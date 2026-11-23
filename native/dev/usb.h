@@ -110,7 +110,7 @@ void nc_pad_rumble(unsigned player, uint16_t *left, uint16_t *right);
 /* ohci.c: the Xbox's first USB controller (0xFED00000, IRQ 1), with gamepads
  * for the players in NC_PAD_MASK (or NC_PADS from player 1; default 1). */
 struct NcVm;
-void nc_dev_ohci_init(struct NcVm *vm);
+void nc_dev_xbox_usb_init(struct NcVm *vm);
 /* The players with a controller now (bit n: player n + 1): the others'
  * controllers pulled out, theirs plugged in, as the title would see it. */
 void nc_dev_ohci_set_pads(unsigned mask);

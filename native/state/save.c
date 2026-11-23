@@ -232,6 +232,52 @@ const char *nc_state_save_finish(void)
     return err;
 }
 
+static bool park_gpu_for_save(void)
+{
+    /* the frame before the next flip, within 100 ms (a game at 10 fps or
+     * more); else where the decoder is. A title that flips in a trap's
+     * handler (IMMEDIATE presents) never waits for one: the whole wait,
+     * 500 ms then, it ran on unseen with its sound, the picture held, and
+     * came back further on (#401: Republic Commando's every save). */
+    const bool traps = hle_pb_flips_in_traps();
+    bool parked = !traps && hle_pb_park(true, 100000000ull);
+    if (!parked) {
+        nc_log("xbased-native-state", "%s: the decoder stops where it is",
+               traps ? "the title flips in a trap's handler (no flip to wait for)" : "no flip within 100 ms");
+        parked = hle_pb_park(false, 1000000000ull);
+    }
+    return parked;
+}
+
+static const char *capture_on_guest_thread(const char *path)
+{
+    pthread_mutex_lock(&g_req.mu);
+    snprintf(g_req.path, sizeof(g_req.path), "%s", path);
+    g_req.pending = true;
+    g_req.taking = false;
+    g_req.done = false;
+    g_req.result = NULL;
+    pthread_mutex_unlock(&g_req.mu);
+    nc_pause_set(true);
+    nc_pause_kick();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec += 15;
+    /* 15 s for the guest CPU to take the request; once it has, the
+     * state is being written and the game resumes only after it (the
+     * devices would change what it writes) */
+    pthread_mutex_lock(&g_req.mu);
+    int rc = 0;
+    while (!g_req.done && (rc == 0 || g_req.taking)) {
+        rc = g_req.taking ? pthread_cond_wait(&g_req.cv, &g_req.mu)
+                          : pthread_cond_timedwait(&g_req.cv, &g_req.mu, &ts);
+    }
+    const char *result = g_req.done ? g_req.result : "the game did not stop";
+    g_req.pending = false;          /* not taken: withdrawn */
+    pthread_mutex_unlock(&g_req.mu);
+    return result;
+}
+
 const char *nc_state_save_begin(const char *path)
 {
     if (!g_core) {
@@ -251,47 +297,7 @@ const char *nc_state_save_begin(const char *path)
     if (was_paused) {
         nc_pause_set(false);
     }
-    /* the frame before the next flip, within 100 ms (a game at 10 fps or
-     * more); else where the decoder is. A title that flips in a trap's
-     * handler (IMMEDIATE presents) never waits for one: the whole wait,
-     * 500 ms then, it ran on unseen with its sound, the picture held, and
-     * came back further on (#401: Republic Commando's every save). */
-    const bool traps = hle_pb_flips_in_traps();
-    bool parked = !traps && hle_pb_park(true, 100000000ull);
-    if (!parked) {
-        nc_log("xbased-native-state", "%s: the decoder stops where it is",
-               traps ? "the title flips in a trap's handler (no flip to wait for)" : "no flip within 100 ms");
-        parked = hle_pb_park(false, 1000000000ull);
-    }
-    const char *result = NULL;
-    if (!parked) {
-        result = "the GPU did not stop";
-    } else {
-        pthread_mutex_lock(&g_req.mu);
-        snprintf(g_req.path, sizeof(g_req.path), "%s", path);
-        g_req.pending = true;
-        g_req.taking = false;
-        g_req.done = false;
-        g_req.result = NULL;
-        pthread_mutex_unlock(&g_req.mu);
-        nc_pause_set(true);
-        nc_pause_kick();
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        ts.tv_sec += 15;
-        /* 15 s for the guest CPU to take the request; once it has, the
-         * state is being written and the game resumes only after it (the
-         * devices would change what it writes) */
-        pthread_mutex_lock(&g_req.mu);
-        int rc = 0;
-        while (!g_req.done && (rc == 0 || g_req.taking)) {
-            rc = g_req.taking ? pthread_cond_wait(&g_req.cv, &g_req.mu)
-                              : pthread_cond_timedwait(&g_req.cv, &g_req.mu, &ts);
-        }
-        result = g_req.done ? g_req.result : "the game did not stop";
-        g_req.pending = false;          /* not taken: withdrawn */
-        pthread_mutex_unlock(&g_req.mu);
-    }
+    const char *result = park_gpu_for_save() ? capture_on_guest_thread(path) : "the GPU did not stop";
     hle_pb_unpark();
     nc_pause_set(was_paused);
     nc_log("xbased-native-state", "save: %s in %.0f ms", result ? result : "saved", (mono_ns() - t0) / 1e6);

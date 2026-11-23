@@ -416,7 +416,8 @@ EXPORT JNIEXPORT jboolean JNICALL Java_com_rfandango_haku_1x_NativeCoreActivity_
 
 static void *core_thread(void *arg)
 {
-    if (!nc_core_boot(&g_core, g_disc_fd)) {
+    const NcBootOptions *boot = arg;
+    if (!nc_core_boot(&g_core, g_disc_fd, boot)) {
         nc_log("xbased-app", "core: boot failed");
         if (!nc_hle_fatal()) {
             nc_hle_set_fatal(NC_FATAL_BOOT, "The game stopped while starting.");
@@ -608,7 +609,7 @@ EXPORT int SDL_main(int argc, char *argv[])
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16u << 20);
     pthread_t core;
-    pthread_create(&core, &attr, core_thread, NULL);
+    pthread_create(&core, &attr, core_thread, &opt.boot);
     pthread_attr_destroy(&attr);
 
     SDL_Gamepad *pad = NULL;

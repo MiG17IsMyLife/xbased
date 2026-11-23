@@ -376,27 +376,37 @@ static bool canon(const char *in, char *out, size_t cap)
     return true;
 }
 
-/* Which device a canonical path is on: -1 the disc, 0..7 a partition, -2
- * unknown. rel receives the path inside the device ("" for its root). */
-static int device_of(const char *path, const char **rel)
+typedef enum IoDeviceKind {
+    IO_DEVICE_UNKNOWN,
+    IO_DEVICE_DISC,
+    IO_DEVICE_RAW_DISK,
+    IO_DEVICE_PARTITION,
+} IoDeviceKind;
+
+typedef struct IoDevicePath {
+    IoDeviceKind kind;
+    int partition;
+    const char *relative;  /* inside the device, empty for its root */
+} IoDevicePath;
+
+static IoDevicePath device_path(const char *path)
 {
     static const char cd[] = "\\Device\\CdRom0";
     static const char hd[] = "\\Device\\Harddisk0\\Partition";
     if (prefix_ci(path, cd) && (!path[sizeof(cd) - 1] || path[sizeof(cd) - 1] == '\\')) {
-        *rel = path + sizeof(cd) - 1;
-        return -1;
+        return (IoDevicePath){.kind = IO_DEVICE_DISC, .relative = path + sizeof(cd) - 1};
     }
     if (prefix_ci(path, hd) && isdigit((unsigned char)path[sizeof(hd) - 1])) {
-        const char *p = path + sizeof(hd) - 1;
-        int part = *p - '0';
-        p++;
-        if (*p && *p != '\\') {
-            return -2;
+        const char *digit = path + sizeof(hd) - 1;
+        if (!digit[1] || digit[1] == '\\') {
+            return (IoDevicePath){
+                .kind = *digit == '0' ? IO_DEVICE_RAW_DISK : IO_DEVICE_PARTITION,
+                .partition = *digit - '0',
+                .relative = digit + 1,
+            };
         }
-        *rel = p;
-        return part;
     }
-    return -2;
+    return (IoDevicePath){.kind = IO_DEVICE_UNKNOWN};
 }
 
 static int host_path(int part, const char *rel, char *out, size_t cap);
@@ -404,14 +414,13 @@ static int host_path(int part, const char *rel, char *out, size_t cap);
 bool nc_io_host_file(const char *xbox_path, char *out, size_t n)
 {
     char path[512];
-    const char *rel;
     if (!canon(xbox_path, path, sizeof(path))) {
         return false;
     }
-    const int part = device_of(path, &rel);
+    const IoDevicePath dev = device_path(path);
     struct stat st;
-    return part >= 1 && part <= 5 && *rel && host_path(part, rel, out, n) == 1 && stat(out, &st) == 0 &&
-           S_ISREG(st.st_mode);
+    return dev.kind == IO_DEVICE_PARTITION && dev.partition <= 5 && *dev.relative &&
+           host_path(dev.partition, dev.relative, out, n) == 1 && stat(out, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 void nc_io_set_launch_dir(const char *dir)
@@ -1631,8 +1640,158 @@ bool nc_io_disc_lacks_language(const NcDisc *disc, int lang)
     return lacks;
 }
 
-static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t share, uint32_t attrs, uint32_t disposition,
-                        uint32_t options, uint32_t *handle, uint32_t *info)
+typedef struct FileOpenOptions {
+    uint32_t access;
+    uint32_t share;
+    uint32_t disposition;
+    uint32_t flags;
+} FileOpenOptions;
+
+static uint32_t open_disc_file(NcKernel *k, const char *path, const char *rel,
+                               const FileOpenOptions *request, NcFile **file)
+{
+    if (k->disc->fd < 0 && !k->disc->ov) {
+        return STATUS_NO_MEDIA_IN_DEVICE;   /* the dashboard booted with the tray empty */
+    }
+    if (request->disposition != FILE_OPEN && request->disposition != FILE_OPEN_IF) {
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+    NcDiscFile df;
+    char alt[512];
+    if (!nc_disc_find(k->disc, rel, &df)) {
+        if (!lang_fallback(k->disc, rel, alt, sizeof(alt), &df)) {
+            nc_log("xbased-native-io", "open %s: not on the disc", path);
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        nc_log("xbased-native-io", "open %s: not on the disc, its English one instead (%s)", path, alt);
+        rel = alt;
+    }
+    const bool dir = df.attr & 0x10;
+    if ((request->flags & FILE_DIRECTORY_FILE) && !dir) {
+        return dir_mismatch(path, request->flags, STATUS_NOT_A_DIRECTORY);
+    }
+    if ((request->flags & FILE_NON_DIRECTORY_FILE) && dir) {
+        return dir_mismatch(path, request->flags, STATUS_FILE_IS_A_DIRECTORY);
+    }
+    NcFile *nf = file_new();
+    if (!nf) {
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    }
+    nf->kind = *rel ? F_DISC : F_VOLUME;
+    nf->partition = -1;
+    nf->disc = df;
+    nf->is_dir = dir;
+    *file = nf;
+    return NC_STATUS_SUCCESS;
+}
+
+static uint32_t open_host_file(int partition, const char *path, const char *rel,
+                               const FileOpenOptions *request, NcFile **file, uint32_t *info)
+{
+    char host[512];
+    const int exists = host_path(partition, rel, host, sizeof(host));
+    if (exists < 0) {
+        if (g_trace_io) {
+            nc_log("xbased-native-io", "open %s: path not found", path);
+        }
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+    struct stat st;
+    bool is_dir = exists && stat(host, &st) == 0 && S_ISDIR(st.st_mode);
+    if (!*rel) {
+        is_dir = true; /* the partition root */
+    }
+    if (exists && !is_dir && file_other(NULL, host, true)) {
+        nc_log("xbased-native-io", "open %s: delete pending", path);
+        return STATUS_DELETE_PENDING;
+    }
+    if (exists && request->disposition == FILE_CREATE) {
+        if (g_trace_io) {
+            nc_log("xbased-native-io", "open %s: exists (a new one asked)%s", path, is_dir ? ", a folder" : "");
+        }
+        return STATUS_OBJECT_NAME_COLLISION;
+    }
+    if (exists && !is_dir && share_conflict(host, share_granted(request->access), (uint8_t)(request->share & 7))) {
+        if (g_trace_io) {
+            nc_log("xbased-native-io", "open %s: sharing violation", path);
+        }
+        return STATUS_SHARING_VIOLATION;
+    }
+    if (!exists && (request->disposition == FILE_OPEN || request->disposition == FILE_OVERWRITE)) {
+        if (g_trace_io) {
+            nc_log("xbased-native-io", "open %s: not found", path);
+        }
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (exists && is_dir && (request->flags & FILE_NON_DIRECTORY_FILE)) {
+        return dir_mismatch(path, request->flags, STATUS_FILE_IS_A_DIRECTORY);
+    }
+    if (exists && !is_dir && (request->flags & FILE_DIRECTORY_FILE)) {
+        return dir_mismatch(path, request->flags, STATUS_NOT_A_DIRECTORY);
+    }
+    int fd = -1;
+    char old_path[320] = "";
+    uint64_t old_size = 0;
+    if (!exists && (request->flags & FILE_DIRECTORY_FILE)) {
+        if (mkdir(host, 0775) != 0) {
+            return STATUS_ACCESS_DENIED;
+        }
+        is_dir = true;
+        *info = 2; /* FILE_CREATED */
+    } else if (!is_dir) {
+        int flags = O_RDWR | O_CLOEXEC;
+        if (!exists) {
+            flags |= O_CREAT;
+            *info = 2;
+        } else if (request->disposition == FILE_OVERWRITE || request->disposition == FILE_OVERWRITE_IF ||
+                   request->disposition == FILE_SUPERSEDE) {
+            /* Empty now; the old bytes wait in a side file (NcFile.old_path). */
+            old_size = (uint64_t)st.st_size;
+            if (!set_aside(host, old_path, sizeof(old_path))) {
+                old_path[0] = '\0';
+            }
+            flags |= O_CREAT | O_TRUNC;
+            *info = request->disposition == FILE_SUPERSEDE ? 0 : 3;
+        } else {
+            *info = 1;
+        }
+        fd = open(host, flags, 0664);
+        if (fd < 0) {
+            nc_log("xbased-native-io", "open %s (%s): %s", path, host, strerror(errno));
+            if (old_path[0]) {
+                rename(old_path, host); /* the file as it was */
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    } else {
+        *info = 1;
+    }
+    NcFile *nf = file_new();
+    if (!nf) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (old_path[0]) {
+            rename(old_path, host);
+        }
+        return NC_STATUS_INSUFFICIENT_RESOURCES;
+    }
+    nf->kind = F_HOST;
+    nf->partition = partition;
+    nf->fd = fd;
+    nf->is_dir = is_dir;
+    snprintf(nf->old_path, sizeof(nf->old_path), "%s", old_path);
+    nf->old_size = old_size;
+    snprintf(nf->host, sizeof(nf->host), "%s", host);
+    if (!is_dir) {
+        nf->share_granted = share_granted(request->access);
+        nf->share_allowed = (uint8_t)(request->share & 7);
+    }
+    *file = nf;
+    return NC_STATUS_SUCCESS;
+}
+
+static uint32_t do_open(NcKernel *k, uint32_t attrs, const FileOpenOptions *request, uint32_t *handle, uint32_t *info)
 {
     char name[512], path[512];
     ansi(k, nc_vm_rd32(k->vm, attrs + 4), name, sizeof(name));
@@ -1645,12 +1804,10 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t share, uint32_t a
         nc_log("xbased-native-io", "open %s: no such drive", name);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
-    const char *rel;
-    const int dev = device_of(path, &rel);
+    const IoDevicePath dev = device_path(path);
     *info = 5; /* FILE_DOES_NOT_EXIST */
-    NcFile *nf = NULL;
 
-    if (dev == -2) {
+    if (dev.kind == IO_DEVICE_UNKNOWN) {
         /* No such object. As the object manager's lookup has it, a name
          * missing from an object directory (\, \??, \Device) is a missing
          * name, one under a missing component a missing path. Titles tell
@@ -1663,43 +1820,17 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t share, uint32_t a
         nc_log("xbased-native-io", "open %s: unknown device (a missing %s)", path, in_dir ? "name" : "path");
         return in_dir ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_OBJECT_PATH_NOT_FOUND;
     }
-    if (dev == -1) {
-        if (k->disc->fd < 0 && !k->disc->ov) {
-            return STATUS_NO_MEDIA_IN_DEVICE;   /* the dashboard booted with the tray empty */
+    NcFile *nf = NULL;
+    uint32_t status = NC_STATUS_SUCCESS;
+    if (dev.kind == IO_DEVICE_DISC) {
+        status = open_disc_file(k, path, dev.relative, request, &nf);
+        if (status == NC_STATUS_SUCCESS) {
+            *info = 1; /* FILE_OPENED */
         }
-        if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF) {
-            return STATUS_MEDIA_WRITE_PROTECTED;
-        }
-        NcDiscFile df;
-        char alt[512];
-        if (!nc_disc_find(k->disc, rel, &df)) {
-            if (!lang_fallback(k->disc, rel, alt, sizeof(alt), &df)) {
-                nc_log("xbased-native-io", "open %s: not on the disc", path);
-                return STATUS_OBJECT_NAME_NOT_FOUND;
-            }
-            nc_log("xbased-native-io", "open %s: not on the disc, its English one instead (%s)", path, alt);
-            rel = alt;
-        }
-        const bool dir = df.attr & 0x10;
-        if ((options & FILE_DIRECTORY_FILE) && !dir) {
-            return dir_mismatch(path, options, STATUS_NOT_A_DIRECTORY);
-        }
-        if ((options & FILE_NON_DIRECTORY_FILE) && dir) {
-            return dir_mismatch(path, options, STATUS_FILE_IS_A_DIRECTORY);
-        }
-        nf = file_new();
-        if (!nf) {
-            return NC_STATUS_INSUFFICIENT_RESOURCES;
-        }
-        nf->kind = *rel ? F_DISC : F_VOLUME;
-        nf->partition = -1;
-        nf->disc = df;
-        nf->is_dir = dir;
-        *info = 1; /* FILE_OPENED */
-    } else if (dev == 0) {
+    } else if (dev.kind == IO_DEVICE_RAW_DISK) {
         /* Partition0 is the whole disk, opened raw for its config sectors:
          * they read as zeros (no refurb or cache records) and writes drop. */
-        if (*rel) {
+        if (*dev.relative) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
         nf = file_new();
@@ -1710,110 +1841,15 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t share, uint32_t a
         nf->partition = 0;
         *info = 1;
     } else {
-        char host[512];
-        int exists = host_path(dev, rel, host, sizeof(host));
-        if (exists < 0) {
-            if (g_trace_io) {
-                nc_log("xbased-native-io", "open %s: path not found", path);
-            }
-            return STATUS_OBJECT_PATH_NOT_FOUND;
-        }
-        struct stat st;
-        bool is_dir = exists && stat(host, &st) == 0 && S_ISDIR(st.st_mode);
-        if (!*rel) {
-            is_dir = true; /* the partition root */
-        }
-        if (exists && !is_dir && file_other(NULL, host, true)) {
-            nc_log("xbased-native-io", "open %s: delete pending", path);
-            return STATUS_DELETE_PENDING;
-        }
-        if (exists && disposition == FILE_CREATE) {
-            if (g_trace_io) {
-                nc_log("xbased-native-io", "open %s: exists (a new one asked)%s", path, is_dir ? ", a folder" : "");
-            }
-            return STATUS_OBJECT_NAME_COLLISION;
-        }
-        if (exists && !is_dir && share_conflict(host, share_granted(access), (uint8_t)(share & 7))) {
-            if (g_trace_io) {
-                nc_log("xbased-native-io", "open %s: sharing violation", path);
-            }
-            return STATUS_SHARING_VIOLATION;
-        }
-        if (!exists && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE)) {
-            if (g_trace_io) {
-                nc_log("xbased-native-io", "open %s: not found", path);
-            }
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        if (exists && is_dir && (options & FILE_NON_DIRECTORY_FILE)) {
-            return dir_mismatch(path, options, STATUS_FILE_IS_A_DIRECTORY);
-        }
-        if (exists && !is_dir && (options & FILE_DIRECTORY_FILE)) {
-            return dir_mismatch(path, options, STATUS_NOT_A_DIRECTORY);
-        }
-        int fd = -1;
-        char old_path[320] = "";
-        uint64_t old_size = 0;
-        if (!exists && (options & FILE_DIRECTORY_FILE)) {
-            if (mkdir(host, 0775) != 0) {
-                return STATUS_ACCESS_DENIED;
-            }
-            is_dir = true;
-            *info = 2; /* FILE_CREATED */
-        } else if (!is_dir) {
-            int flags = O_RDWR | O_CLOEXEC;
-            if (!exists) {
-                flags |= O_CREAT;
-                *info = 2;
-            } else if (disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF ||
-                       disposition == FILE_SUPERSEDE) {
-                /* Empty now; the old bytes wait in a side file (NcFile.old_path). */
-                old_size = (uint64_t)st.st_size;
-                if (!set_aside(host, old_path, sizeof(old_path))) {
-                    old_path[0] = '\0';
-                }
-                flags |= O_CREAT | O_TRUNC;
-                *info = disposition == FILE_SUPERSEDE ? 0 : 3;
-            } else {
-                *info = 1;
-            }
-            fd = open(host, flags, 0664);
-            if (fd < 0) {
-                nc_log("xbased-native-io", "open %s (%s): %s", path, host, strerror(errno));
-                if (old_path[0]) {
-                    rename(old_path, host); /* the file as it was */
-                }
-                return STATUS_ACCESS_DENIED;
-            }
-        } else {
-            *info = 1;
-        }
-        nf = file_new();
-        if (!nf) {
-            if (fd >= 0) {
-                close(fd);
-            }
-            if (old_path[0]) {
-                rename(old_path, host);
-            }
-            return NC_STATUS_INSUFFICIENT_RESOURCES;
-        }
-        nf->kind = F_HOST;
-        nf->partition = dev;
-        nf->fd = fd;
-        nf->is_dir = is_dir;
-        snprintf(nf->old_path, sizeof(nf->old_path), "%s", old_path);
-        nf->old_size = old_size;
-        snprintf(nf->host, sizeof(nf->host), "%s", host);
-        if (!is_dir) {
-            nf->share_granted = share_granted(access);
-            nf->share_allowed = (uint8_t)(share & 7);
-        }
+        status = open_host_file(dev.partition, path, dev.relative, request, &nf, info);
+    }
+    if (status != NC_STATUS_SUCCESS) {
+        return status;
     }
     snprintf(nf->path, sizeof(nf->path), "%s", path);
-    nf->async = !(options & FILE_SYNCHRONOUS_IO);
-    nf->no_buffering = (options & FILE_NO_INTERMEDIATE_BUFFERING) != 0;
-    nf->can_write = (access & ACCESS_WRITES) != 0;
+    nf->async = !(request->flags & FILE_SYNCHRONOUS_IO);
+    nf->no_buffering = (request->flags & FILE_NO_INTERMEDIATE_BUFFERING) != 0;
+    nf->can_write = (request->access & ACCESS_WRITES) != 0;
     nc_kernel_trace_trigger(path);
     *handle = file_handle(k, nf);
     if (!*handle) {
@@ -1839,7 +1875,8 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t share, uint32_t a
 static uint64_t NtCreateFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     uint32_t h = 0, info = 0;
-    uint32_t st = do_open(k, a[1], a[6], a[2], a[7], a[8], &h, &info);
+    const FileOpenOptions request = {.access = a[1], .share = a[6], .disposition = a[7], .flags = a[8]};
+    uint32_t st = do_open(k, a[2], &request, &h, &info);
     if (st == NC_STATUS_SUCCESS && info != 1) {     /* created, overwritten, superseded: not FILE_OPENED */
         g_hdd_gen++;
     }
@@ -1854,7 +1891,8 @@ static uint64_t NtCreateFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 static uint64_t NtOpenFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     uint32_t h = 0, info = 0;
-    uint32_t st = do_open(k, a[1], a[4], a[2], FILE_OPEN, a[5], &h, &info);
+    const FileOpenOptions request = {.access = a[1], .share = a[4], .disposition = FILE_OPEN, .flags = a[5]};
+    uint32_t st = do_open(k, a[2], &request, &h, &info);
     io_status(k, a[3], st, info);
     if (st == NC_STATUS_SUCCESS) {
         nc_vm_wr32(k->vm, a[0], h);
@@ -2247,17 +2285,15 @@ static uint64_t NtReadFileScatter(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* The partition number if nf is a hard disk partition's root, else -1. */
 static int partition_root(const NcFile *nf)
 {
-    const char *rel;
-    const int dev = device_of(nf->path, &rel);
-    return dev >= 0 && !*rel ? dev : -1;
+    const IoDevicePath dev = device_path(nf->path);
+    return (dev.kind == IO_DEVICE_PARTITION || dev.kind == IO_DEVICE_RAW_DISK) && !*dev.relative ? dev.partition : -1;
 }
 
 /* The hard disk partition a file is on, else -1. */
 static int file_partition(const NcFile *nf)
 {
-    const char *rel;
-    const int dev = device_of(nf->path, &rel);
-    return dev >= 0 ? dev : -1;
+    const IoDevicePath dev = device_path(nf->path);
+    return dev.kind == IO_DEVICE_PARTITION || dev.kind == IO_DEVICE_RAW_DISK ? dev.partition : -1;
 }
 
 /* A folder emptied at once: its contents moved aside (<hdd>/.overwrite)
@@ -2702,12 +2738,16 @@ static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
          * the cache never completed). */
         char name[1024], path[512], host[512];
         ansi(k, a[2] + 8, name, sizeof(name));
-        const char *rel;
-        int dev, exists = -1;
-        if (nf->kind != F_HOST || !resolve_name(k, nc_rd32(in + 4), name, sizeof(name)) ||
-            !canon(name, path, sizeof(path)) || (dev = device_of(path, &rel)) < 1 ||
-            (exists = host_path(dev, rel, host, sizeof(host))) < 0) {
-            st = exists < 0 && nf->kind == F_HOST ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_ACCESS_DENIED;
+        int exists = -1;
+        if (nf->kind == F_HOST && resolve_name(k, nc_rd32(in + 4), name, sizeof(name)) &&
+            canon(name, path, sizeof(path))) {
+            const IoDevicePath dev = device_path(path);
+            if (dev.kind == IO_DEVICE_PARTITION) {
+                exists = host_path(dev.partition, dev.relative, host, sizeof(host));
+            }
+        }
+        if (exists < 0) {
+            st = nf->kind == F_HOST ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_ACCESS_DENIED;
         } else if (exists && !in[0]) {
             st = STATUS_OBJECT_NAME_COLLISION;
         } else if (rename(nf->host, host) != 0) {
@@ -3069,9 +3109,11 @@ static void list_dir(NcKernel *k, const NcFile *nf, DirList *l)
             }
             free(dir);
         }
-        const char *rel;
-        if (k->disc->ov && device_of(nf->path, &rel) == -1) {
-            nc_disc_overlay_list(k->disc, rel, ov_entry, l);
+        if (k->disc->ov) {
+            const IoDevicePath dev = device_path(nf->path);
+            if (dev.kind == IO_DEVICE_DISC) {
+                nc_disc_overlay_list(k->disc, dev.relative, ov_entry, l);
+            }
         }
         return;
     }
@@ -3188,7 +3230,8 @@ static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 static uint64_t NtQueryFullAttributesFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     uint32_t h = 0, info = 0;
-    uint32_t st = do_open(k, 0, 7, a[0], FILE_OPEN, 0, &h, &info);
+    const FileOpenOptions request = {.share = 7, .disposition = FILE_OPEN};
+    uint32_t st = do_open(k, a[0], &request, &h, &info);
     if (st != NC_STATUS_SUCCESS) {
         return st;
     }
@@ -3206,13 +3249,12 @@ static uint64_t NtDeleteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (!resolve_name(k, nc_vm_rd32(k->vm, a[0]), name, sizeof(name))) {
         return NC_STATUS_INVALID_HANDLE;
     }
-    const char *rel;
-    int dev;
-    if (!canon(name, path, sizeof(path)) || (dev = device_of(path, &rel)) < 1) {
+    const IoDevicePath dev = canon(name, path, sizeof(path)) ? device_path(path) : (IoDevicePath){0};
+    if (dev.kind != IO_DEVICE_PARTITION) {
         nc_log("xbased-native-io", "delete %s: no such drive", name);
         return STATUS_ACCESS_DENIED;    /* the disc, the raw disk: no file system to delete in */
     }
-    if (host_path(dev, rel, host, sizeof(host)) != 1) {
+    if (host_path(dev.partition, dev.relative, host, sizeof(host)) != 1) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     struct stat st;
@@ -3550,17 +3592,17 @@ static uint64_t ObReferenceObjectByName(NcKernel *k, NcFrame *f, const uint32_t 
 {
     char name[512], path[512];
     ansi(k, a[0], name, sizeof(name));
-    const char *rel;
     if (!canon(name, path, sizeof(path))) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     uint32_t d = device_named(path);
     if (!d) {
-        if (device_of(path, &rel) == -2 || *rel) {
+        const IoDevicePath dev = device_path(path);
+        if (dev.kind == IO_DEVICE_UNKNOWN || *dev.relative) {
             nc_log("xbased-native-io", "reference by name %s: not found", name);
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
-        d = device_new(k, 0, 0, device_of(path, &rel) == -1 ? 0x02 : 0x07);
+        d = device_new(k, 0, 0, dev.kind == IO_DEVICE_DISC ? 0x02 : 0x07);
         if (!d) {
             return NC_STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -3843,10 +3885,10 @@ bool nc_file_state_load(NcRd *r, unsigned v)
         if (nf->kind == F_HOST && !nf->is_dir) {
             nf->fd = open(nf->host, O_RDWR | O_CLOEXEC);
             int err = errno;
-            const char *rel;
+            const IoDevicePath dev = device_path(nf->path);
             char host[512];
-            if (nf->fd < 0 && err == ENOENT && device_of(nf->path, &rel) == nf->partition && *rel &&
-                host_path(nf->partition, rel, host, sizeof(host)) == 1 && strcmp(host, nf->host)) {
+            if (nf->fd < 0 && err == ENOENT && dev.kind == IO_DEVICE_PARTITION && dev.partition == nf->partition &&
+                *dev.relative && host_path(dev.partition, dev.relative, host, sizeof(host)) == 1 && strcmp(host, nf->host)) {
                 /* the game's own path, its names matched as the drive has them
                  * (a state from Windows on Linux, whose names are case-sensitive) */
                 nf->fd = open(host, O_RDWR | O_CLOEXEC);

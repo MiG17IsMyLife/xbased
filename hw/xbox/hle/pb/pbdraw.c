@@ -3797,15 +3797,55 @@ static void carry_latch(uint32_t last, const uint32_t *inl)
     }
 }
 
+static uint32_t draw_constants_offset(bool ff)
+{
+    /* Reuse the last draw's constants and current attributes while they
+     * still match and their arena allocation belongs to this submission. */
+    if (g_pd.blk_ok && g_pd.blk_ff == ff && g_pd.blk_gen == g_pd.cgen &&
+        (!ff || g_pd.blk_ffgen == g_pd.ffgen) && g_pd.blk_value == hle_fe_last_value()) {
+        g_pd.blk_reused++;
+        return g_pd.blk_off;
+    }
+    uint8_t *cb;
+    const uint32_t c_off = arena(sizeof(g_pd.consts) + sizeof(g_pd.cur), &cb);
+    if (c_off == HLE_ARENA_FULL) {
+        return HLE_ARENA_FULL;
+    }
+    if (ff) {
+        ff_consts((float (*)[4])cb);
+    } else {
+        memcpy(cb, g_pd.consts, sizeof(g_pd.consts));
+    }
+    memcpy(cb + sizeof(g_pd.consts), g_pd.cur, sizeof(g_pd.cur));
+    g_pd.blk_ok = true;
+    g_pd.blk_ff = ff;
+    g_pd.blk_ffgen = g_pd.ffgen;
+    g_pd.blk_off = c_off;
+    g_pd.blk_gen = g_pd.cgen;
+    g_pd.blk_value = hle_fe_last_value();   /* after arena(): it may have kicked */
+    return c_off;
+}
+
+static void resolve_draw_textures(HleCmdDraw *d)
+{
+    for (unsigned s = 0; s < 4; s++) {
+        bool unset, lin;
+        d->tex[s] = texture(s, &unset, &lin);
+        d->tex_unset |= (uint32_t)unset << s;
+        d->tex_lin |= (uint32_t)lin << s;
+        /* per draw: the state cache isn't rebuilt when only a texture changes */
+        d->tex_rect[s] = lin ? R(NV097_SET_TEXTURE_IMAGE_RECT + 64 * s) : 0;
+        d->tex_ord |= tex_order(s, d->tex[s]) << 2 * s;
+    }
+}
+
 /* The rest of a draw whose vertices and indices d holds: the stages'
  * textures, the constants (a program's, or the fixed-function stage's from
  * its methods) and the attributes' current values after them, the state
  * and the vertex shader; emitted. */
-static void emit(HleCmdDraw *d)
+static void emit_draw(HleCmdDraw *d)
 {
     const bool ff = (R(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3) != 2;
-    uint8_t *cb;
-    uint32_t c_off;
     if (g_carry.pending) {
         /* the attributes this draw has no array for take their current
          * values: what an earlier draw's last vertex left, first */
@@ -3815,33 +3855,10 @@ static void emit(HleCmdDraw *d)
         }
         carry_apply(~arrays);
     }
-    /* a draw whose constants and current attributes are the last one's, in
-     * the same submission (its block lives until that completes): that
-     * block. Crimson Sea's 2300 draws a frame copied 3.3 KB each; a
-     * fixed-function draw's block (ff_consts) holds while none of the
-     * registers it is made of changed (ffgen). */
-    if (g_pd.blk_ok && g_pd.blk_ff == ff && g_pd.blk_gen == g_pd.cgen &&
-        (!ff || g_pd.blk_ffgen == g_pd.ffgen) && g_pd.blk_value == hle_fe_last_value()) {
-        c_off = g_pd.blk_off;
-        g_pd.blk_reused++;
-    } else {
-        c_off = arena(sizeof(g_pd.consts) + sizeof(g_pd.cur), &cb);
-        if (c_off == HLE_ARENA_FULL) {
-            skip(SK_EMIT_ARENA);
-            return;
-        }
-        if (ff) {
-            ff_consts((float (*)[4])cb);
-        } else {
-            memcpy(cb, g_pd.consts, sizeof(g_pd.consts));
-        }
-        memcpy(cb + sizeof(g_pd.consts), g_pd.cur, sizeof(g_pd.cur));
-        g_pd.blk_ok = true;
-        g_pd.blk_ff = ff;
-        g_pd.blk_ffgen = g_pd.ffgen;
-        g_pd.blk_off = c_off;
-        g_pd.blk_gen = g_pd.cgen;
-        g_pd.blk_value = hle_fe_last_value();   /* after arena(): it may have kicked */
+    const uint32_t c_off = draw_constants_offset(ff);
+    if (c_off == HLE_ARENA_FULL) {
+        skip(SK_EMIT_ARENA);
+        return;
     }
     rt_first_write(false);
     if (g_pd.rt_obj) {
@@ -3852,15 +3869,7 @@ static void emit(HleCmdDraw *d)
     if (g_pd.ds && ((R(0x030C) && R(0x035C)) || (R(0x032C) && (R(0x0360) & 0xFF)))) {
         ds_written();                   /* depth test and writes, or stencil writes */
     }
-    for (unsigned s = 0; s < 4; s++) {
-        bool unset, lin;
-        d->tex[s] = texture(s, &unset, &lin);
-        d->tex_unset |= (uint32_t)unset << s;
-        d->tex_lin |= (uint32_t)lin << s;
-        /* per draw: the state cache isn't rebuilt when only a texture changes */
-        d->tex_rect[s] = lin ? R(NV097_SET_TEXTURE_IMAGE_RECT + 64 * s) : 0;
-        d->tex_ord |= tex_order(s, d->tex[s]) << 2 * s;
-    }
+    resolve_draw_textures(d);
     state();
     uint32_t zf = (R(NV097_SET_SURFACE_FORMAT) >> 4) & 0xF;
     d->vsh = ff ? ff_program() : program();
@@ -3929,7 +3938,7 @@ static void draw_imm(void)
     for (unsigned a = 0; a < ATTRS; a++) {
         d.attr[a] = (4u << 4 | 2u) | (16u * a) << 16;       /* F, 4 components */
     }
-    emit(&d);
+    emit_draw(&d);
 }
 
 /* An inline array: vertices of the enabled attributes' formats, packed in
@@ -3957,7 +3966,7 @@ static void draw_inline(void)
     d.nbind = 1;
     d.bind_off[0] = off;
     d.bind_stride[0] = vsize;
-    emit(&d);
+    emit_draw(&d);
 }
 
 /* Vertex arrays read in place: the GPU fetches them from guest RAM (the
@@ -4145,25 +4154,10 @@ static bool vb_realign(HleCmdDraw *d, unsigned b, const uint8_t *src, uint32_t f
     return true;
 }
 
-/* The vertex arrays the indices reach, read in place or copied to the
- * arena, the indices converted for the primitive and rebased. */
-static void draw_arrays(void)
+static void build_vertex_bindings(HleCmdDraw *d, uint32_t *base, uint32_t *end)
 {
-    uint32_t n = g_pd.nidx;
-    uint32_t lo = UINT32_MAX, hi = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        lo = MIN(lo, g_pd.idx[i]);
-        hi = MAX(hi, g_pd.idx[i]);
-    }
-    if (hi - lo >= 0xFFFF) {
-        skip(SK_DRAW_ARRAYS_SPAN);
-        return;
-    }
-    HleCmdDraw d;
-    memset(&d, 0, sizeof(d));
     /* bindings: attributes of one stride whose data lie within one stride
      * of a binding's start share it (interleaved vertices) */
-    uint32_t base[HLE_DRAW_MAX_BIND], end[HLE_DRAW_MAX_BIND];
     uint32_t order[HLE_DRAW_ATTRS], nord = 0;
     for (unsigned a = 0; a < HLE_DRAW_ATTRS; a++) {
         if ((R(NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a) >> 4) & 0xF) {
@@ -4181,40 +4175,44 @@ static void draw_arrays(void)
         uint32_t fmt = R(NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 4 * a), stride = fmt >> 8;
         uint32_t pa = R(NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 4 * a) & 0x7FFFFFFFu;
         unsigned b = 0;
-        while (b < d.nbind && !(stride && d.bind_stride[b] == stride && pa - base[b] < stride)) {
+        while (b < d->nbind && !(stride && d->bind_stride[b] == stride && pa - base[b] < stride)) {
             b++;
         }
-        if (b == d.nbind) {
-            if (d.nbind == HLE_DRAW_MAX_BIND) {
+        if (b == d->nbind) {
+            if (d->nbind == HLE_DRAW_MAX_BIND) {
                 continue;
             }
-            d.nbind++;
+            d->nbind++;
             base[b] = pa;
             end[b] = 0;
-            d.bind_stride[b] = stride;
+            d->bind_stride[b] = stride;
         }
         end[b] = MAX(end[b], pa - base[b] + attr_bytes(fmt));
-        d.attr[a] = (fmt & 0xFF) | b << 8 | (pa - base[b]) << 16;
+        d->attr[a] = (fmt & 0xFF) | b << 8 | (pa - base[b]) << 16;
     }
-    for (unsigned b = 0; b < d.nbind; b++) {
-        uint32_t st = d.bind_stride[b], from, len;
+}
+
+static bool prepare_vertex_buffers(HleCmdDraw *d, const uint32_t *base, const uint32_t *end, uint32_t lo, uint32_t hi)
+{
+    for (unsigned b = 0; b < d->nbind; b++) {
+        uint32_t st = d->bind_stride[b], from, len;
         if (!hle_vimm_span(base[b], st, lo, hi, end[b], hle_ram_size(), &from, &len)) {
             skip(SK_DRAW_ARRAYS_SPAN);      /* not memory, or a stride no host draws with */
-            return;
+            return false;
         }
         coh_pend_wait(from, len);           /* a copy queued into it lands first */
         const uint8_t *src = hle_pa_ptr(from, len);
-        if (src && hle_quirk(HLE_QUIRK_VB_ALIGN) && vb_misaligned(&d, b, base[b])) {
-            if (!vb_realign(&d, b, src, from, len, st ? hi - lo + 1 : 1)) {
+        if (src && hle_quirk(HLE_QUIRK_VB_ALIGN) && vb_misaligned(d, b, base[b])) {
+            if (!vb_realign(d, b, src, from, len, st ? hi - lo + 1 : 1)) {
                 skip(SK_DRAW_ARRAYS_ARENA);
-                return;
+                return false;
             }
             continue;
         }
         if (src && vb_in_place() && !hle_barrier_contended(from, len)) {
             hle_barrier_arm(from, len, hle_fe_last_value() + 1);
-            d.guest_vb |= 1u << b;
-            d.bind_off[b] = from;
+            d->guest_vb |= 1u << b;
+            d->bind_off[b] = from;
             g_pd.vb_place++;
             continue;
         }
@@ -4222,16 +4220,40 @@ static void draw_arrays(void)
         uint32_t off = src ? arena(len, &dst) : HLE_ARENA_FULL;
         if (off == HLE_ARENA_FULL) {
             skip(SK_DRAW_ARRAYS_ARENA);
-            return;
+            return false;
         }
         if (recopied(from, len)) {
             hle_barrier_arm_copied(from, len);
         }
         memcpy(dst, src, len);
-        d.bind_off[b] = off;
+        d->bind_off[b] = off;
         g_pd.vb_copied++;
-        bool pos = ((R(NV097_SET_VERTEX_DATA_ARRAY_FORMAT) >> 4) & 0xF) && ((d.attr[0] >> 8) & 0xFF) == b;
-        vbrace(from, len, st, pos ? (int)(d.attr[0] >> 16) : -1, dst);
+        bool pos = ((R(NV097_SET_VERTEX_DATA_ARRAY_FORMAT) >> 4) & 0xF) && ((d->attr[0] >> 8) & 0xFF) == b;
+        vbrace(from, len, st, pos ? (int)(d->attr[0] >> 16) : -1, dst);
+    }
+    return true;
+}
+
+/* The vertex arrays the indices reach, read in place or copied to the
+ * arena, the indices converted for the primitive and rebased. */
+static void draw_arrays(void)
+{
+    uint32_t n = g_pd.nidx;
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        lo = MIN(lo, g_pd.idx[i]);
+        hi = MAX(hi, g_pd.idx[i]);
+    }
+    if (hi - lo >= 0xFFFF) {
+        skip(SK_DRAW_ARRAYS_SPAN);
+        return;
+    }
+    HleCmdDraw d;
+    memset(&d, 0, sizeof(d));
+    uint32_t base[HLE_DRAW_MAX_BIND], end[HLE_DRAW_MAX_BIND];
+    build_vertex_bindings(&d, base, end);
+    if (!prepare_vertex_buffers(&d, base, end, lo, hi)) {
+        return;
     }
     uint32_t pt = g_pd.prim;
     /* One run of vertices in order, of a primitive Vulkan draws as it is
@@ -4251,7 +4273,7 @@ static void draw_arrays(void)
             d.count = n;
             d.ib_off = UINT32_MAX;
             g_pd.seq_draws++;
-            emit(&d);
+            emit_draw(&d);
             return;
         }
     }
@@ -4278,7 +4300,7 @@ static void draw_arrays(void)
     d.prim = hle_draw_prim_topology(pt);
     d.count = cnt;
     d.ib_off = ib_off;
-    emit(&d);
+    emit_draw(&d);
 }
 
 static void draw_prim(void);

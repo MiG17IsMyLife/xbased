@@ -1806,16 +1806,8 @@ bool nc_kernel_sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
     return r;
 }
 
-static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
+static void dispatch_guest_sysop(NcKernel *k, NcFrame *f, enum NcSysOp op, unsigned size, uint32_t eip)
 {
-    NcKernel *k = opaque;
-#if XBASED_DIAG
-    g_sysop_kind[(unsigned)op & 31]++;
-    if ((++g_sysops & 0xFFF) == 0) {
-        stats_tick(k);
-    }
-#endif
-    const uint32_t eip = nc_frame_eip(f);
     const uint8_t *insn = nc_vm_host(k->vm, eip);
     nc_x86mmio_flush(k);
 
@@ -2010,6 +2002,19 @@ static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
                                insn[0], insn[1], insn[2]);
         break;
     }
+}
+
+static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
+{
+    NcKernel *k = opaque;
+#if XBASED_DIAG
+    g_sysop_kind[(unsigned)op & 31]++;
+    if ((++g_sysops & 0xFFF) == 0) {
+        stats_tick(k);
+    }
+#endif
+    const uint32_t eip = nc_frame_eip(f);
+    dispatch_guest_sysop(k, f, op, size, eip);
 
     if (k->hle_after_sysop) {
         k->hle_after_sysop(k);

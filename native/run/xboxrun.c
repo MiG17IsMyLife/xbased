@@ -333,7 +333,7 @@ int main(int argc, char **argv)
     nc_options_apply(&opt);
     nc_log("xbased-native", "xboxrun: disc %s, hdd %s", argv[1], nc_io_hdd_root());
 
-    if (!nc_core_boot(&g_core, fd)) {
+    if (!nc_core_boot(&g_core, fd, &opt.boot)) {
         nc_log("xbased-native-frontier", "boot failed%s%s", nc_hle_fatal() ? ": " : "",
                nc_hle_fatal() ? nc_hle_fatal() : "");
         return nc_hle_fatal_kind() == NC_FATAL_STATE ? 8 : 1;

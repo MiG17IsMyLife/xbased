@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON
 #define PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON (0x00000001ull << 16)
@@ -14,6 +15,46 @@
 #ifndef PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON
 #define PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON (0x00000001ull << 20)
 #endif
+
+bool xb_quote_arg(char *cmd, size_t capacity, const char *arg)
+{
+    const size_t original = strlen(cmd);
+    size_t n = original;
+    if (capacity <= n || capacity - n < (n ? 4u : 3u)) {
+        return false;
+    }
+    if (n) {
+        cmd[n++] = ' ';
+    }
+    cmd[n++] = '"';
+    for (;;) {
+        size_t slashes = 0;
+        while (*arg == '\\') {
+            slashes++;
+            arg++;
+        }
+        if (*arg == '"' || !*arg) {
+            slashes *= 2;
+        }
+        const size_t chars = *arg == '"' ? 2 : *arg ? 1 : 0;
+        if (capacity - n < slashes + chars + 2) {
+            cmd[original] = '\0';
+            return false;
+        }
+        memset(cmd + n, '\\', slashes);
+        n += slashes;
+        if (!*arg) {
+            break;
+        }
+        if (*arg == '"') {
+            cmd[n++] = '\\';
+        }
+        cmd[n++] = *arg++;
+    }
+    cmd[n++] = '"';
+    cmd[n] = '\0';
+    return true;
+}
 
 bool xb_spawn(const char *exe, char *cmd, const char *dir, PROCESS_INFORMATION *pi)
 {

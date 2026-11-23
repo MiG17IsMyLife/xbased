@@ -21,6 +21,7 @@
 #include <windows.h>
 
 #include "native/app/win_aslr.h"
+#include "native/app/win_frame.h"
 #endif
 
 #include "xbased_version.h"         /* XBASED_VERSION (cmake/app_win.cmake) */
@@ -1591,29 +1592,6 @@ static struct {
 #ifdef _WIN32
 static HANDLE g_follow;     /* the game's process on Windows (follow below) */
 
-/* s, quoted for a Windows command line, after cmd's n bytes */
-static size_t quote_arg(char *cmd, size_t n, size_t size, const char *s)
-{
-    size_t slashes = 0;
-    if (n && n + 1 < size) {
-        cmd[n++] = ' ';
-    }
-    if (n + 1 < size) {
-        cmd[n++] = '"';
-    }
-    for (; *s && n + 4 < size; s++) {
-        slashes = *s == '\\' ? slashes + 1 : 0;
-        cmd[n++] = *s;
-    }
-    for (; slashes && n + 3 < size; slashes--) {
-        cmd[n++] = '\\';    /* a closing quote after backslashes: each doubled */
-    }
-    if (n + 1 < size) {
-        cmd[n++] = '"';
-    }
-    cmd[n] = 0;
-    return n;
-}
 #endif
 
 /* The file a game's processes note their time paused in (win_main.c
@@ -1663,21 +1641,20 @@ static void go_spawn(void)
     }
     /* the game's process with Windows' address randomization on for it
      * (win_aslr.h), followed as a run started again is */
-    static char cmd[4096];
-    size_t n = quote_arg(cmd, 0, sizeof(cmd), D.exe);
-    n = quote_arg(cmd, n, sizeof(cmd), g_go.path);
-    if (g_go.has_extra) {
-        quote_arg(cmd, n, sizeof(cmd), g_go.extra);
-    }
+    char cmd[4096] = "";
+    const bool args_ok = xb_quote_arg(cmd, sizeof(cmd), D.exe) &&
+                         xb_quote_arg(cmd, sizeof(cmd), g_go.path) &&
+                         (!g_go.has_extra || xb_quote_arg(cmd, sizeof(cmd), g_go.extra));
     PROCESS_INFORMATION pi;
     AllowSetForegroundWindow(ASFW_ANY);     /* the game's window, and its frame's process, may take it */
-    if (xb_spawn(D.exe, cmd, NULL, &pi)) {
+    if (args_ok && xb_spawn(D.exe, cmd, NULL, &pi)) {
         CloseHandle(pi.hThread);
         g_follow = pi.hProcess;
         g_go.t_start = SDL_GetTicks();
     } else {
         char e[96];
-        snprintf(e, sizeof(e), "The game couldn't start (error %lu)", GetLastError());
+        snprintf(e, sizeof(e), "The game couldn't start (error %lu)",
+                 args_ok ? GetLastError() : (unsigned long)ERROR_BUFFER_OVERFLOW);
         dash_toast(e);
 #else
     const char *args[4] = {D.exe, g_go.path, g_go.has_extra ? g_go.extra : NULL, NULL};
@@ -1762,10 +1739,11 @@ void launch_game(LibGame *g, const char *extra)
 
 static bool follow(DWORD code)
 {
-    if (!(code & 0x40000000u) || code == STILL_ACTIVE) {
+    const uint32_t pid = nc_frame_handoff_pid(code);
+    if (!pid || code == STILL_ACTIVE) {
         return false;
     }
-    g_follow = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, code & 0x3FFFFFFFu);
+    g_follow = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     return g_follow != NULL;
 }
 #endif

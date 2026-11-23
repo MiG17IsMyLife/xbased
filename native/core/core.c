@@ -9,6 +9,7 @@ void (*nc_crash_hook)(void);
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
+#include "native/core/xbox_boot.h"
 #include "native/core/xcheat.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
@@ -16,86 +17,13 @@ void (*nc_crash_hook)(void);
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <strings.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 
 #define MAIN_STACK_SIZE (256u * 1024u)
 
-static NcThread *g_boot;
-static bool g_relaunch;
-static bool g_dashboard;        /* boot the dashboard (nc_core_set_dashboard) */
-static char g_loadstate[512];   /* boot into this savestate (nc_core_set_loadstate) */
-static bool g_loaded;
-
-void nc_core_set_relaunch(bool on)
-{
-    g_relaunch = on;
-}
-
-void nc_core_set_dashboard(bool on)
-{
-    g_dashboard = on;
-}
-
-void nc_core_set_loadstate(const char *path)
-{
-    snprintf(g_loadstate, sizeof(g_loadstate), "%s", path ? path : "");
-}
 static bool core_hook_query(void *opaque, uint32_t eip);
 static void core_code_page(void *opaque, uint32_t va);
-
-/* An XBE header's certificate: the title ID and version. */
-static bool xbe_title(const uint8_t *h, size_t len, uint32_t *tid, uint32_t *ver)
-{
-    if (len < 0x180 || memcmp(h, "XBEH", 4)) {
-        return false;
-    }
-    const uint32_t cert = nc_rd32(h + 0x118) - nc_rd32(h + 0x104);
-    if (cert > len - 0xB0) {
-        return false;
-    }
-    *tid = nc_rd32(h + cert + 0x08);
-    *ver = nc_rd32(h + cert + 0xAC);
-    return true;
-}
-
-/* An Xbox Live title update of a disc XBE (path "\default.xbe" or
- * "\Device\CdRom0\default.xbe"): as the Xbox kernel does, the file of that
- * name in E:\TDATA\<title ID>\$u boots instead when it is the same title's
- * and no older (the title's updater installs it there, then relaunches the
- * disc). Its path in out; false when there is none. */
-static bool title_update(const NcDisc *disc, const char *path, char *out, size_t n)
-{
-    static const char cd[] = "\\Device\\CdRom0\\";
-    const char *rel = !strncasecmp(path, cd, sizeof(cd) - 1)                ? path + sizeof(cd) - 1
-                      : path[0] == '\\' && strncasecmp(path, "\\Device\\", 8) ? path + 1
-                                                                            : NULL;
-    NcDiscFile f;
-    uint8_t h[0x1000], u[0x1000];
-    uint32_t tid, ver, utid, uver;
-    if (!rel || strchr(rel, '\\') || !nc_disc_find(disc, rel, &f) || f.size < sizeof(h) ||
-        !nc_disc_read(disc, &f, 0, h, sizeof(h)) || !xbe_title(h, sizeof(h), &tid, &ver)) {
-        return false;
-    }
-    char host[512];
-    snprintf(out, n, "\\Device\\Harddisk0\\Partition1\\TDATA\\%08x\\$u\\%s", tid, rel);
-    if (!nc_io_host_file(out, host, sizeof(host))) {
-        return false;
-    }
-    FILE *fp = fopen(host, "rb");
-    const bool read = fp && fread(u, 1, sizeof(u), fp) == sizeof(u);
-    if (fp) {
-        fclose(fp);
-    }
-    if (!read || !xbe_title(u, sizeof(u), &utid, &uver) || utid != tid || uver < ver) {
-        nc_log("xbased-native-frontier", "title update %s: not this title's newer version (title %08x version %x, "
-               "the disc's %08x %x): the disc's boots", out, read ? utid : 0, read ? uver : 0, tid, ver);
-        return false;
-    }
-    nc_log("xbased-native-frontier", "title update: %s (version %x, the disc's %x) boots for %s", out, uver, ver, path);
-    return true;
-}
 
 /* The title can't start: why, for the activity's dialog (NC_FATAL_BOOT). */
 static bool boot_failed(const char *why)
@@ -104,148 +32,41 @@ static bool boot_failed(const char *why)
     return false;
 }
 
-bool nc_core_boot(NcCore *c, int disc_fd)
+static void init_xbox_devices(NcVm *vm)
+{
+    nc_dev_nv2a_init();
+    nc_dev_nv2a_set_ram(vm->ram_size);
+    nc_dev_apu_init(vm);
+    nc_dev_xbox_usb_init(vm);
+    nc_dev_aci_init(vm);
+    nc_net_start();
+    nc_dev_nvnet_init(vm);
+    /* Register last so the catch-all leaves APU and other devices first. */
+    nc_dev_misc_init();
+}
+
+bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
 {
     memset(c, 0, sizeof(*c));
     c->disc.fd = -1;
-    /* 128 MiB, a debug kit's (the option ram=128, NC_RAM_MB=128): for a title
-     * built without XINIT_LIMIT_DEVKIT_MEMORY (the XBE's init flag 4), as a
-     * debug kit gives it; betas and debug builds use the extra memory. A
-     * retail title marked for 64 MiB gets 64 there too: given 128, Halo's
-     * D3D wrote push buffer jumps the GPU can't take and drew nothing.
-     * An XBE signed with the debug keys runs on a debug kit only, so it gets
-     * a debug kit's memory whatever the option says (unless marked for 64):
-     * StarCraft Ghost's v1.256 build (flags 1) ran out of 64 MiB loading its
-     * first mission ("out of physical memory", then a write to 0). */
-    const char *mb = getenv("NC_RAM_MB");
-    uint32_t ram = mb && atoi(mb) == 128 ? 128u << 20 : NC_RAM_RETAIL;
-    if (disc_fd >= 0 && !g_dashboard) {
-        NcDisc d;
-        memset(&d, 0, sizeof(d));
-        const int fd = dup(disc_fd);
-        NcDiscFile f;
-        uint8_t h[0x12C];
-        if (fd >= 0 && nc_disc_open(&d, fd)) {
-            if (nc_disc_find(&d, "default.xbe", &f) && nc_disc_read(&d, &f, 0, h, sizeof(h)) &&
-                !memcmp(h, "XBEH", 4)) {
-                const uint32_t base = nc_rd32(h + 0x104), size = nc_rd32(h + 0x10C);
-                const uint32_t entry = nc_rd32(h + 0x128) ^ 0x94859D4Bu;     /* the debug keys' */
-                const bool debug = entry >= base && entry - base < size &&
-                                   !((nc_rd32(h + 0x128) ^ 0xA8FC57ABu) - base < size);
-                if (nc_rd32(h + 0x124) & 4) {
-                    if (ram > NC_RAM_RETAIL) {
-                        nc_log("xbased-native", "memory: the title is marked for 64 MiB (as a debug kit runs it): 64 MiB");
-                    }
-                    ram = NC_RAM_RETAIL;
-                } else if (debug && ram == NC_RAM_RETAIL) {
-                    ram = 128u << 20;
-                    nc_log("xbased-native", "memory: a debug kit's XBE (the debug keys), not marked for 64 MiB: 128 MiB");
-                }
-            }
-            nc_disc_close(&d);
-        } else if (fd >= 0) {
-            close(fd);
-        }
-    }
+    const bool loadstate = boot->loadstate[0] != '\0';
+    const uint32_t ram = nc_xbox_boot_ram(disc_fd, boot);
     /* a savestate's kernel objects are where its boot made them (KERN v3
      * moved the pool's first range) */
-    nc_kernel_pool_for(g_loadstate[0] ? nc_kern_state_kprocess(g_loadstate) : 0);
+    nc_kernel_pool_for(loadstate ? nc_kern_state_kprocess(boot->loadstate) : 0);
     if (!nc_vm_init(&c->vm, ram) || !nc_kernel_init(&c->kernel, &c->vm)) {
+        if (disc_fd >= 0) {
+            close(disc_fd);
+        }
         return boot_failed(nc_vm_why ? nc_vm_why : "The emulated console couldn't be set up.");
     }
-    if (g_relaunch) {
+    if (boot->relaunch) {
         /* the last title's kept memory (D3D's saved display), where it was */
         nc_kernel_av_saved_set(nc_mm_keep_restore(&c->kernel));
     }
-    nc_dev_nv2a_init();
-    nc_dev_nv2a_set_ram(c->vm.ram_size);   /* PFB_CSTATUS: the memory the GPU reports */
-    nc_dev_apu_init(&c->vm); /* before the catch-all, which would claim its window */
-    nc_dev_ohci_init(&c->vm);
-    nc_dev_aci_init(&c->vm);
-    nc_net_start();          /* the network the NIC finds, before it */
-    nc_dev_nvnet_init(&c->vm);
-    nc_dev_misc_init();
-    /* The dashboard boots with no disc (the tray empty); a title from the
-     * disc, or the dashboard relaunched from one, has it. */
-    if (disc_fd >= 0) {
-        if (!nc_disc_open(&c->disc, disc_fd)) {
-            close(disc_fd);
-            return boot_failed("The game's file isn't an Xbox disc image.");
-        }
-        nc_mods_install(&c->disc);      /* the mods' files and XBE patches, the cheats */
-    } else if (!g_dashboard && !g_loadstate[0]) {
-        return boot_failed("The game's file can't be opened.");
-    }
-    /* A relaunch (XLaunchNewImage, NativeCoreActivity starts the core again):
-     * the XBE the saved launch data page names, and the page for the title. */
-    static uint8_t page[NC_LAUNCH_PAGE];
-    bool have_page = false;
-    char xbe_path[NC_LAUNCH_PAGE] = "\\default.xbe";
-    if (g_dashboard) {
-        snprintf(xbe_path, sizeof(xbe_path), "%s", NC_DASHBOARD_PATH);
-        snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", NC_DASHBOARD_PATH);
-    }
-    if (g_loadstate[0]) {
-        /* a savestate: the XBE it was running (a relaunched title's own, the
-         * dashboard's) */
-        NcStateInfo info;
-        static const char cd[] = "\\Device\\CdRom0";
-        static const char hd[] = "\\Device\\Harddisk0\\";
-        if (!nc_state_read_info(g_loadstate, &info)) {
-            nc_hle_set_fatal(NC_FATAL_STATE, "the savestate can't be read");
-            return false;
-        }
-        if ((!strncasecmp(info.xbe_path, cd, sizeof(cd) - 1) && info.xbe_path[sizeof(cd) - 1] == '\\') ||
-            !strncasecmp(info.xbe_path, hd, sizeof(hd) - 1)) {
-            snprintf(xbe_path, sizeof(xbe_path), "%s", info.xbe_path);
-            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", info.xbe_path);
-        }
-        nc_log("xbased-native-frontier", "savestate: booting %s for %s", xbe_path, g_loadstate);
-    } else if (g_relaunch) {
-        char file[512];
-        nc_kernel_relaunch_file(file, sizeof(file));
-        FILE *fp = fopen(file, "rb");
-        if (fp) {
-            have_page = fread(page, 1, NC_LAUNCH_PAGE, fp) == NC_LAUNCH_PAGE;
-            fclose(fp);
-            unlink(file);
-        }
-        if (have_page && nc_kernel_launch_xbe(page, xbe_path, sizeof(xbe_path))) {
-            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", xbe_path);
-            nc_log("xbased-native-frontier", "relaunch: %s (launch type %u)", c->kernel.image_path,
-                   *(const uint32_t *)page);
-        } else {
-            have_page = false;
-            snprintf(xbe_path, sizeof(xbe_path), "%s", g_dashboard ? NC_DASHBOARD_PATH : "\\default.xbe");
-            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", g_dashboard ? NC_DASHBOARD_PATH : "");
-            nc_log("xbased-native-frontier", "relaunch: no launch data page, booting %s", xbe_path);
-        }
-    }
-    /* a disc XBE with a title update installed: the update (a savestate's
-     * memory is the XBE it ran, booted as it was) */
-    static char update[NC_LAUNCH_PAGE];
-    if (!g_loadstate[0] && disc_fd >= 0 && title_update(&c->disc, xbe_path, update, sizeof(update))) {
-        snprintf(xbe_path, sizeof(xbe_path), "%s", update);
-        snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", update);
-    }
-    if (!nc_xbe_load(&c->vm, &c->disc, xbe_path, &c->kernel, &c->xbe)) {
-        char why[256], host[512];
-        if (nc_vm_why) {
-            return boot_failed(nc_vm_why);  /* the host's memory where the XBE goes */
-        }
-        if (!strcasecmp(xbe_path, NC_DASHBOARD_PATH) && !nc_io_host_file(xbe_path, host, sizeof(host))) {
-            return boot_failed("The dashboard isn't installed: its files (xboxdash.xbe and its folders) go on "
-                               "the hard disk's C: drive.");
-        }
-        const char *name = strrchr(xbe_path, '\\');
-        snprintf(why, sizeof(why), "The game's program (%s) can't be loaded: it's damaged, or xbased doesn't support "
-                 "it yet.", name ? name + 1 : xbe_path);
-        return boot_failed(why);
-    }
-    nc_kernel_title_loaded(&c->kernel, &c->disc, &c->xbe.file, c->xbe.fd, c->xbe.info.base,
-                           c->xbe.info.sizeof_image);
-    if (have_page) {
-        nc_kernel_launch_page_restore(&c->kernel, page);
+    init_xbox_devices(&c->vm);
+    if (!nc_xbox_boot_xbe(c, disc_fd, boot)) {
+        return false;
     }
     nc_kernel_title_fixups(&c->kernel, &c->xbe.info);
     {
@@ -290,22 +111,22 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         stack = nc_align_up(c->xbe.stack_commit, NC_PAGE);
     }
     /* a cheat file chosen for this title (core/xcheat.c): run before the entry point */
-    const uint32_t start = g_loadstate[0] ? c->xbe.info.entry
-                                          : nc_xcheat_install(&c->kernel, &c->vm, c->xbe.info.entry, c->xbe.info.title_id);
-    g_boot = nc_kernel_boot_thread(&c->kernel, c->cpu, start, stack);
-    if (!g_boot) {
+    const uint32_t start = loadstate ? c->xbe.info.entry
+                                    : nc_xcheat_install(&c->kernel, &c->vm, c->xbe.info.entry, c->xbe.info.title_id);
+    c->boot_thread = nc_kernel_boot_thread(&c->kernel, c->cpu, start, stack);
+    if (!c->boot_thread) {
         return boot_failed("The emulated CPU couldn't start.");
     }
     nc_log("xbased-native-frontier", "stage S1 entry %08x, stack %08x-%08x, fs %08x",
-           c->xbe.info.entry, g_boot->stack_limit, g_boot->stack_base, c->kernel.kpcr_va);
+           c->xbe.info.entry, c->boot_thread->stack_limit, c->boot_thread->stack_base, c->kernel.kpcr_va);
 
     /* The HLE GPU layer: its hooks come from the title's signature scan. */
     c->kernel.hle_hook = nc_hle_hook;
     c->kernel.hle_after_sysop = nc_hle_after_sysop;
-    nc_hle_boot(&c->kernel, &c->vm, c->cpu, &g_boot->ctx);
+    nc_hle_boot(&c->kernel, &c->vm, c->cpu, &c->boot_thread->ctx);
     nc_state_attach(c);
-    if (g_loadstate[0]) {
-        const char *err = nc_state_load(g_loadstate);
+    if (loadstate) {
+        const char *err = nc_state_load(boot->loadstate);
         if (err) {
             char why[384];
             snprintf(why, sizeof(why), "The savestate couldn't be loaded: %s.", err);
@@ -314,7 +135,7 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         }
         nc_kernel_loaded_fixups(&c->kernel);
         nc_mods_after_load(&c->kernel, c->kernel.image_path);
-        g_loaded = true;
+        c->restored_state = true;
     }
     return true;
 }
@@ -326,8 +147,8 @@ void nc_core_run(NcCore *c)
      * wait run 50 us late by default. */
     prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
     /* a savestate: the thread it was running, or the scheduler first */
-    const NcCpuContext *start = g_loaded ? nc_kstate_start_context(&c->kernel) : &g_boot->ctx;
-    nc_cpu_run(c->cpu, start ? start : &g_boot->ctx);
+    const NcCpuContext *start = c->restored_state ? nc_kstate_start_context(&c->kernel) : &c->boot_thread->ctx;
+    nc_cpu_run(c->cpu, start ? start : &c->boot_thread->ctx);
     const NcKernel *k = &c->kernel;
     if (k->stop) {
         nc_log("xbased-native-frontier", "stop: %s", k->stop_reason);
@@ -525,82 +346,38 @@ void nc_mmio_fault_sites(char *buf, size_t len)
     memset(g_mfs, 0, sizeof(g_mfs));
 }
 
-bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
+static void log_watched_store(NcCore *c, const void *address, void *ucontext, uintptr_t pc)
 {
-    if (sig == SIGILL) {
-        return false;
+    const uint64_t gva = nc_vm_guest_of(&c->vm, address);
+    const uint32_t gpa = gva != UINT64_MAX ? nc_vm_phys(&c->vm, (uint32_t)gva) : UINT32_MAX;
+    if (gpa == UINT32_MAX || !nc_hle_watch_pa(gpa)) {
+        return;
     }
-#if defined(__x86_64__)
-    const uintptr_t pc = nc_cpu_context_pc(ucontext);
-#else
-    const uintptr_t pc = ((ucontext_t *)ucontext)->uc_mcontext.pc;
-#endif
-    if (sig == SIGFPE) {
-        /* A guest DIV/IDIV's divide error (fault_win.c): to the title's
-         * handlers, as the Xbox kernel hands it (a divisor of zero, or a
-         * quotient that doesn't fit: si_code says which); with none, said
-         * where it happened rather than leaving the process gone unlogged. */
-        NcFrame *df = nc_cpu_fault_frame(c->cpu, ucontext);
-        if (df && (nc_kernel_trap(&c->kernel, df, 0, nc_frame_eip(df)) ||
-                   nc_seh_fault(&c->kernel, df, info->si_code == NC_FPE_OVERFLOW ? NC_STATUS_INTEGER_OVERFLOW
-                                                                                 : NC_STATUS_INTEGER_DIVIDE_BY_ZERO,
-                                nc_frame_eip(df), 0, 0, 0))) {
-            nc_cpu_fault_resume(c->cpu, ucontext);
-            return true;
-        }
-        return fault_report(c, pc, 0, "divide error");
-    }
-    if (sig == SIGBUS && nc_cpu_unaligned_fault(c->cpu, info->si_code, ucontext)) {
-        /* Doom 3 keeps a critical section at 0x00BFD88E: RtlEnterCriticalSection's
-         * lock inc of its LockCount (0x00BFD89E) took the core down */
-        if (__atomic_fetch_add(&g_nc_faults_unaligned, 1, __ATOMIC_RELAXED) < 4) {
-            nc_log("xbased-native", "unaligned atomic at guest %08llx, eip %08x",
-                   (unsigned long long)nc_vm_guest_of(&c->vm, info->si_addr), nc_cpu_guest_eip_at(c->cpu, pc));
-        }
-        return true;
-    }
-    if (nc_cpu_callret_fault(c->cpu, (uintptr_t)info->si_addr, ucontext)) {
-        __atomic_fetch_add(&g_nc_faults_callret, 1, __ATOMIC_RELAXED);
-        return true;
-    }
-    {   /* NC_WATCHPA: a guest store to the watched RAM, with its EIP */
-        const uint64_t gva = nc_vm_guest_of(&c->vm, info->si_addr);
-        const uint32_t gpa = gva != UINT64_MAX ? nc_vm_phys(&c->vm, (uint32_t)gva) : UINT32_MAX;
-        if (gpa != UINT32_MAX && nc_hle_watch_pa(gpa)) {
-            nc_hle_watch_store((uint32_t)gva, gpa, nc_cpu_guest_eip_at(c->cpu, pc), 0);
-            static unsigned framed;
-            NcFrame *wf = framed < 20 ? nc_cpu_fault_frame(c->cpu, ucontext) : NULL;
-            if (wf) {
-                /* the stack's words that look like the title's code: return addresses */
-                framed++;
-                char fr[400];
-                int n = 0;
-                const uint32_t esp = nc_frame_gpr(wf, NC_ESP);
-                for (uint32_t i = 0; i < 160 && n < (int)sizeof(fr) - 12; i++) {
-                    const uint32_t a = esp + 4 * i;
-                    if (nc_vm_phys(&c->vm, a) == UINT32_MAX) {
-                        break;
-                    }
-                    const uint32_t w = nc_vm_rd32(&c->vm, a);
-                    if (w >= 0x11000 && w < 0x160000) {
-                        n += snprintf(fr + n, sizeof(fr) - (size_t)n, " %x:%08x", i * 4, w);
-                    }
-                }
-                nc_log("xbased-native-watch", "  esp %08x stack%s", esp, fr);
+    nc_hle_watch_store((uint32_t)gva, gpa, nc_cpu_guest_eip_at(c->cpu, pc), 0);
+    static unsigned framed;
+    NcFrame *wf = framed < 20 ? nc_cpu_fault_frame(c->cpu, ucontext) : NULL;
+    if (wf) {
+        /* the stack's words that look like the title's code: return addresses */
+        framed++;
+        char fr[400];
+        int n = 0;
+        const uint32_t esp = nc_frame_gpr(wf, NC_ESP);
+        for (uint32_t i = 0; i < 160 && n < (int)sizeof(fr) - 12; i++) {
+            const uint32_t a = esp + 4 * i;
+            if (nc_vm_phys(&c->vm, a) == UINT32_MAX) {
+                break;
+            }
+            const uint32_t w = nc_vm_rd32(&c->vm, a);
+            if (w >= 0x11000 && w < 0x160000) {
+                n += snprintf(fr + n, sizeof(fr) - (size_t)n, " %x:%08x", i * 4, w);
             }
         }
+        nc_log("xbased-native-watch", "  esp %08x stack%s", esp, fr);
     }
-    if (nc_hle_dirty_fault(info, ucontext)) {
-        __atomic_fetch_add(&g_nc_faults_dirty, 1, __ATOMIC_RELAXED);
-        return true;
-    }
-    if (nc_mmio_fault(&c->vm, info, ucontext)) {
-        __atomic_fetch_add(&g_nc_faults_mmio, 1, __ATOMIC_RELAXED);
-        mmio_fault_sample(nc_cpu_guest_eip_at(c->cpu, pc));
-        /* From translated code: that instruction is hooked from now on. */
-        nc_x86mmio_note(nc_cpu_guest_eip_at(c->cpu, pc));
-        return true;
-    }
+}
+
+static bool handle_guest_page_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext, uintptr_t pc)
+{
     /* A guest page the guest doesn't have: the title's page tables may map
      * it since the last flush (the access runs again), or else from
      * translated code the title's page-fault handler, if it has one, maps it.
@@ -657,4 +434,57 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
     }
     nc_cpu_fault_resume(c->cpu, ucontext);
     return true;
+}
+
+bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
+{
+    if (sig == SIGILL) {
+        return false;
+    }
+#if defined(__x86_64__)
+    const uintptr_t pc = nc_cpu_context_pc(ucontext);
+#else
+    const uintptr_t pc = ((ucontext_t *)ucontext)->uc_mcontext.pc;
+#endif
+    if (sig == SIGFPE) {
+        /* A guest DIV/IDIV's divide error (fault_win.c): to the title's
+         * handlers, as the Xbox kernel hands it (a divisor of zero, or a
+         * quotient that doesn't fit: si_code says which); with none, said
+         * where it happened rather than leaving the process gone unlogged. */
+        NcFrame *df = nc_cpu_fault_frame(c->cpu, ucontext);
+        if (df && (nc_kernel_trap(&c->kernel, df, 0, nc_frame_eip(df)) ||
+                   nc_seh_fault(&c->kernel, df, info->si_code == NC_FPE_OVERFLOW ? NC_STATUS_INTEGER_OVERFLOW
+                                                                                 : NC_STATUS_INTEGER_DIVIDE_BY_ZERO,
+                                nc_frame_eip(df), 0, 0, 0))) {
+            nc_cpu_fault_resume(c->cpu, ucontext);
+            return true;
+        }
+        return fault_report(c, pc, 0, "divide error");
+    }
+    if (sig == SIGBUS && nc_cpu_unaligned_fault(c->cpu, info->si_code, ucontext)) {
+        /* Doom 3 keeps a critical section at 0x00BFD88E: RtlEnterCriticalSection's
+         * lock inc of its LockCount (0x00BFD89E) took the core down */
+        if (__atomic_fetch_add(&g_nc_faults_unaligned, 1, __ATOMIC_RELAXED) < 4) {
+            nc_log("xbased-native", "unaligned atomic at guest %08llx, eip %08x",
+                   (unsigned long long)nc_vm_guest_of(&c->vm, info->si_addr), nc_cpu_guest_eip_at(c->cpu, pc));
+        }
+        return true;
+    }
+    if (nc_cpu_callret_fault(c->cpu, (uintptr_t)info->si_addr, ucontext)) {
+        __atomic_fetch_add(&g_nc_faults_callret, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    log_watched_store(c, info->si_addr, ucontext, pc);
+    if (nc_hle_dirty_fault(info, ucontext)) {
+        __atomic_fetch_add(&g_nc_faults_dirty, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+    if (nc_mmio_fault(&c->vm, info, ucontext)) {
+        __atomic_fetch_add(&g_nc_faults_mmio, 1, __ATOMIC_RELAXED);
+        mmio_fault_sample(nc_cpu_guest_eip_at(c->cpu, pc));
+        /* From translated code: that instruction is hooked from now on. */
+        nc_x86mmio_note(nc_cpu_guest_eip_at(c->cpu, pc));
+        return true;
+    }
+    return handle_guest_page_fault(c, sig, info, ucontext, pc);
 }

@@ -3,7 +3,6 @@
  * end (native/app/app_main.c) and xboxrun (native/run/xboxrun.c).
  */
 #include "native/core/options.h"
-#include "native/core/core.h"
 #include "native/core/mods.h"
 #include "native/core/xcheat.h"
 #include "native/hle/hle_native.h"
@@ -45,9 +44,9 @@ bool nc_option(NcOptions *o, const char *arg)
     } else if (!strcmp(arg, "uncap")) {
         o->uncap = true;
     } else if (!strcmp(arg, "relaunch")) {
-        nc_core_set_relaunch(true);
+        o->boot.relaunch = true;
     } else if (!strcmp(arg, "dash")) {
-        nc_core_set_dashboard(true);            /* no disc: the disc argument is "none" */
+        o->boot.dashboard = true;            /* no disc: the disc argument is "none" */
     } else if ((v = value(arg, "xcheat="))) {
         /* a cheat file and its options' states: <file>|<1s and 0s> */
         char path[1024];
@@ -67,7 +66,7 @@ bool nc_option(NcOptions *o, const char *arg)
     } else if ((v = value(arg, "fpscap="))) {
         o->fps_cap = atoi(v) > 0 ? atoi(v) : 0;
     } else if ((v = value(arg, "loadstate="))) {
-        nc_core_set_loadstate(v);
+        snprintf(o->boot.loadstate, sizeof(o->boot.loadstate), "%s", v);
         nc_log("xbased-app", "savestate %s", v);
     } else if ((v = value(arg, "mods="))) {
         nc_mods_set_manifest(v);                /* read as the disc opens */

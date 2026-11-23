@@ -148,7 +148,7 @@ static bool g_trace; /* NC_TRACE_USB: every transfer but NAKed polls */
 static const unsigned k_port_map[4] = {3, 4, 1, 2};
 static NcUsbDev *g_pad_hub[4];
 static bool g_front_hub;
-static bool g_ready;                    /* nc_dev_ohci_init done */
+static bool g_ready;                    /* the controller and its ports are ready */
 static int g_early_mask = -1;           /* nc_dev_ohci_set_pads before it: the boot's */
 
 static uint64_t now_ns(void)
@@ -578,6 +578,43 @@ static bool service_list(Ohci *o, uint32_t head, bool periodic)
     return active;
 }
 
+static void service_frame_lists(Ohci *o, const uint8_t *hcca)
+{
+    if ((o->ctl & CTL_PLE) && hcca) {
+        service_list(o, nc_rd32(hcca + 4 * (o->frame_number & 31)), true);
+    }
+    if ((o->ctl & CTL_CLE) && (o->status & CS_CLF)) {
+        if (!service_list(o, o->ctrl_head, false)) {
+            o->ctrl_cur = 0;
+            o->status &= ~CS_CLF;
+        }
+    }
+    if ((o->ctl & CTL_BLE) && (o->status & CS_BLF)) {
+        if (!service_list(o, o->bulk_head, false)) {
+            o->bulk_cur = 0;
+            o->status &= ~CS_BLF;
+        }
+    }
+}
+
+static void publish_done_queue(Ohci *o, uint8_t *hcca)
+{
+    /* The done queue goes out when its delay runs down and the last one was taken. */
+    if (o->done && o->done_count == 0 && !(o->intr_status & INT_WDH) && hcca) {
+        uint32_t head = o->done;
+        if (o->intr_status & o->intr & ~INT_WDH) {
+            head |= 1;
+        }
+        nc_wr32(hcca + 0x84, head);
+        o->done = 0;
+        o->done_count = 7;
+        o->intr_status |= INT_WDH;
+    }
+    if (o->done_count != 7 && o->done_count != 0) {
+        o->done_count--;
+    }
+}
+
 static void frame(Ohci *o)
 {
     o->frames++;
@@ -601,36 +638,8 @@ static void frame(Ohci *o)
     }
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
-    if ((o->ctl & CTL_PLE) && hcca) {
-        service_list(o, nc_rd32(hcca + 4 * (o->frame_number & 31)), true);
-    }
-    if ((o->ctl & CTL_CLE) && (o->status & CS_CLF)) {
-        if (!service_list(o, o->ctrl_head, false)) {
-            o->ctrl_cur = 0;
-            o->status &= ~CS_CLF;
-        }
-    }
-    if ((o->ctl & CTL_BLE) && (o->status & CS_BLF)) {
-        if (!service_list(o, o->bulk_head, false)) {
-            o->bulk_cur = 0;
-            o->status &= ~CS_BLF;
-        }
-    }
-
-    /* The done queue goes out when its delay runs down and the last one was taken. */
-    if (o->done && o->done_count == 0 && !(o->intr_status & INT_WDH) && hcca) {
-        uint32_t head = o->done;
-        if (o->intr_status & o->intr & ~INT_WDH) {
-            head |= 1;
-        }
-        nc_wr32(hcca + 0x84, head);
-        o->done = 0;
-        o->done_count = 7;
-        o->intr_status |= INT_WDH;
-    }
-    if (o->done_count != 7 && o->done_count != 0) {
-        o->done_count--;
-    }
+    service_frame_lists(o, hcca);
+    publish_done_queue(o, hcca);
     o->intr_status |= INT_SF;
     update_irq(o);
 }
@@ -784,35 +793,30 @@ static void ohci_write(void *opaque, uint32_t off, uint64_t value, unsigned size
 /* NC_PAD_MASK: which of players 1-4 have a controller plugged in at boot (bit n:
  * player n + 1; hex: the app's, later ones nc_dev_ohci_set_pads); else NC_PADS, how many
  * from player 1 (default 1). */
-void nc_dev_ohci_init(struct NcVm *vm)
+static unsigned initial_player_mask(void)
 {
-    Ohci *o = &g_ohci;
-    pthread_mutex_lock(&o->lock);
-    o->vm = vm;
-
-    g_trace = getenv("NC_TRACE_USB") != NULL;
-    const char *m = getenv("NC_PAD_MASK");
-    const char *e = getenv("NC_PADS");
-    unsigned mask = m ? (unsigned)strtoul(m, NULL, 16) & 0xF : 0;
-    if (!m) {
-        const unsigned n = e ? (unsigned)atoi(e) : 1;
-        mask = n >= 4 ? 0xF : (1u << n) - 1;
-    }
+    const char *configured_mask = getenv("NC_PAD_MASK");
     if (g_early_mask >= 0) {
-        mask = (unsigned)g_early_mask;      /* the controllers changed while the core started */
+        return (unsigned)g_early_mask;  /* controllers changed while the core started */
     }
-    unsigned players = 0;
-    for (unsigned p = 0; p < 4; p++) {
-        players += (mask >> p) & 1;
+    if (configured_mask) {
+        return (unsigned)strtoul(configured_mask, NULL, 16) & 0xF;
     }
+    const char *configured_count = getenv("NC_PADS");
+    const unsigned count = configured_count ? (unsigned)atoi(configured_count) : 1;
+    return count >= 4 ? 0xF : (1u << count) - 1;
+}
+
+/* Establish the console wiring before the host controller starts polling. */
+static bool build_xbox_usb_ports(NcUsbDev *ports[ROOT_PORTS], unsigned mask)
+{
     /* Controllers straight on the root ports (players 1-4 on ports 3, 4, 1,
      * 2), as the later consoles wire them. NC_USB_FRONT_HUB=1 puts the 1.0
      * console's front panel hub in between, which the titles' USB stack
      * doesn't enumerate past here yet. */
     const char *fh = getenv("NC_USB_FRONT_HUB");
     const bool front_hub = fh && atoi(fh) != 0;
-    g_front_hub = front_hub;
-    NcUsbDev *front = front_hub && players ? nc_usb_hub_new(4) : NULL;
+    NcUsbDev *front = front_hub && mask ? nc_usb_hub_new(4) : NULL;
     const char *voice = getenv("NC_VOICE");
     for (unsigned p = 0; p < 4; p++) {
         g_pad_hub[p] = nc_usb_hub_new(3);
@@ -826,18 +830,17 @@ void nc_dev_ohci_init(struct NcVm *vm)
         if (front) {
             nc_usb_hub_attach(front, k_port_map[p], g_pad_hub[p]);
         } else {
-            o->dev[k_port_map[p] - 1] = g_pad_hub[p];
+            ports[k_port_map[p] - 1] = g_pad_hub[p];
         }
     }
     if (front) {
-        o->dev[0] = front;
+        ports[0] = front;
     }
-    soft_reset(o);
-    o->ctl = 0;
-    roothub_reset(o);
-    g_ready = true;
-    pthread_mutex_unlock(&o->lock);
+    return front_hub;
+}
 
+static void ohci_start(Ohci *o)
+{
     static NcMmioDev dev = {
         .name = "ohci0",
         .base = OHCI_BASE,
@@ -851,6 +854,29 @@ void nc_dev_ohci_init(struct NcVm *vm)
     pthread_t t;
     pthread_create(&t, NULL, frame_thread, o);
     pthread_detach(t);
+}
+
+void nc_dev_xbox_usb_init(NcVm *vm)
+{
+    Ohci *o = &g_ohci;
+
+    pthread_mutex_lock(&o->lock);
+    o->vm = vm;
+    g_trace = getenv("NC_TRACE_USB") != NULL;
+    const unsigned mask = initial_player_mask();
+    const bool front_hub = build_xbox_usb_ports(o->dev, mask);
+    g_front_hub = front_hub;
+    soft_reset(o);
+    o->ctl = 0;
+    roothub_reset(o);
+    g_ready = true;
+    pthread_mutex_unlock(&o->lock);
+
+    ohci_start(o);
+    unsigned players = 0;
+    for (unsigned p = 0; p < 4; p++) {
+        players += (mask >> p) & 1;
+    }
     nc_log("xbased-native-usb", "ohci: %u controller(s) (players %s%s%s%s)%s", players, mask & 1 ? "1" : "",
            mask & 2 ? "2" : "", mask & 4 ? "3" : "", mask & 8 ? "4" : "",
            front_hub ? " behind the front panel hub" : "");
@@ -952,6 +978,53 @@ static bool dev_fits(NcUsbDev *d)
     return false;
 }
 
+static bool load_root_hub(Ohci *o, unsigned i, uint32_t fresh, NcRd *r, unsigned v, unsigned *changes)
+{
+    NcUsbDev *hub = o->dev[i];
+    if (!nc_rd_u8(r)) {
+        if (hub) {
+            /* plugged in since: a connection for the guest to see */
+            o->port[i] = fresh | PORT_CCS | PORT_CSC | (hub->low_speed ? PORT_LSDA : 0);
+            (*changes)++;
+        }
+        return true;
+    }
+
+    /* Restore endpoint state into the current hub, keeping its descriptors
+     * and callbacks. Consume the same fields if the hub was unplugged. */
+    NcUsbDev scratch;
+    NcUsbHubState hs = {0};
+    nc_rec_get(r, &nc_rec_NcUsbDev, hub ? hub : &scratch, v);
+    nc_rec_get(r, &nc_rec_NcUsbHubState, &hs, v);
+    if (hs.nports > 4 || !dev_fits(hub ? hub : &scratch)) {
+        return false;
+    }
+
+    if (hub) {
+        nc_usb_hub_state_set(hub, &hs);
+    } else {
+        /* unplugged since: the guest sees it go */
+        o->port[i] = (o->port[i] & ~(PORT_CCS | PORT_PES | PORT_LSDA)) | PORT_CSC;
+        (*changes)++;
+    }
+
+    for (unsigned p = 1; p <= hs.nports; p++) {
+        NcUsbDev *child = hub ? nc_usb_hub_child(hub, p) : NULL;
+        const bool had_child = nc_rd_u8(r);
+        if (had_child) {
+            nc_rec_get(r, &nc_rec_NcUsbDev, child ? child : &scratch, v);
+            if (!dev_fits(child ? child : &scratch)) {
+                return false;
+            }
+        }
+        if (hub && had_child != (child != NULL)) {
+            nc_usb_hub_port_changed(hub, p);
+            (*changes)++;
+        }
+    }
+    return true;
+}
+
 bool nc_usb_state_load(NcRd *r, unsigned v)
 {
     Ohci *o = &g_ohci;
@@ -961,46 +1034,9 @@ bool nc_usb_state_load(NcRd *r, unsigned v)
     nc_rec_get(r, &nc_rec_Ohci, o, v);
     unsigned changes = 0;
     for (unsigned i = 0; i < ROOT_PORTS && !r->fail; i++) {
-        NcUsbDev *hub = o->dev[i];
-        if (!nc_rd_u8(r)) {
-            if (hub) {
-                /* plugged in since: a connection for the guest to see */
-                o->port[i] = fresh_port[i] | PORT_CCS | PORT_CSC | (hub->low_speed ? PORT_LSDA : 0);
-                changes++;
-            }
-            continue;
-        }
-        /* the state's devices are read into the ones plugged in now: their
-         * stored fields only (descriptors and callbacks stay) */
-        NcUsbDev scratch;
-        NcUsbHubState hs = {0};
-        nc_rec_get(r, &nc_rec_NcUsbDev, hub ? hub : &scratch, v);
-        nc_rec_get(r, &nc_rec_NcUsbHubState, &hs, v);
-        if (hs.nports > 4 || !dev_fits(hub ? hub : &scratch)) {
+        if (!load_root_hub(o, i, fresh_port[i], r, v, &changes)) {
             pthread_mutex_unlock(&o->lock);
             return false;
-        }
-        if (hub) {
-            nc_usb_hub_state_set(hub, &hs);
-        } else {
-            /* unplugged since: the guest sees it go */
-            o->port[i] = (o->port[i] & ~(PORT_CCS | PORT_PES | PORT_LSDA)) | PORT_CSC;
-            changes++;
-        }
-        for (unsigned p = 1; p <= hs.nports; p++) {
-            NcUsbDev *c = hub ? nc_usb_hub_child(hub, p) : NULL;
-            const bool had = nc_rd_u8(r);
-            if (had) {
-                nc_rec_get(r, &nc_rec_NcUsbDev, c ? c : &scratch, v);
-                if (!dev_fits(c ? c : &scratch)) {
-                    pthread_mutex_unlock(&o->lock);
-                    return false;
-                }
-            }
-            if (hub && had != (c != NULL)) {
-                nc_usb_hub_port_changed(hub, p);    /* plugged in or out since */
-                changes++;
-            }
         }
     }
     for (unsigned i = 0; i < ROOT_PORTS; i++) {

@@ -501,72 +501,68 @@ static void dac_write(uint32_t off, uint8_t v)
     }
 }
 
-static void nv2a_write(void *opaque, uint32_t off, uint64_t value, unsigned size)
+/* True when the push-buffer handler consumed the write. */
+static bool nv2a_write_pushbuffer_reg(uint32_t off, uint32_t value)
 {
-    if (__builtin_expect(g_census.on, 0)) {
-        census(off, true, (uint32_t)value);
-    }
-    if (g_pbmode && size == 1 && (off == NV_PRMDIO_WRITE_INDEX || off == NV_PRMDIO_DATA)) {
-        dac_write(off, (uint8_t)value);
-        return;
-    }
-    if (g_pbmode && size == 4 && off == NV_PFIFO_CACHE1_DMA_SUBROUTINE) {
-        __atomic_store_n(reg(off), (uint32_t)value, __ATOMIC_RELEASE);
-        hle_pb_subroutine_written((uint32_t)value);     /* D3D left a run (4928) */
-        return;
-    }
-    if (g_pbmode && size == 4 && (off == NV_PFIFO_CACHE1_DMA_PUT || off == NV_PFIFO_CACHE1_DMA_GET)) {
+    switch (off) {
+    case NV_PFIFO_CACHE1_DMA_SUBROUTINE:
+        __atomic_store_n(reg(off), value, __ATOMIC_RELEASE);
+        hle_pb_subroutine_written(value);     /* D3D left a run (4928) */
+        return true;
+    case NV_PFIFO_CACHE1_DMA_PUT:
+    case NV_PFIFO_CACHE1_DMA_GET: {
         static unsigned s_logged_c;             /* debug: the first direct CACHE1 writes */
         if (s_logged_c++ < 16) {
             nc_log("xbased-native", "nv2a: CACHE1 %s <- %08x (GET %08x PUT %08x)",
-                   off == NV_PFIFO_CACHE1_DMA_PUT ? "PUT" : "GET", (uint32_t)value,
+                   off == NV_PFIFO_CACHE1_DMA_PUT ? "PUT" : "GET", value,
                    ld(NV_PFIFO_CACHE1_DMA_GET), ld(NV_PFIFO_CACHE1_DMA_PUT));
         }
         if (off == NV_PFIFO_CACHE1_DMA_GET) {
             hle_pb_get();                       /* a channel set-up: the scout syncs again */
         }
+        return false;  /* the caller stores the CACHE1 register after notifying the scout */
     }
-    if (g_pbmode && size == 4 && (off == NV_USER_DMA_PUT || off == NV_USER_DMA_GET ||
-                                  off == NV_USER_REF)) {
+    case NV_USER_DMA_PUT:
+    case NV_USER_DMA_GET:
+    case NV_USER_REF: {
         static unsigned s_logged;               /* debug: the first channel writes */
         if (s_logged < 24 && off != NV_USER_REF) {
             s_logged++;
             nc_log("xbased-native", "nv2a: channel %s <- %08x (GET %08x PUT %08x)",
-                   off == NV_USER_DMA_PUT ? "PUT" : "GET", (uint32_t)value,
+                   off == NV_USER_DMA_PUT ? "PUT" : "GET", value,
                    ld(NV_PFIFO_CACHE1_DMA_GET), ld(NV_PFIFO_CACHE1_DMA_PUT));
         }
         if (off == NV_USER_DMA_PUT) {
-            hle_pb_pushed((uint32_t)value);         /* before the decoder can see it */
+            hle_pb_pushed(value);         /* before the decoder can see it */
         }
-        __atomic_store_n(reg(off - NV_USER_DMA_PUT + NV_PFIFO_CACHE1_DMA_PUT), (uint32_t)value,
+        __atomic_store_n(reg(off - NV_USER_DMA_PUT + NV_PFIFO_CACHE1_DMA_PUT), value,
                          __ATOMIC_RELEASE);
         if (off == NV_USER_DMA_PUT) {
             hle_pb_put();
         } else if (off == NV_USER_DMA_GET) {
             hle_pb_get();
         }
-        return;
+        return true;
     }
-    if (g_pbmode && size == 4 && off == NV_PGRAPH_FIFO) {
-        hle_host_gpu_trace(HLE_GTR_FIFO, (uint32_t)value);
-        __atomic_store_n(reg(off), (uint32_t)value, __ATOMIC_RELEASE);
+    case NV_PGRAPH_FIFO:
+        hle_host_gpu_trace(HLE_GTR_FIFO, value);
+        __atomic_store_n(reg(off), value, __ATOMIC_RELEASE);
         hle_pb_kick();                              /* access back: the decoder goes on */
-        return;
-    }
-    if (g_pbmode && size == 4 && (off == NV_PGRAPH_INTR || off == NV_PGRAPH_INTR_EN)) {
+        return true;
+    case NV_PGRAPH_INTR:
+    case NV_PGRAPH_INTR_EN:
         /* PGRAPH's interrupt: the ISR clears what it handled (1s), and a
          * decoder waiting on a trap goes on */
         if (off == NV_PGRAPH_INTR) {
-            hle_host_gpu_trace(HLE_GTR_INTR_CLR, (uint32_t)value);
-            __atomic_fetch_and(reg(off), ~(uint32_t)value, __ATOMIC_ACQ_REL);
+            hle_host_gpu_trace(HLE_GTR_INTR_CLR, value);
+            __atomic_fetch_and(reg(off), ~value, __ATOMIC_ACQ_REL);
         } else {
-            __atomic_store_n(reg(off), (uint32_t)value, __ATOMIC_RELEASE);
+            __atomic_store_n(reg(off), value, __ATOMIC_RELEASE);
         }
         update_irq();
         hle_pb_kick();
-        return;
-    }
-    if (g_pbmode && off == NV_PGRAPH_INCREMENT && size == 4) {
+        return true;
+    case NV_PGRAPH_INCREMENT:
         /* the vblank ISR's flip: the read counter advances (modulo), and a
          * FLIP_STALL in the push buffer may go on */
         if (value & 2) {
@@ -586,6 +582,22 @@ static void nv2a_write(void *opaque, uint32_t off, uint64_t value, unsigned size
             hle_pb_flipped(ld(NV_PCRTC_START));
             hle_pb_kick();
         }
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void nv2a_write(void *opaque, uint32_t off, uint64_t value, unsigned size)
+{
+    if (__builtin_expect(g_census.on, 0)) {
+        census(off, true, (uint32_t)value);
+    }
+    if (g_pbmode && size == 1 && (off == NV_PRMDIO_WRITE_INDEX || off == NV_PRMDIO_DATA)) {
+        dac_write(off, (uint8_t)value);
+        return;
+    }
+    if (g_pbmode && size == 4 && nv2a_write_pushbuffer_reg(off, (uint32_t)value)) {
         return;
     }
     switch (off) {
@@ -1113,131 +1125,136 @@ static uint64_t cap_slot(uint64_t t, uint64_t last, uint64_t vs, uint64_t pd, in
     return grid_at_or_after(from, vs, pd, at);
 }
 
+static int sleep_until_ns(uint64_t target)
+{
+    const struct timespec ts = {(time_t)(target / 1000000000ull), (long)(target % 1000000000ull)};
+    return clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+}
+
+static uint64_t wait_uncapped_vblank(uint64_t next, uint64_t last)
+{
+    /* A frame limit (Up to 60, Up to 120): a frame's first early vblank
+     * no sooner than the limit's period after the last frame's. A frame
+     * is a stall; its further early vblanks (a presentation interval of
+     * 2 flips on the second) as they come. */
+    static uint32_t last_stall;
+    static uint64_t last_frame_ns;
+    /* A limit of whole refreshes of the display (Up to 30 or 60 on a
+     * 60 Hz one, Unlocked's limit at the display's rate): each frame's
+     * first early vblank on the display's vsyncs, where the vblank keeps
+     * to them (display_grid), at least the limit's refreshes after the
+     * last frame's. On a grid of its own, the limit's period beside the
+     * display's, the frames fell anywhere in a refresh, and those near a
+     * vsync were shown a refresh early or late: Otogi at Up to 30 with
+     * one picture in four on for 50 or 17 ms instead of 33 (12 s at 60 Hz
+     * with V-Sync), Crash Bandicoot's 60 fps at Up to 60 without V-Sync
+     * one in four 8 or 26 ms; another run's at the display's limit, on
+     * the same grid, none, its phase by chance. */
+    uint64_t vsync_ns = 0, refresh_period_ns = 0;
+    int64_t vblank_offset_ns = 0;
+    bool timed;
+    const bool aligned = cap_grid(&vsync_ns, &refresh_period_ns, &vblank_offset_ns, &timed);
+    for (uint64_t t = now_ns(); t < next; t = now_ns()) {
+#ifdef NC_DESKTOP
+        const uint32_t seen = __atomic_load_n(&g_flip_waits, __ATOMIC_ACQUIRE);
+#endif
+        const uint32_t stall = hle_pb_flip_stalls();
+        const bool paced = !g_cap_ns || stall == last_stall || t - last_frame_ns >= g_cap_ns;
+        if (t - last >= EARLY_GAP_NS && hle_pb_flip_waiting() &&
+            !(ld(NV_PCRTC_INTR_0) & PCRTC_VBLANK)) {
+            if (aligned && stall != last_stall) {
+                const uint64_t slot = cap_slot(t, last_frame_ns, vsync_ns, refresh_period_ns, vblank_offset_ns);
+                if (t + EARLY_POLL_NS >= slot) {
+                    last_stall = stall;
+                    last_frame_ns = slot;
+                    frame_due(slot);
+                    return t;
+                }
+                const uint64_t until = next < slot ? next : slot;
+                (void)sleep_until_ns(until);
+                continue;
+            }
+            if (paced) {
+                if (stall != last_stall) {
+                    last_stall = stall;
+                    /* on the limit's grid while frames keep up with it (the
+                     * timer wakes a little late), else from now */
+                    last_frame_ns = g_cap_ns && t - last_frame_ns < 2 * g_cap_ns ? last_frame_ns + g_cap_ns : t;
+                    return frame_due(on_limit(t, last_frame_ns));
+                }
+                return t;
+            }
+            /* the frame waits for the limit: till then, or the vblank due */
+            const uint64_t until = next < last_frame_ns + g_cap_ns ? next : last_frame_ns + g_cap_ns;
+            (void)sleep_until_ns(until);
+            continue;
+        }
+#ifdef NC_DESKTOP
+        /* waiting for a stall (not for the guest's handler to take the
+         * last vblank: that it is polled for): until the stall, or a ms
+         * short of the vblank due (its wait's timeout is in whole ms) */
+        if (!hle_pb_flip_waiting() && t - last >= EARLY_GAP_NS && next - t > 1500000) {
+            WaitOnAddress((void *)&g_flip_waits, (void *)&seen, 4, (unsigned)((next - t - 500000) / 1000000));
+            continue;
+        }
+#endif
+        const uint64_t until = next < t + EARLY_POLL_NS ? next : t + EARLY_POLL_NS;
+        (void)sleep_until_ns(until);
+    }
+    /* The vblank due, a waiting frame's first: under a limit, not before
+     * the limit's period after the last frame's either. It came at the
+     * display's rate, and a frame of a presentation interval of 2 had its
+     * second at once: Prince of Persia - Warrior Within ran at 53 fps
+     * under Up to 30, at 56 under Up to 60; a frame of 1 flipped at the
+     * display's rate whatever the limit below it. */
+    if (aligned && hle_pb_flip_waiting() && hle_pb_flip_stalls() != last_stall) {
+        /* the vblank due, a waiting frame's first, on the display's grid
+         * too: held till its vsync's place if it comes before */
+        const uint64_t slot = cap_slot(now_ns(), last_frame_ns, vsync_ns, refresh_period_ns, vblank_offset_ns);
+        for (uint64_t t = now_ns(); t + EARLY_POLL_NS < slot && hle_pb_flip_waiting(); t = now_ns()) {
+            const uint64_t u = slot < t + EARLY_POLL_NS * 4 ? slot : t + EARLY_POLL_NS * 4;
+            (void)sleep_until_ns(u);
+        }
+        const uint64_t t = now_ns();
+        if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != last_stall) {
+            last_stall = hle_pb_flip_stalls();
+            last_frame_ns = slot;
+            frame_due(slot > next ? slot : next);
+        }
+        return t > next ? t : next;
+    }
+    if (g_cap_ns && hle_pb_flip_waiting() && hle_pb_flip_stalls() != last_stall &&
+        now_ns() < last_frame_ns + g_cap_ns) {
+        /* (held only while it would come before the limit allows: past
+         * that, as it always came) */
+        const uint64_t until = last_frame_ns + g_cap_ns;
+        for (uint64_t t = now_ns(); t < until && hle_pb_flip_waiting(); t = now_ns()) {
+            const uint64_t u = until < t + EARLY_POLL_NS * 4 ? until : t + EARLY_POLL_NS * 4;
+            (void)sleep_until_ns(u);
+        }
+        const uint64_t t = now_ns();
+        if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != last_stall) {
+            last_stall = hle_pb_flip_stalls();
+            last_frame_ns = until;          /* on the limit's grid (the wake's overshoot left out) */
+            return frame_due(on_limit(t, until > next ? until : next));
+        }
+        return t > next ? t : next;
+    }
+    /* the vblank due takes a waiting frame on: the limit counts from it */
+    if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != last_stall) {
+        last_stall = hle_pb_flip_stalls();
+        last_frame_ns = next;
+        frame_due(next);
+    }
+    return next;
+}
+
 static uint64_t wait_vblank(uint64_t next, uint64_t last)
 {
     if (g_pbmode && uncapped()) {
-        /* A frame limit (Up to 60, Up to 120): a frame's first early vblank
-         * no sooner than the limit's period after the last frame's. A frame
-         * is a stall; its further early vblanks (a presentation interval of
-         * 2 flips on the second) as they come. */
-        static uint32_t s_stall;
-        static uint64_t s_frame_t;
-        /* A limit of whole refreshes of the display (Up to 30 or 60 on a
-         * 60 Hz one, Unlocked's limit at the display's rate): each frame's
-         * first early vblank on the display's vsyncs, where the vblank keeps
-         * to them (display_grid), at least the limit's refreshes after the
-         * last frame's. On a grid of its own, the limit's period beside the
-         * display's, the frames fell anywhere in a refresh, and those near a
-         * vsync were shown a refresh early or late: Otogi at Up to 30 with
-         * one picture in four on for 50 or 17 ms instead of 33 (12 s at 60 Hz
-         * with V-Sync), Crash Bandicoot's 60 fps at Up to 60 without V-Sync
-         * one in four 8 or 26 ms; another run's at the display's limit, on
-         * the same grid, none, its phase by chance. */
-        uint64_t gvs = 0, gpd = 0;
-        int64_t gat = 0;
-        bool gtimed;
-        const bool aligned = cap_grid(&gvs, &gpd, &gat, &gtimed);
-        for (uint64_t t = now_ns(); t < next; t = now_ns()) {
-#ifdef NC_DESKTOP
-            const uint32_t seen = __atomic_load_n(&g_flip_waits, __ATOMIC_ACQUIRE);
-#endif
-            const uint32_t stall = hle_pb_flip_stalls();
-            const bool paced = !g_cap_ns || stall == s_stall || t - s_frame_t >= g_cap_ns;
-            if (t - last >= EARLY_GAP_NS && hle_pb_flip_waiting() &&
-                !(ld(NV_PCRTC_INTR_0) & PCRTC_VBLANK)) {
-                if (aligned && stall != s_stall) {
-                    const uint64_t slot = cap_slot(t, s_frame_t, gvs, gpd, gat);
-                    if (t + EARLY_POLL_NS >= slot) {
-                        s_stall = stall;
-                        s_frame_t = slot;
-                        frame_due(slot);
-                        return t;
-                    }
-                    const uint64_t until = next < slot ? next : slot;
-                    const struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
-                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-                    continue;
-                }
-                if (paced) {
-                    if (stall != s_stall) {
-                        s_stall = stall;
-                        /* on the limit's grid while frames keep up with it (the
-                         * timer wakes a little late), else from now */
-                        s_frame_t = g_cap_ns && t - s_frame_t < 2 * g_cap_ns ? s_frame_t + g_cap_ns : t;
-                        return frame_due(on_limit(t, s_frame_t));
-                    }
-                    return t;
-                }
-                /* the frame waits for the limit: till then, or the vblank due */
-                const uint64_t until = next < s_frame_t + g_cap_ns ? next : s_frame_t + g_cap_ns;
-                const struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-                continue;
-            }
-#ifdef NC_DESKTOP
-            /* waiting for a stall (not for the guest's handler to take the
-             * last vblank: that it is polled for): until the stall, or a ms
-             * short of the vblank due (its wait's timeout is in whole ms) */
-            if (!hle_pb_flip_waiting() && t - last >= EARLY_GAP_NS && next - t > 1500000) {
-                WaitOnAddress((void *)&g_flip_waits, (void *)&seen, 4, (unsigned)((next - t - 500000) / 1000000));
-                continue;
-            }
-#endif
-            const uint64_t until = next < t + EARLY_POLL_NS ? next : t + EARLY_POLL_NS;
-            const struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-        }
-        /* The vblank due, a waiting frame's first: under a limit, not before
-         * the limit's period after the last frame's either. It came at the
-         * display's rate, and a frame of a presentation interval of 2 had its
-         * second at once: Prince of Persia - Warrior Within ran at 53 fps
-         * under Up to 30, at 56 under Up to 60; a frame of 1 flipped at the
-         * display's rate whatever the limit below it. */
-        if (aligned && hle_pb_flip_waiting() && hle_pb_flip_stalls() != s_stall) {
-            /* the vblank due, a waiting frame's first, on the display's grid
-             * too: held till its vsync's place if it comes before */
-            const uint64_t slot = cap_slot(now_ns(), s_frame_t, gvs, gpd, gat);
-            for (uint64_t t = now_ns(); t + EARLY_POLL_NS < slot && hle_pb_flip_waiting(); t = now_ns()) {
-                const uint64_t u = slot < t + EARLY_POLL_NS * 4 ? slot : t + EARLY_POLL_NS * 4;
-                const struct timespec ts = {(time_t)(u / 1000000000ull), (long)(u % 1000000000ull)};
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-            }
-            const uint64_t t = now_ns();
-            if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != s_stall) {
-                s_stall = hle_pb_flip_stalls();
-                s_frame_t = slot;
-                frame_due(slot > next ? slot : next);
-            }
-            return t > next ? t : next;
-        }
-        if (g_cap_ns && hle_pb_flip_waiting() && hle_pb_flip_stalls() != s_stall &&
-            now_ns() < s_frame_t + g_cap_ns) {
-            /* (held only while it would come before the limit allows: past
-             * that, as it always came) */
-            const uint64_t until = s_frame_t + g_cap_ns;
-            for (uint64_t t = now_ns(); t < until && hle_pb_flip_waiting(); t = now_ns()) {
-                const uint64_t u = until < t + EARLY_POLL_NS * 4 ? until : t + EARLY_POLL_NS * 4;
-                const struct timespec ts = {(time_t)(u / 1000000000ull), (long)(u % 1000000000ull)};
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-            }
-            const uint64_t t = now_ns();
-            if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != s_stall) {
-                s_stall = hle_pb_flip_stalls();
-                s_frame_t = until;          /* on the limit's grid (the wake's overshoot left out) */
-                return frame_due(on_limit(t, until > next ? until : next));
-            }
-            return t > next ? t : next;
-        }
-        /* the vblank due takes a waiting frame on: the limit counts from it */
-        if (hle_pb_flip_waiting() && hle_pb_flip_stalls() != s_stall) {
-            s_stall = hle_pb_flip_stalls();
-            s_frame_t = next;
-            frame_due(next);
-        }
-        return next;
+        return wait_uncapped_vblank(next, last);
     }
-    const struct timespec ts = {(time_t)(next / 1000000000ull), (long)(next % 1000000000ull)};
-    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
+    while (sleep_until_ns(next) != 0) {
     }
     return next;
 }
@@ -1267,6 +1284,18 @@ static uint64_t late_skip(uint64_t at, uint64_t step)
     return at + n * step;
 }
 
+static void signal_vblank(uint64_t at, uint64_t due)
+{
+    __atomic_store_n(&g_last_vblank_ns, at, __ATOMIC_RELEASE);
+    __atomic_fetch_or(reg(NV_PCRTC_INTR_0), PCRTC_VBLANK, __ATOMIC_ACQ_REL);
+    __atomic_fetch_add(&g_vblanks, 1, __ATOMIC_RELAXED);
+    hle_host_gpu_trace(HLE_GTR_VBLANK, (uint32_t)g_vblanks | (at < due ? 0x80000000u : 0));
+    update_irq();
+    if (g_pbmode) {
+        hle_pb_vblank();    /* the scanout shows the memory, flipped or not */
+    }
+}
+
 static void *vblank_thread(void *arg)
 {
     nc_pause_register("vblank");
@@ -1286,14 +1315,7 @@ static void *vblank_thread(void *arg)
         const uint64_t prev = next;
         const uint64_t due = next_vblank(prev);
         next = wait_vblank(due, prev);
-        __atomic_store_n(&g_last_vblank_ns, next, __ATOMIC_RELEASE);
-        __atomic_fetch_or(reg(NV_PCRTC_INTR_0), PCRTC_VBLANK, __ATOMIC_ACQ_REL);
-        __atomic_fetch_add(&g_vblanks, 1, __ATOMIC_RELAXED);
-        hle_host_gpu_trace(HLE_GTR_VBLANK, (uint32_t)g_vblanks | (next < due ? 0x80000000u : 0));
-        update_irq();
-        if (g_pbmode) {
-            hle_pb_vblank();    /* the scanout shows the memory, flipped or not */
-        }
+        signal_vblank(next, due);
         if (g_census.on && next - g_census.t_log >= 1000000000ull) {
             g_census.t_log = next;
             if (XBASED_DIAG) {

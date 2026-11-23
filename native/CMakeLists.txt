@@ -110,6 +110,7 @@ add_library(xbased_native STATIC
   core/xcheat.c
   core/memscan.c
   core/core.c
+  core/xbox_boot.c
   core/mmio.c
   core/irq.c
   dev/nv2a.c

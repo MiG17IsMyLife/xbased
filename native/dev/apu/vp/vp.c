@@ -2961,19 +2961,12 @@ static void idle_report(MCPXAPUState *d, const uint16_t *idle, unsigned n)
     apu_spin_unlock(&d->vp.fe_spin);
 }
 
-void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+static void queue_frame_voices(MCPXAPUState *d, uint8_t *c, uint64_t *listed)
 {
-    memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
-
-    /* The voice table loaded once for the frame: the list walk below and
-     * voice_work_dispatch / voice_work_schedule use it. */
-    uint8_t *c = apu_ld_acq(&d->vp.voice_cache);
-
     /* The voices queued this frame: one twice (a cycle in the guest's
      * lists) would take its own lock again and spin forever, and more than
      * MCPX_HW_MAX_VOICES would overrun the queue. */
     uint64_t queued[MCPX_HW_MAX_VOICES / 64] = {0};
-    uint64_t listed[MCPX_HW_MAX_VOICES / 64] = {0};   /* the voices on a list now */
     uint16_t idle[MCPX_HW_MAX_VOICES];  /* the idle voices on them, in list order */
     unsigned nidle = 0;
 
@@ -3026,6 +3019,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
         }
     }
     idle_report(d, idle, nidle);
+}
+
+static void notify_unlisted_voices(MCPXAPUState *d, const uint64_t *listed)
+{
     /* the guest's VOICE_OFFs (voice_off): notified once their voice has
      * left the lists, its release done */
     for (unsigned w = 0; w < MCPX_HW_MAX_VOICES / 64; w++) {
@@ -3036,11 +3033,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
             }
         }
     }
-    voice_work_dispatch(d, c, mixbins);
-    if (c) {
-        report_written_voices(d, c);
-    }
+}
 
+static void mix_voice_monitor(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         /* Mix all voices together to hear any audible voice */
         int16_t isamp[NUM_SAMPLES_PER_FRAME * 2];
@@ -3065,6 +3061,25 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
             memset(g_vp_sample6, 0, sizeof(g_vp_sample6));
         }
     }
+}
+
+void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+
+    /* The voice table loaded once for the frame: the list walk below and
+     * voice_work_dispatch / voice_work_schedule use it. */
+    uint8_t *c = apu_ld_acq(&d->vp.voice_cache);
+
+    uint64_t listed[MCPX_HW_MAX_VOICES / 64] = {0};
+    queue_frame_voices(d, c, listed);
+    notify_unlisted_voices(d, listed);
+    voice_work_dispatch(d, c, mixbins);
+    if (c) {
+        report_written_voices(d, c);
+    }
+
+    mix_voice_monitor(d, mixbins);
 }
 
 void mcpx_apu_vp_init(MCPXAPUState *d)

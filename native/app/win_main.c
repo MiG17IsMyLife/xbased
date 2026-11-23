@@ -385,14 +385,14 @@ static _Noreturn void exit_now(int code)
 {
     saves_finish();         /* a savestate being written: whole first */
     paused_note();
-    const bool closing = g_frame && !(code & 0x40000000) && !g_frame_keep;
+    const bool closing = g_frame && !(code & NC_FRAME_HANDOFF_FLAG) && !g_frame_keep;
     if (closing) {
         nc_frame_close(g_frame);    /* the session's end: the frame hands the screen back to the dashboard */
     }
     fflush(NULL);
 #ifdef _WIN32
     if (!closing) {
-        give_foreground(!(code & 0x40000000));
+        give_foreground(!(code & NC_FRAME_HANDOFF_FLAG));
     }
     TerminateProcess(GetCurrentProcess(), (UINT)code);
 #endif
@@ -407,6 +407,29 @@ static void fatal_box(const char *title, const char *msg)
 static void hold_picture(char *path, size_t n);
 static void wait_next_run(void *ev, void *proc);
 
+static void relaunch_args(char **argv, char *exe, const char *extra)
+{
+    size_t n = 0;
+    argv[n++] = exe;
+    argv[n++] = g_disc[0] ? g_disc : (char *)"none";
+    const char *eq = extra ? strchr(extra, '=') : NULL;
+    const size_t name_len = eq ? (size_t)(eq - extra) : extra ? strlen(extra) : 0;
+    for (int i = 0; i < g_ncmdline; i++) {
+        char *a = g_cmdline[i];
+        if (!a[0] || !strcmp(a, "relaunch") || !strncmp(a, "loadstate=", 10)) {
+            continue;
+        }
+        if (extra && !strncmp(a, extra, name_len) && (a[name_len] == '=' || a[name_len] == 0)) {
+            continue;
+        }
+        argv[n++] = a;
+    }
+    if (extra) {
+        argv[n++] = (char *)extra;
+    }
+    argv[n] = NULL;
+}
+
 /* The process again, with the same disc and options plus extra (minus any
  * earlier option of extra's name). hold: the next run shows this one's
  * picture until its first frame (a state loaded, a title relaunched),
@@ -416,32 +439,28 @@ static void wait_next_run(void *ev, void *proc);
  * the keyboard, between the two. */
 static void run_again(const char *extra, bool hold)
 {
+    char exe[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    char *argv[MAX_ARGS + 4];
+    relaunch_args(argv, exe, extra);
+#ifdef _WIN32
+    char cmd[8192] = "";
+    for (size_t i = 0; argv[i]; i++) {
+        if (!xb_quote_arg(cmd, sizeof(cmd), argv[i])) {
+            nc_log("xbased-app", "can't start again: command line too long");
+            return;
+        }
+    }
+    nc_log("xbased-app", "running again: %s", cmd);
+#else
+    nc_log("xbased-app", "running again: %s%s%s", argv[1], extra ? " " : "", extra ? extra : "");
+#endif
     pause_core(true);    /* the picture held is the last one */
     nc_audio_set_paused(true);
     char hold_path[MAX_PATH + 32] = "";
     if (hold) {
         hold_picture(hold_path, sizeof(hold_path));
     }
-    char cmd[8192];
-    char exe[MAX_PATH];
-    GetModuleFileNameA(NULL, exe, sizeof(exe));
-    int n = snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\"", exe, g_disc[0] ? g_disc : "none");
-    const char *eq = extra ? strchr(extra, '=') : NULL;
-    const size_t name_len = eq ? (size_t)(eq - extra) : extra ? strlen(extra) : 0;
-    for (int i = 0; i < g_ncmdline && n < (int)sizeof(cmd) - 8; i++) {
-        const char *a = g_cmdline[i];
-        if (extra && !strncmp(a, extra, name_len) && (a[name_len] == '=' || a[name_len] == 0)) {
-            continue;
-        }
-        if (!a[0] || !strcmp(a, "relaunch") || !strncmp(a, "loadstate=", 10)) {
-            continue; /* one run's */
-        }
-        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " \"%s\"", a);
-    }
-    if (extra) {
-        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " \"%s\"", extra);
-    }
-    nc_log("xbased-app", "running again: %s", cmd);
 #ifdef _WIN32
     SetEnvironmentVariableA("XBASED_HOLD", hold_path[0] ? hold_path : NULL);
     char ev_name[96];
@@ -467,7 +486,7 @@ static void run_again(const char *extra, bool hold)
         CloseHandle(pi.hProcess);
         /* the dashboard waits for this process: the new one's id in the
          * exit code (bit 30 set) lets it follow the game on (dash.c) */
-        exit_now((int)(0x40000000u | (pi.dwProcessId & 0x3FFFFFFFu)));
+        exit_now(nc_frame_handoff_code(pi.dwProcessId));
     }
     if (g_nw.hwnd && !g_frame) {
         SetWindowPos((HWND)g_nw.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -478,25 +497,6 @@ static void run_again(const char *extra, bool hold)
     } else {
         unsetenv("XBASED_HOLD");
     }
-    /* this process becomes the new run (the same arguments as above) */
-    char *argv[MAX_ARGS + 4];
-    int k = 0;
-    argv[k++] = exe;
-    argv[k++] = g_disc[0] ? g_disc : (char *)"none";
-    for (int i = 0; i < g_ncmdline; i++) {
-        char *a = g_cmdline[i];
-        if (extra && !strncmp(a, extra, name_len) && (a[name_len] == '=' || a[name_len] == 0)) {
-            continue;
-        }
-        if (!a[0] || !strcmp(a, "relaunch") || !strncmp(a, "loadstate=", 10)) {
-            continue;
-        }
-        argv[k++] = a;
-    }
-    if (extra) {
-        argv[k++] = (char *)extra;
-    }
-    argv[k] = NULL;
     fflush(stderr);
     if (g_frame) {
         /* inside the frame: the next run a process of its own, its window
@@ -533,9 +533,10 @@ static void run_again(const char *extra, bool hold)
 
 static void *core_thread(void *arg)
 {
+    const NcBootOptions *boot = arg;
     nc_win_thread_name("vcpu");
     nc_win_thread_priority(1);
-    if (!nc_core_boot(&g_core, g_disc_fd)) {
+    if (!nc_core_boot(&g_core, g_disc_fd, boot)) {
         nc_log("xbased-app", "core: boot failed");
         if (!nc_hle_fatal()) {
             nc_hle_set_fatal(NC_FATAL_BOOT, "The game stopped while starting.");
@@ -1875,6 +1876,394 @@ static void env_legacy(void)
     }
 }
 
+static void apply_online_mode(void)
+{
+    for (int i = 0; i < g_nargs; i++) {
+        const char *a = g_args[i];
+        if (!strcmp(a, "online") || (!strncmp(a, "online=", 7) && strcmp(a + 7, "0"))) {
+            g_online = true;
+        }
+    }
+    if (g_online) {
+        int dropped = 0;
+        for (int i = 0; i < g_nargs; i++) {
+            char *a = g_args[i];
+            if (!strcmp(a, "uncap") || !strncmp(a, "uncap=", 6) || !strncmp(a, "fpscap=", 7) ||
+                !strncmp(a, "xcheat=", 7) || !strncmp(a, "mod=", 4) || !strncmp(a, "cheat=", 6) ||
+                !strncmp(a, "devtime=", 8)) {
+                a[0] = 0;
+                dropped++;
+            }
+        }
+        add_arg("devtime=2");     /* the drive's own timing */
+        nc_log("xbased-app", "online mode: original frame rate and speed, no patches, mods or cheats (%d settings "
+               "left out)", dropped);
+    }
+}
+
+static void parse_game_options(NcOptions *opt)
+{
+    for (int i = 0; i < g_nargs; i++) {
+        const char *a = g_args[i];
+        char resolved[2400];
+        if (!strncmp(a, "xcheat=", 7) && a[7] && a[7] != '/' && a[7] != '\\' && a[8] != ':') {
+            /* a cheat file under cheats/ (the shipped ones beside the
+             * executable, the user's in the data folder) */
+            char p[1300];
+            snprintf(p, sizeof(p), "%s", a + 7);
+            char *bar = strrchr(p, '|');
+            const char *states = bar ? bar + 1 : "";
+            if (bar) {
+                *bar = 0;
+            }
+            char full[1400];
+            snprintf(full, sizeof(full), "%s%s", g_data_dir, p);
+            if (access(full, 0) != 0) {
+                snprintf(full, sizeof(full), "%s%s", g_exe_dir, p);
+            }
+            snprintf(resolved, sizeof(resolved), "xcheat=%s|%s", full, states);
+            a = resolved;
+        }
+        if (nc_option(opt, a)) {
+            continue; /* the core's */
+        }
+        if (!strncmp(a, "aspect=", 7)) {
+            const char *v = a + 7;
+            nc_present_set_aspect(!strcmp(v, "4:3")       ? NC_ASPECT_4_3
+                                  : !strcmp(v, "16:9")    ? NC_ASPECT_16_9
+                                  : !strcmp(v, "stretch") ? NC_ASPECT_STRETCH
+                                                          : NC_ASPECT_AUTO);
+        } else if (!strncmp(a, "overscan=", 9)) {
+            nc_present_set_overscan(atoi(a + 9));
+        } else if (!strncmp(a, "maxfps=", 7)) {
+            g_maxfps = !strcmp(a + 7, "refresh") ? -1 : atoi(a + 7);
+        } else if (!strncmp(a, "fsrate=", 7)) {
+            g_fs60 = !strcmp(a + 7, "60");
+        } else if (!strncmp(a, "croph=", 6)) {
+            g_crop[0] = atoi(a + 6);
+            nc_present_set_crop(g_crop[0], g_crop[1]);
+        } else if (!strncmp(a, "cropv=", 6)) {
+            g_crop[1] = atoi(a + 6);
+            nc_present_set_crop(g_crop[0], g_crop[1]);
+        } else if (!strncmp(a, "fxaa=", 5)) {
+            nc_present_set_fxaa(atoi(a + 5) != 0);
+        } else if (!strncmp(a, "upscale=", 8)) {
+            nc_present_set_upscale(nc_upscale_from_name(a + 8));
+        } else if (!strncmp(a, "crt=", 4)) {
+            hle_present_set_crt(atoi(a + 4));
+        } else if (!strncmp(a, "vsync=", 6)) {
+            hle_present_set_vsync(atoi(a + 6) != 0);
+        } else if (!strncmp(a, "volume=", 7)) {
+            g_volume = atoi(a + 7) / 100.0f;
+            nc_audio_set_volume(g_volume);
+        } else if (!strncmp(a, "showfps=", 8)) {
+            nc_present_set_show_fps(atoi(a + 8) != 0);
+        } else if (!strncmp(a, "mutebg=", 7)) {
+            g_mute_bg = atoi(a + 7) != 0;
+        }
+    }
+}
+
+typedef struct GameWindowState {
+    bool quit;
+    bool paused;
+    bool minimized;
+    bool focused;
+} GameWindowState;
+
+static void set_game_minimized(GameWindowState *state, bool minimized)
+{
+    state->minimized = minimized;
+    const bool paused = state->paused || minimized;
+    pause_core(paused);
+    nc_audio_set_paused(paused);
+}
+
+static void game_key_down(SDL_Window *win, GameWindowState *state, const SDL_KeyboardEvent *event)
+{
+    if (event->repeat) {
+        return;
+    }
+    if (event->key == SDLK_ESCAPE && g_mgrab) {
+        mouse_hold(false);
+        return;
+    }
+    /* the shortcuts (Settings > Shortcuts): the key with the
+     * Ctrl and Alt it was set with (exactly), Shift too if it
+     * was; Shift with quick save/load otherwise: slot 2 */
+    const SDL_Keymod mod = mods_held(event->mod);
+    const uint8_t held = ((mod & SDL_KMOD_CTRL) ? 1 : 0) | ((mod & SDL_KMOD_ALT) ? 2 : 0) |
+                         ((mod & SDL_KMOD_SHIFT) ? 4 : 0);
+    if (event->key == SDLK_RETURN && (held & 2) && !(held & 1)) {
+        hotkey_do(win, IM_HK_FULL, true, 1, &state->paused, state->minimized);
+        return;
+    }
+    for (int h = 0; h < IM_HOTKEYS; h++) {
+        const uint8_t need = g_map.hk_mod[h];
+        if (event->key == g_map.hotkey[h] && (held & 3) == (need & 3) && (!(need & 4) || (held & 4))) {
+            if (need & 3) {
+                g_hk_eaten[event->scancode] = true;   /* the game doesn't get the key */
+                g_hk_any_eaten = true;
+            }
+            hotkey_do(win, h, true, (held & 4) && !(need & 4) ? 2 : 1, &state->paused, state->minimized);
+            break;
+        }
+    }
+}
+
+static void gamepad_button_down(SDL_Window *win, GameWindowState *state, const SDL_GamepadButtonEvent *event)
+{
+    /* the controller's shortcuts: Guide with a button (Guide
+     * alone, a tap: on its release, nothing else pressed), the
+     * touchpad, Share, Back with a button; and the menu with
+     * Back and Start */
+    SDL_Gamepad *gp = SDL_GetGamepadFromID(event->which);
+    const int b = im_face(event->button);   /* as its label says (pad.face) */
+    int code = IM_HKP_NONE;
+    if (b == SDL_GAMEPAD_BUTTON_GUIDE) {
+        g_guide_alone = true;
+    } else if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+        code = IM_HKP_TOUCHPAD;
+    } else if (b == SDL_GAMEPAD_BUTTON_MISC1) {
+        code = IM_HKP_SHARE;
+    } else if (pad_guide_held(gp)) {
+        code = IM_HKP_WITH + b;
+        g_guide_alone = false;
+    } else if (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) &&
+               SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_START)) {
+        ingame_menu(win, &state->paused, state->minimized);
+    } else if (gp && b != SDL_GAMEPAD_BUTTON_BACK && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK)) {
+        code = IM_HKP_BACK_WITH + b;
+    }
+    for (int h = 0; code != IM_HKP_NONE && h < IM_HOTKEYS; h++) {
+        if (g_map.hk_pad[h] == code) {
+            g_pad_held_hk = h;
+            g_pad_held_code = code;
+            if (code >= IM_HKP_BACK_WITH) {
+                g_back_pad = gp;        /* the game doesn't get the button */
+                g_back_btn = b;
+            }
+            hotkey_do(win, h, true, 1, &state->paused, state->minimized);
+            break;
+        }
+    }
+}
+
+static void gamepad_button_up(SDL_Window *win, GameWindowState *state, const SDL_GamepadButtonEvent *event)
+{
+    const int b = im_face(event->button);
+    if (b == SDL_GAMEPAD_BUTTON_GUIDE && g_guide_alone) {
+        g_guide_alone = false;
+        for (int h = 0; h < IM_HOTKEYS; h++) {
+            if (g_map.hk_pad[h] == IM_HKP_GUIDE) {
+                hotkey_do(win, h, true, 1, &state->paused, state->minimized);
+                hotkey_do(win, h, false, 1, &state->paused, state->minimized);
+                break;
+            }
+        }
+    }
+    /* a held shortcut (fast forward) ends with either button let go */
+    if (g_pad_held_hk >= 0 &&
+        (b == SDL_GAMEPAD_BUTTON_GUIDE || IM_HKP_WITH + b == g_pad_held_code ||
+         IM_HKP_BACK_WITH + b == g_pad_held_code ||
+         (b == SDL_GAMEPAD_BUTTON_BACK && g_pad_held_code >= IM_HKP_BACK_WITH) ||
+         (b == SDL_GAMEPAD_BUTTON_TOUCHPAD && g_pad_held_code == IM_HKP_TOUCHPAD) ||
+         (b == SDL_GAMEPAD_BUTTON_MISC1 && g_pad_held_code == IM_HKP_SHARE))) {
+        hotkey_do(win, g_pad_held_hk, false, 1, &state->paused, state->minimized);
+        g_pad_held_hk = -1;
+    }
+}
+
+static void handle_game_event(SDL_Window *win, GameWindowState *state, const SDL_Event *event)
+{
+    switch (event->type) {
+    case SDL_EVENT_QUIT:
+        state->quit = true;
+        break;
+    case SDL_EVENT_KEY_DOWN:
+        game_key_down(win, state, &event->key);
+        break;
+    case SDL_EVENT_KEY_UP:
+        if (event->key.key == g_map.hotkey[IM_HK_TURBO]) {
+            hotkey_do(win, IM_HK_TURBO, false, 1, &state->paused, state->minimized);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        gamepad_button_down(win, state, &event->gbutton);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        gamepad_button_up(win, state, &event->gbutton);
+        break;
+    case SDL_EVENT_JOYSTICK_ADDED:
+        joystick_added(event->jdevice.which);
+        break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+        pad_added(event->gdevice.which);
+        break;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        pad_removed(event->gdevice.which);
+        break;
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        g_nw.width = event->window.data1;
+        g_nw.height = event->window.data2;
+        break;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+    case SDL_EVENT_WINDOW_RESTORED:
+        set_game_minimized(state, event->type == SDL_EVENT_WINDOW_MINIMIZED);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        state->focused = true;
+        nc_audio_set_volume(g_volume);
+        mods_released();
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        state->focused = false;
+        mouse_hold(false);
+        mods_released();
+        if (g_mute_bg) {
+            nc_audio_set_volume(0);
+        }
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (g_mgrab && SDL_GetWindowRelativeMouseMode(win)) {
+            im_mouse_move(event->motion.xrel, event->motion.yrel);  /* its own window's relative mode */
+        }
+        play_pointer(fabsf(event->motion.xrel) + fabsf(event->motion.yrel));
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (g_mgrab) {
+            g_mbuttons |= SDL_BUTTON_MASK(event->button.button);
+        } else if (g_map.mouse_stick && state->focused && !state->paused) {
+            g_mgrab_win = win;
+            mouse_hold(true);       /* the click that takes it isn't the game's */
+            break;
+        }
+        play_pointer(2);
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        g_mbuttons &= ~SDL_BUTTON_MASK(event->button.button);
+        break;
+    default:
+        break;
+    }
+}
+
+static void run_game_window(SDL_Window *win)
+{
+    nc_win_thread_name("window");
+    GameWindowState state = {.focused = true};
+    bool told = false;
+    while (!state.quit) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            handle_game_event(win, &state, &event);
+        }
+        play_pointer_tick();
+        nc_auto_tick();
+#ifdef XBASED_DEVCTL
+        nc_devctl_tick(&state.paused, state.minimized);
+#endif
+        if (nc_auto_take_menu()) {
+            ingame_menu(win, &state.paused, state.minimized);
+        }
+        if (g_dc_player) {
+            /* a player's controller gone: the menu, which pauses, and why */
+            const int p = g_dc_player;
+            g_dc_player = 0;
+            if (g_map.dc_pause && SDL_GetAtomicInt(&g_core_state) == 1) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), T(S_PAD_DC), p);
+                nc_log("xbased-app", "player %d's controller disconnected: the menu opens", p);
+                dash_ingame_notice(msg);
+                ingame_menu(win, &state.paused, state.minimized);
+            }
+        }
+        update_pads(state.focused);
+        state_request_poll();
+
+        /* the GPU can't draw the game (no Vulkan device, a driver lacking
+         * what it needs): the game ran on with its sound over a black
+         * window, the reason only in the log */
+        if (!told && nc_hle_fatal_kind() == NC_FATAL_DRIVER) {
+            told = true;
+            pause_core(true);           /* (its sound went on under the box, #378) */
+            nc_audio_set_paused(true);
+            fatal_box("xbased", nc_hle_fatal());
+            break;
+        }
+        const int core_state = SDL_GetAtomicInt(&g_core_state);
+        if (core_state < 0) {
+            if (g_core.kernel.relaunch) {
+                run_again("relaunch", true);
+            }
+            if (g_core.kernel.quit) {
+                if (g_core.kernel.quit_no_dash) {
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "xbased", T(S_NO_DASHBOARD), win);
+                } else {
+                    fx_out();
+                }
+                break;
+            }
+            if (!told) {
+                told = true;
+                const char *why = nc_hle_fatal();
+                if (why) {
+                    fatal_box("xbased", why);
+                    break;
+                }
+            }
+        }
+        overlay_tick();
+        if (state.minimized || g_nw.width <= 0 || !nc_present_frame(&g_nw)) {
+            SDL_Delay(8); /* nothing to wait for the display on */
+        }
+#ifdef _WIN32
+        if (g_frame && !IsWindow((HWND)g_frame)) {
+            /* the frame's window went (its process fell), this run's with it:
+             * not left running unseen, back to the dashboard */
+            const char *why = hle_present_remote_why();
+            nc_log("xbased-app", "window: the frame's gone%s%s: leaving", why[0] ? ": " : "", why);
+            exit_now(0);
+        }
+#endif
+        if (g_frame && g_frame_hidden) {
+            if (hle_present_remote_state() < 0) {
+                g_frame_hidden = false;     /* no shared pictures: the window fills the frame, as before */
+                nc_frame_fill(g_frame, win);
+                nc_log("xbased-app", "window: the frame's pictures can't be had: drawn in the window");
+            } else {
+                frame_mouse_pump();
+            }
+        }
+        static bool raised;
+        if (g_frame && !raised && hle_present_count() > 0) {
+            raised = true;
+            nc_frame_raise(g_frame, win);   /* over the run before's, which goes next */
+        }
+        if (g_frame) {
+            const bool m = nc_frame_minimized(g_frame);
+            if (m != state.minimized) {
+                /* A child window doesn't receive its frame's minimize events. */
+                set_game_minimized(&state, m);
+            }
+        }
+#ifndef _WIN32
+        if (g_ready_fd >= 0 && hle_present_count() > 0) {
+            if (write(g_ready_fd, "1", 1) < 0) {
+            }
+            close(g_ready_fd);  /* drawn: the run before may go */
+            g_ready_fd = -1;
+        }
+#else
+        if (g_ready_ev && hle_present_count() > 0) {
+            SetEvent(g_ready_ev);   /* drawn: the run before may go */
+            CloseHandle(g_ready_ev);
+            g_ready_ev = NULL;
+        }
+#endif
+    }
+}
+
 int main(int argc, char *argv[])
 {
     env_legacy();
@@ -2064,86 +2453,8 @@ int main(int argc, char *argv[])
 
     NcOptions opt;
     nc_options_init(&opt);
-    for (int i = 0; i < g_nargs; i++) {
-        const char *a = g_args[i];
-        if (!strcmp(a, "online") || (!strncmp(a, "online=", 7) && strcmp(a + 7, "0"))) {
-            g_online = true;
-        }
-    }
-    if (g_online) {
-        int dropped = 0;
-        for (int i = 0; i < g_nargs; i++) {
-            char *a = g_args[i];
-            if (!strcmp(a, "uncap") || !strncmp(a, "uncap=", 6) || !strncmp(a, "fpscap=", 7) ||
-                !strncmp(a, "xcheat=", 7) || !strncmp(a, "mod=", 4) || !strncmp(a, "cheat=", 6) ||
-                !strncmp(a, "devtime=", 8)) {
-                a[0] = 0;
-                dropped++;
-            }
-        }
-        add_arg("devtime=2");     /* the drive's own timing */
-        nc_log("xbased-app", "online mode: original frame rate and speed, no patches, mods or cheats (%d settings "
-               "left out)", dropped);
-    }
-    for (int i = 0; i < g_nargs; i++) {
-        const char *a = g_args[i];
-        char resolved[2400];
-        if (!strncmp(a, "xcheat=", 7) && a[7] && a[7] != '/' && a[7] != '\\' && a[8] != ':') {
-            /* a cheat file under cheats/ (the shipped ones beside the
-             * executable, the user's in the data folder) */
-            char p[1300];
-            snprintf(p, sizeof(p), "%s", a + 7);
-            char *bar = strrchr(p, '|');
-            const char *states = bar ? bar + 1 : "";
-            if (bar) {
-                *bar = 0;
-            }
-            char full[1400];
-            snprintf(full, sizeof(full), "%s%s", g_data_dir, p);
-            if (access(full, 0) != 0) {
-                snprintf(full, sizeof(full), "%s%s", g_exe_dir, p);
-            }
-            snprintf(resolved, sizeof(resolved), "xcheat=%s|%s", full, states);
-            a = resolved;
-        }
-        if (nc_option(&opt, a)) {
-            continue; /* the core's */
-        }
-        if (!strncmp(a, "aspect=", 7)) {
-            const char *v = a + 7;
-            nc_present_set_aspect(!strcmp(v, "4:3")       ? NC_ASPECT_4_3
-                                  : !strcmp(v, "16:9")    ? NC_ASPECT_16_9
-                                  : !strcmp(v, "stretch") ? NC_ASPECT_STRETCH
-                                                          : NC_ASPECT_AUTO);
-        } else if (!strncmp(a, "overscan=", 9)) {
-            nc_present_set_overscan(atoi(a + 9));
-        } else if (!strncmp(a, "maxfps=", 7)) {
-            g_maxfps = !strcmp(a + 7, "refresh") ? -1 : atoi(a + 7);
-        } else if (!strncmp(a, "fsrate=", 7)) {
-            g_fs60 = !strcmp(a + 7, "60");
-        } else if (!strncmp(a, "croph=", 6)) {
-            g_crop[0] = atoi(a + 6);
-            nc_present_set_crop(g_crop[0], g_crop[1]);
-        } else if (!strncmp(a, "cropv=", 6)) {
-            g_crop[1] = atoi(a + 6);
-            nc_present_set_crop(g_crop[0], g_crop[1]);
-        } else if (!strncmp(a, "fxaa=", 5)) {
-            nc_present_set_fxaa(atoi(a + 5) != 0);
-        } else if (!strncmp(a, "upscale=", 8)) {
-            nc_present_set_upscale(nc_upscale_from_name(a + 8));
-        } else if (!strncmp(a, "crt=", 4)) {
-            hle_present_set_crt(atoi(a + 4));
-        } else if (!strncmp(a, "vsync=", 6)) {
-            hle_present_set_vsync(atoi(a + 6) != 0);
-        } else if (!strncmp(a, "volume=", 7)) {
-            g_volume = atoi(a + 7) / 100.0f;
-            nc_audio_set_volume(g_volume);
-        } else if (!strncmp(a, "showfps=", 8)) {
-            nc_present_set_show_fps(atoi(a + 8) != 0);
-        } else if (!strncmp(a, "mutebg=", 7)) {
-            g_mute_bg = atoi(a + 7) != 0;
-        }
-    }
+    apply_online_mode();
+    parse_game_options(&opt);
     if (g_online) {
         nc_win_mods_cleanup(g_exe_dir);     /* none of the mods, the widescreen database's included */
     } else {
@@ -2281,275 +2592,10 @@ int main(int argc, char *argv[])
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16u << 20);
     pthread_t core;
-    pthread_create(&core, &attr, core_thread, NULL);
+    pthread_create(&core, &attr, core_thread, &opt.boot);
     pthread_attr_destroy(&attr);
 
-    nc_win_thread_name("window");
-    bool quit = false, paused = false, minimized = false, focused = true, told = false;
-    while (!quit) {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            switch (ev.type) {
-            case SDL_EVENT_QUIT:
-                quit = true;
-                break;
-            case SDL_EVENT_KEY_DOWN: {
-                if (ev.key.repeat) {
-                    break;
-                }
-                if (ev.key.key == SDLK_ESCAPE && g_mgrab) {
-                    mouse_hold(false);
-                    break;
-                }
-                /* the shortcuts (Settings > Shortcuts): the key with the
-                 * Ctrl and Alt it was set with (exactly), Shift too if it
-                 * was; Shift with quick save/load otherwise: slot 2 */
-                const SDL_Keymod mod = mods_held(ev.key.mod);
-                const uint8_t held = ((mod & SDL_KMOD_CTRL) ? 1 : 0) | ((mod & SDL_KMOD_ALT) ? 2 : 0) |
-                                     ((mod & SDL_KMOD_SHIFT) ? 4 : 0);
-                if (ev.key.key == SDLK_RETURN && (held & 2) && !(held & 1)) {
-                    hotkey_do(win, IM_HK_FULL, true, 1, &paused, minimized);
-                    break;
-                }
-                for (int h = 0; h < IM_HOTKEYS; h++) {
-                    const uint8_t need = g_map.hk_mod[h];
-                    if (ev.key.key == g_map.hotkey[h] && (held & 3) == (need & 3) && (!(need & 4) || (held & 4))) {
-                        if (need & 3) {
-                            g_hk_eaten[ev.key.scancode] = true;   /* the game doesn't get the key */
-                            g_hk_any_eaten = true;
-                        }
-                        hotkey_do(win, h, true, (held & 4) && !(need & 4) ? 2 : 1, &paused, minimized);
-                        break;
-                    }
-                }
-                break;
-            }
-            case SDL_EVENT_KEY_UP:
-                if (ev.key.key == g_map.hotkey[IM_HK_TURBO]) {
-                    hotkey_do(win, IM_HK_TURBO, false, 1, &paused, minimized);
-                }
-                break;
-            case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
-                /* the controller's shortcuts: Guide with a button (Guide
-                 * alone, a tap: on its release, nothing else pressed), the
-                 * touchpad, Share, Back with a button; and the menu with
-                 * Back and Start */
-                SDL_Gamepad *gp = SDL_GetGamepadFromID(ev.gbutton.which);
-                const int b = im_face(ev.gbutton.button);   /* as its label says (pad.face) */
-                int code = IM_HKP_NONE;
-                if (b == SDL_GAMEPAD_BUTTON_GUIDE) {
-                    g_guide_alone = true;
-                } else if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-                    code = IM_HKP_TOUCHPAD;
-                } else if (b == SDL_GAMEPAD_BUTTON_MISC1) {
-                    code = IM_HKP_SHARE;
-                } else if (pad_guide_held(gp)) {
-                    code = IM_HKP_WITH + b;
-                    g_guide_alone = false;
-                } else if (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) &&
-                           SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_START)) {
-                    ingame_menu(win, &paused, minimized);
-                } else if (gp && b != SDL_GAMEPAD_BUTTON_BACK && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK)) {
-                    code = IM_HKP_BACK_WITH + b;
-                }
-                for (int h = 0; code != IM_HKP_NONE && h < IM_HOTKEYS; h++) {
-                    if (g_map.hk_pad[h] == code) {
-                        g_pad_held_hk = h;
-                        g_pad_held_code = code;
-                        if (code >= IM_HKP_BACK_WITH) {
-                            g_back_pad = gp;        /* the game doesn't get the button */
-                            g_back_btn = b;
-                        }
-                        hotkey_do(win, h, true, 1, &paused, minimized);
-                        break;
-                    }
-                }
-                break;
-            }
-            case SDL_EVENT_GAMEPAD_BUTTON_UP: {
-                const int b = im_face(ev.gbutton.button);
-                if (b == SDL_GAMEPAD_BUTTON_GUIDE && g_guide_alone) {
-                    g_guide_alone = false;
-                    for (int h = 0; h < IM_HOTKEYS; h++) {
-                        if (g_map.hk_pad[h] == IM_HKP_GUIDE) {
-                            hotkey_do(win, h, true, 1, &paused, minimized);
-                            hotkey_do(win, h, false, 1, &paused, minimized);
-                            break;
-                        }
-                    }
-                }
-                /* a held shortcut (fast forward) ends with either button let go */
-                if (g_pad_held_hk >= 0 &&
-                    (b == SDL_GAMEPAD_BUTTON_GUIDE || IM_HKP_WITH + b == g_pad_held_code ||
-                     IM_HKP_BACK_WITH + b == g_pad_held_code ||
-                     (b == SDL_GAMEPAD_BUTTON_BACK && g_pad_held_code >= IM_HKP_BACK_WITH) ||
-                     (b == SDL_GAMEPAD_BUTTON_TOUCHPAD && g_pad_held_code == IM_HKP_TOUCHPAD) ||
-                     (b == SDL_GAMEPAD_BUTTON_MISC1 && g_pad_held_code == IM_HKP_SHARE))) {
-                    hotkey_do(win, g_pad_held_hk, false, 1, &paused, minimized);
-                    g_pad_held_hk = -1;
-                }
-                break;
-            }
-            case SDL_EVENT_JOYSTICK_ADDED:
-                joystick_added(ev.jdevice.which);
-                break;
-            case SDL_EVENT_GAMEPAD_ADDED:
-                pad_added(ev.gdevice.which);
-                break;
-            case SDL_EVENT_GAMEPAD_REMOVED:
-                pad_removed(ev.gdevice.which);
-                break;
-            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-                g_nw.width = ev.window.data1;
-                g_nw.height = ev.window.data2;
-                break;
-            case SDL_EVENT_WINDOW_MINIMIZED:
-            case SDL_EVENT_WINDOW_RESTORED:
-                minimized = ev.type == SDL_EVENT_WINDOW_MINIMIZED;
-                pause_core(paused || minimized);
-                nc_audio_set_paused(paused || minimized);
-                break;
-            case SDL_EVENT_WINDOW_FOCUS_GAINED:
-                focused = true;
-                nc_audio_set_volume(g_volume);
-                mods_released();
-                break;
-            case SDL_EVENT_WINDOW_FOCUS_LOST:
-                focused = false;
-                mouse_hold(false);
-                mods_released();
-                if (g_mute_bg) {
-                    nc_audio_set_volume(0);
-                }
-                break;
-            case SDL_EVENT_MOUSE_MOTION:
-                if (g_mgrab && SDL_GetWindowRelativeMouseMode(win)) {
-                    im_mouse_move(ev.motion.xrel, ev.motion.yrel);  /* its own window's relative mode */
-                }
-                play_pointer(fabsf(ev.motion.xrel) + fabsf(ev.motion.yrel));
-                break;
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                if (g_mgrab) {
-                    g_mbuttons |= SDL_BUTTON_MASK(ev.button.button);
-                } else if (g_map.mouse_stick && focused && !paused) {
-                    g_mgrab_win = win;
-                    mouse_hold(true);       /* the click that takes it isn't the game's */
-                    break;
-                }
-                play_pointer(2);
-                break;
-            case SDL_EVENT_MOUSE_BUTTON_UP:
-                g_mbuttons &= ~SDL_BUTTON_MASK(ev.button.button);
-                break;
-            default:
-                break;
-            }
-        }
-        play_pointer_tick();
-        nc_auto_tick();
-#ifdef XBASED_DEVCTL
-        nc_devctl_tick(&paused, minimized);
-#endif
-        if (nc_auto_take_menu()) {
-            ingame_menu(win, &paused, minimized);
-        }
-        if (g_dc_player) {
-            /* a player's controller gone: the menu, which pauses, and why */
-            const int p = g_dc_player;
-            g_dc_player = 0;
-            if (g_map.dc_pause && SDL_GetAtomicInt(&g_core_state) == 1) {
-                char msg[256];
-                snprintf(msg, sizeof(msg), T(S_PAD_DC), p);
-                nc_log("xbased-app", "player %d's controller disconnected: the menu opens", p);
-                dash_ingame_notice(msg);
-                ingame_menu(win, &paused, minimized);
-            }
-        }
-        update_pads(focused);
-        state_request_poll();
-
-        /* the GPU can't draw the game (no Vulkan device, a driver lacking
-         * what it needs): the game ran on with its sound over a black
-         * window, the reason only in the log */
-        if (!told && nc_hle_fatal_kind() == NC_FATAL_DRIVER) {
-            told = true;
-            pause_core(true);           /* (its sound went on under the box, #378) */
-            nc_audio_set_paused(true);
-            fatal_box("xbased", nc_hle_fatal());
-            break;
-        }
-        const int state = SDL_GetAtomicInt(&g_core_state);
-        if (state < 0) {
-            if (g_core.kernel.relaunch) {
-                run_again("relaunch", true);
-            }
-            if (g_core.kernel.quit) {
-                if (g_core.kernel.quit_no_dash) {
-                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "xbased", T(S_NO_DASHBOARD), win);
-                } else {
-                    fx_out();
-                }
-                break;
-            }
-            if (!told) {
-                told = true;
-                const char *why = nc_hle_fatal();
-                if (why) {
-                    fatal_box("xbased", why);
-                    break;
-                }
-            }
-        }
-        overlay_tick();
-        if (minimized || g_nw.width <= 0 || !nc_present_frame(&g_nw)) {
-            SDL_Delay(8); /* nothing to wait for the display on */
-        }
-#ifdef _WIN32
-        if (g_frame && !IsWindow((HWND)g_frame)) {
-            /* the frame's window went (its process fell), this run's with it:
-             * not left running unseen, back to the dashboard */
-            const char *why = hle_present_remote_why();
-            nc_log("xbased-app", "window: the frame's gone%s%s: leaving", why[0] ? ": " : "", why);
-            exit_now(0);
-        }
-#endif
-        if (g_frame && g_frame_hidden) {
-            if (hle_present_remote_state() < 0) {
-                g_frame_hidden = false;     /* no shared pictures: the window fills the frame, as before */
-                nc_frame_fill(g_frame, win);
-                nc_log("xbased-app", "window: the frame's pictures can't be had: drawn in the window");
-            } else {
-                frame_mouse_pump();
-            }
-        }
-        static bool raised;
-        if (g_frame && !raised && hle_present_count() > 0) {
-            raised = true;
-            nc_frame_raise(g_frame, win);   /* over the run before's, which goes next */
-        }
-        if (g_frame) {
-            const bool m = nc_frame_minimized(g_frame);
-            if (m != minimized) {
-                minimized = m;      /* a child window hears nothing of its frame's minimizing */
-                pause_core(paused || minimized);
-                nc_audio_set_paused(paused || minimized);
-            }
-        }
-#ifndef _WIN32
-        if (g_ready_fd >= 0 && hle_present_count() > 0) {
-            if (write(g_ready_fd, "1", 1) < 0) {
-            }
-            close(g_ready_fd);  /* drawn: the run before may go */
-            g_ready_fd = -1;
-        }
-#else
-        if (g_ready_ev && hle_present_count() > 0) {
-            SetEvent(g_ready_ev);   /* drawn: the run before may go */
-            CloseHandle(g_ready_ev);
-            g_ready_ev = NULL;
-        }
-#endif
-    }
+    run_game_window(win);
     nc_log("xbased-app", "native core: leaving");
     exit_now(0); /* the core thread has no stop yet */
 }

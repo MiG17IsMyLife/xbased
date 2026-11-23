@@ -16,7 +16,11 @@
 
 #ifdef _WIN32
 #include <stdbool.h>
+#include <stddef.h>
 #include <windows.h>
+
+/* Append one argument using Windows CRT quoting. Failure leaves cmd intact. */
+bool xb_quote_arg(char *cmd, size_t capacity, const char *arg);
 
 /* CreateProcessA (the process code page is UTF-8) with bottom-up and
  * high-entropy ASLR on for the new process; without the attribute where

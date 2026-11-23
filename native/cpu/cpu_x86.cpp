@@ -1475,6 +1475,69 @@ static void kill_block(NcCpu *cpu, Block *b)
     }
 }
 
+static bool decode_guest_instruction(NcCpu *cpu, uint32_t at, ZydisDecodedInstruction &in, ZydisDecodedOperand *ops)
+{
+    const uint32_t avail = guest_readable(at, ZYDIS_MAX_INSTRUCTION_LENGTH) ? ZYDIS_MAX_INSTRUCTION_LENGTH
+                                                                           : 0x1000 - (at & 0xFFF);
+    /* The Xbox's CPU is a Pentium III: no SSE2. An MMX instruction with
+     * an operand-size prefix (66 0F xx) is MMX there, the prefix ignored;
+     * on the host it would be SSE2's (XMM registers, 16 bytes, a 16-byte
+     * aligned operand). Dr. Muto adds a pixel so (66 0F DC: PADDUSB) from
+     * an unaligned address: SSE2's general protection fault, the title
+     * gone. Decoded without the prefix, as the console runs it. */
+    const uint8_t *ib = (const uint8_t *)(uintptr_t)at;
+    const bool mmx66 = avail >= 3 && ib[0] == 0x66 && ib[1] == 0x0F && nc_x86_mmx_opcode(ib[2]);
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&cpu->dec, (const void *)(uintptr_t)(at + (mmx66 ? 1 : 0)),
+                                             avail - (mmx66 ? 1 : 0), &in, ops))) {
+        return false;
+    }
+    if (mmx66) {
+        in.length++;    /* the prefix is the instruction's too */
+    }
+    return true;
+}
+
+static void emit_dispatch_stubs(Translator &t)
+{
+    /* the exits' stubs, after the code: mov r13d, target; jmp dispatch */
+    for (auto &pe : t.exits) {
+        uint8_t *stub = t.a.p;
+        t.a.op(ZYDIS_MNEMONIC_MOV, {R(ZYDIS_REGISTER_R13D), I((int32_t)pe.target)});
+        t.a.jmp(t.cpu->s_dispatch);
+        patch_rel32(pe.rel32, stub);
+        t.b->exits.push_back({pe.rel32, stub, pe.target});
+    }
+}
+
+static void register_translated_block(NcCpu *cpu, Block *b, uint64_t dep_end, bool probe)
+{
+    const uint32_t eip = b->eip;
+    cpu->by_host.push_back(b);
+#ifdef NC_CPU_DIAG
+    if (g_smc_check && !probe && dep_end - eip <= 0x4000 && guest_readable(eip, (uint32_t)(dep_end - eip))) {
+        b->src.assign((const uint8_t *)(uintptr_t)eip, (const uint8_t *)(uintptr_t)eip + (dep_end - eip));
+    }
+#endif
+    if (probe) {
+        b->dead = true; /* made again each time it is reached, until the page is there */
+        return;
+    }
+    for (uint64_t p = eip >> 12; p <= ((dep_end - 1) >> 12) && p <= 0xFFFFFu; p++) {
+        const bool fresh = !(cpu->page_bits[p >> 6] & (1ull << (p & 63)));
+        cpu->pages[(uint32_t)p].push_back(b);
+        cpu->page_bits[p >> 6] |= 1ull << (p & 63);
+        if (fresh && cpu->cfg.code_page) {
+            cpu->cfg.code_page(cpu->cfg.opaque, (uint32_t)p << 12);
+        }
+    }
+    if (b->bypass) {
+        cpu->bypass[eip] = b;
+    } else {
+        cpu->blocks[eip] = b;
+        l1_set(cpu, eip, b->code);
+    }
+}
+
 static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
 {
     if ((size_t)(cpu->code_end - cpu->code_p) < 64 * 1024) {
@@ -1530,26 +1593,12 @@ static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
             }
             break;
         }
-        const uint32_t avail = guest_readable(at, ZYDIS_MAX_INSTRUCTION_LENGTH) ? ZYDIS_MAX_INSTRUCTION_LENGTH
-                                                                               : 0x1000 - (at & 0xFFF);
         ZydisDecodedInstruction in;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-        /* The Xbox's CPU is a Pentium III: no SSE2. An MMX instruction with
-         * an operand-size prefix (66 0F xx) is MMX there, the prefix ignored;
-         * on the host it would be SSE2's (XMM registers, 16 bytes, a 16-byte
-         * aligned operand). Dr. Muto adds a pixel so (66 0F DC: PADDUSB) from
-         * an unaligned address: SSE2's general protection fault, the title
-         * gone. Decoded without the prefix, as the console runs it. */
-        const uint8_t *ib = (const uint8_t *)(uintptr_t)at;
-        const bool mmx66 = avail >= 3 && ib[0] == 0x66 && ib[1] == 0x0F && nc_x86_mmx_opcode(ib[2]);
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&cpu->dec, (const void *)(uintptr_t)(at + (mmx66 ? 1 : 0)),
-                                                 avail - (mmx66 ? 1 : 0), &in, ops))) {
+        if (!decode_guest_instruction(cpu, at, in, ops)) {
             dep_end = std::max(dep_end, (uint64_t)at + 1);
             t.sysop(at, NC_SYSOP_UD2, 0);
             break;
-        }
-        if (mmx66) {
-            in.length++;    /* the prefix is the instruction's too */
         }
         uint8_t *const insn_start = a.p;
         const Translator::Result r = t.insn(in, ops);
@@ -1579,14 +1628,7 @@ static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
         dep_end = std::max(dep_end, (uint64_t)t.eip);
     }
 
-    /* the exits' stubs, after the code: mov r13d, target; jmp dispatch */
-    for (auto &pe : t.exits) {
-        uint8_t *stub = a.p;
-        a.op(ZYDIS_MNEMONIC_MOV, {R(ZYDIS_REGISTER_R13D), I((int32_t)pe.target)});
-        a.jmp(cpu->s_dispatch);
-        patch_rel32(pe.rel32, stub);
-        b->exits.push_back({pe.rel32, stub, pe.target});
-    }
+    emit_dispatch_stubs(t);
     if (a.failed) {
         delete b;
         flush_all(cpu);
@@ -1594,30 +1636,7 @@ static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
     }
     b->code_end = a.p;
     cpu->code_p = (uint8_t *)(((uintptr_t)a.p + 15) & ~(uintptr_t)15);
-    cpu->by_host.push_back(b);
-#ifdef NC_CPU_DIAG
-    if (g_smc_check && !probe && dep_end - eip <= 0x4000 && guest_readable(eip, (uint32_t)(dep_end - eip))) {
-        b->src.assign((const uint8_t *)(uintptr_t)eip, (const uint8_t *)(uintptr_t)eip + (dep_end - eip));
-    }
-#endif
-    if (probe) {
-        b->dead = true; /* made again each time it is reached, until the page is there */
-    } else {
-        for (uint64_t p = eip >> 12; p <= ((dep_end - 1) >> 12) && p <= 0xFFFFFu; p++) {
-            const bool fresh = !(cpu->page_bits[p >> 6] & (1ull << (p & 63)));
-            cpu->pages[(uint32_t)p].push_back(b);
-            cpu->page_bits[p >> 6] |= 1ull << (p & 63);
-            if (fresh && cpu->cfg.code_page) {
-                cpu->cfg.code_page(cpu->cfg.opaque, (uint32_t)p << 12);
-            }
-        }
-    }
-    if (bypass && !probe) {
-        cpu->bypass[eip] = b;
-    } else if (!bypass && !probe) {
-        cpu->blocks[eip] = b;
-        l1_set(cpu, eip, b->code);
-    }
+    register_translated_block(cpu, b, dep_end, probe);
     link_block(cpu, b);
     cpu->translated++;
     FlushInstructionCache(GetCurrentProcess(), b->code, (size_t)(b->code_end - b->code));

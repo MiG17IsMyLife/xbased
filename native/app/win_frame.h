@@ -20,8 +20,23 @@
 #define XBASED_WIN_FRAME_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct SDL_Window;
+
+/* A Windows run hands the session to another PID through its exit code. */
+#define NC_FRAME_HANDOFF_FLAG 0x40000000u
+#define NC_FRAME_HANDOFF_PID_MASK 0x3fffffffu
+
+static inline int nc_frame_handoff_code(uint32_t pid)
+{
+    return (int)(NC_FRAME_HANDOFF_FLAG | (pid & NC_FRAME_HANDOFF_PID_MASK));
+}
+
+static inline uint32_t nc_frame_handoff_pid(uint32_t code)
+{
+    return (code & NC_FRAME_HANDOFF_FLAG) ? code & NC_FRAME_HANDOFF_PID_MASK : 0;
+}
 
 #ifdef _WIN32
 /* "xbased.exe frame <token> <full screen 0|1> <fsrate60 0|1> <title>":

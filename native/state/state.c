@@ -461,6 +461,85 @@ const char *nc_state_verify(const char *path, NcStateInfo *info, const NcStateSe
     return read_state(path, info, secs, nsecs, false);
 }
 
+static const char *check_state_sections(const uint8_t *p, size_t len, const NcStateInfo *info,
+                                        const SecEntry *tab, uint32_t n, const NcStateSection *secs, unsigned nsecs,
+                                        char *why, size_t why_size)
+{
+    const char *err = NULL;
+    /* every section checked before any is restored */
+    for (uint32_t i = 0; !err && i < n; i++) {
+        const NcStateSection *s = NULL;
+        for (unsigned k = 0; k < nsecs && !s; k++) {
+            s = secs[k].tag == tab[i].tag ? &secs[k] : NULL;
+        }
+        if (!s) {
+            snprintf(why, why_size, "the state has a section this core doesn't know (%.4s)",
+                     (const char *)&tab[i].tag);
+            err = why;
+        } else if (tab[i].version > s->version) {
+            snprintf(why, why_size, "made by a newer core (%s): its %s state is version %u, this core "
+                     "reads up to %u", info->core_version, s->name, tab[i].version, s->version);
+            err = why;
+        } else if (tab[i].version < s->min) {
+            snprintf(why, why_size, "made by an older core (%s): its %s state is version %u, this "
+                     "core reads %u and up", info->core_version, s->name, tab[i].version, s->min);
+            err = why;
+        } else if (tab[i].off > len || tab[i].len > len - tab[i].off) {
+            err = "the state is cut short";
+        } else if ((uint32_t)crc32(0, p + tab[i].off, (uInt)tab[i].len) != tab[i].crc) {
+            snprintf(why, why_size, "the state's %s section is damaged", s->name);
+            err = why;
+        }
+    }
+    for (unsigned k = 0; !err && k < nsecs; k++) {
+        bool found = false;
+        for (uint32_t i = 0; i < n && !found; i++) {
+            found = tab[i].tag == secs[k].tag;
+        }
+        if (!found && secs[k].optional) {
+            nc_log("xbased-native-state", "the state has no %s section (older than it): loaded without", secs[k].name);
+        } else if (!found) {
+            snprintf(why, why_size, "the state has no %s section", secs[k].name);
+            err = why;
+        }
+    }
+    return err;
+}
+
+static const char *restore_state_sections(const uint8_t *p, const SecEntry *tab, uint32_t n,
+                                          const NcStateSection *secs, unsigned nsecs, char *why, size_t why_size)
+{
+    const char *err = NULL;
+    /* in the order this core lists them (the RAM before what refers to it) */
+    for (unsigned k = 0; !err && k < nsecs; k++) {
+        bool found = false;
+        for (uint32_t i = 0; i < n; i++) {
+            if (tab[i].tag != secs[k].tag) {
+                continue;
+            }
+            found = true;
+            NcRd sr = {p + tab[i].off, (size_t)tab[i].len, 0, false};
+            if (tab[i].version != secs[k].version) {
+                nc_log("xbased-native-state", "%s: version %u read by a version %u core", secs[k].name,
+                       tab[i].version, secs[k].version);
+            }
+            if (!secs[k].load(&sr, tab[i].version) || sr.fail) {
+                if (g_fail[0]) {
+                    snprintf(why, why_size, "%s", g_fail);
+                } else {
+                    snprintf(why, why_size, "the %s state could not be restored", secs[k].name);
+                }
+                err = why;
+            }
+            break;
+        }
+        if (!found && secs[k].absent) {
+            secs[k].absent();
+        }
+    }
+    return err;
+}
+
 static const char *read_state(const char *path, NcStateInfo *info, const NcStateSection *secs, unsigned nsecs,
                               bool restore)
 {
@@ -482,69 +561,11 @@ static const char *read_state(const char *path, NcStateInfo *info, const NcState
     if (!err && !tab) {
         err = "the state is cut short";
     }
-    /* every section checked before any is restored */
-    for (uint32_t i = 0; !err && i < n; i++) {
-        const NcStateSection *s = NULL;
-        for (unsigned k = 0; k < nsecs && !s; k++) {
-            s = secs[k].tag == tab[i].tag ? &secs[k] : NULL;
-        }
-        if (!s) {
-            snprintf(why, sizeof(why), "the state has a section this core doesn't know (%.4s)",
-                     (const char *)&tab[i].tag);
-            err = why;
-        } else if (tab[i].version > s->version) {
-            snprintf(why, sizeof(why), "made by a newer core (%s): its %s state is version %u, this core "
-                     "reads up to %u", info->core_version, s->name, tab[i].version, s->version);
-            err = why;
-        } else if (tab[i].version < s->min) {
-            snprintf(why, sizeof(why), "made by an older core (%s): its %s state is version %u, this "
-                     "core reads %u and up", info->core_version, s->name, tab[i].version, s->min);
-            err = why;
-        } else if (tab[i].off > len || tab[i].len > len - tab[i].off) {
-            err = "the state is cut short";
-        } else if ((uint32_t)crc32(0, p + tab[i].off, (uInt)tab[i].len) != tab[i].crc) {
-            snprintf(why, sizeof(why), "the state's %s section is damaged", s->name);
-            err = why;
-        }
+    if (!err) {
+        err = check_state_sections(p, len, info, tab, n, secs, nsecs, why, sizeof(why));
     }
-    for (unsigned k = 0; !err && k < nsecs; k++) {
-        bool found = false;
-        for (uint32_t i = 0; i < n && !found; i++) {
-            found = tab[i].tag == secs[k].tag;
-        }
-        if (!found && secs[k].optional) {
-            nc_log("xbased-native-state", "the state has no %s section (older than it): loaded without", secs[k].name);
-        } else if (!found) {
-            snprintf(why, sizeof(why), "the state has no %s section", secs[k].name);
-            err = why;
-        }
-    }
-    /* in the order this core lists them (the RAM before what refers to it) */
-    for (unsigned k = 0; restore && !err && k < nsecs; k++) {
-        bool found = false;
-        for (uint32_t i = 0; i < n; i++) {
-            if (tab[i].tag != secs[k].tag) {
-                continue;
-            }
-            found = true;
-            NcRd sr = {p + tab[i].off, (size_t)tab[i].len, 0, false};
-            if (tab[i].version != secs[k].version) {
-                nc_log("xbased-native-state", "%s: version %u read by a version %u core", secs[k].name,
-                       tab[i].version, secs[k].version);
-            }
-            if (!secs[k].load(&sr, tab[i].version) || sr.fail) {
-                if (g_fail[0]) {
-                    snprintf(why, sizeof(why), "%s", g_fail);
-                } else {
-                    snprintf(why, sizeof(why), "the %s state could not be restored", secs[k].name);
-                }
-                err = why;
-            }
-            break;
-        }
-        if (!found && secs[k].absent) {
-            secs[k].absent();
-        }
+    if (!err && restore) {
+        err = restore_state_sections(p, tab, n, secs, nsecs, why, sizeof(why));
     }
     munmap((void *)p, len);
     return err;

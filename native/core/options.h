@@ -48,7 +48,14 @@
  * after waiting for them */
 typedef enum { NC_SHADERS_HYBRID, NC_SHADERS_ASYNC, NC_SHADERS_SYNC } NcShaderMode;
 
+typedef struct NcBootOptions {
+    bool dashboard;             /* select the Xbox dashboard as the default XBE */
+    bool relaunch;              /* use the title's saved launch data page */
+    char loadstate[512];        /* use the XBE recorded in this savestate */
+} NcBootOptions;
+
 typedef struct NcOptions {
+    NcBootOptions boot;
     bool uncap, prebuild;
     int shaders;                        /* NcShaderMode */
     int fps_cap;                /* uncapped: frames a second at most (0: none) */

@@ -4962,6 +4962,440 @@ static uint8_t dither_mode(const HleCmdState *s, const HleVkSurf *rt)
     }
 }
 
+static void record_blend_constants(VkCommandBuffer cb, uint32_t bc, const HleVkSurf *rt, bool color_target)
+{
+    if (rt && hle_surf_out_bgra(rt->fmt)) {             /* red and blue swap places */
+        bc = (bc & 0xFF00FF00u) | ((bc >> 16) & 0xFF) | ((bc & 0xFF) << 16);
+    }
+    float bcf[4] = { ((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f,
+                     (bc & 0xFF) / 255.0f, (bc >> 24) / 255.0f };
+    /* HLE_QUIRK_BLEND_CONST_RESET: the first colour draw after a pipeline
+     * without colour sets other constants first, so its own are recorded */
+    bool bc_reset = g_rec.bc_lost && color_target;
+    if (!g_rec.valid || memcmp(g_rec.bc, bcf, sizeof(bcf)) || bc_reset) {
+        memcpy(g_rec.bc, bcf, sizeof(bcf));
+        if (bc_reset) {
+            const float other[4] = { bcf[0], bcf[1], bcf[2], bcf[3] == 0.0f ? 1.0f : 0.0f };
+            T.vkCmdSetBlendConstants(cb, other);
+            g_rec.bc_lost = false;
+        }
+        T.vkCmdSetBlendConstants(cb, bcf);
+        g_dr.emits[EM_DYN]++;
+    }
+}
+
+static uint32_t record_vertex_bindings(VkCommandBuffer cb, const HleCmdDraw *c, uint32_t fixed_fvf,
+                                       bool cur_diffuse, bool use_uber, uint32_t na,
+                                       VkVertexInputAttributeDescription2EXT *ad)
+{
+    /* vertex input: the vertex offset goes into firstVertex (vertexOffset),
+     * so draws walking one buffer keep their binding */
+    VkVertexInputBindingDescription2EXT bd[HLE_DRAW_MAX_BIND];
+    VkBuffer bufs[HLE_DRAW_MAX_BIND];
+    VkDeviceSize offs[HLE_DRAW_MAX_BIND];
+    uint32_t strides[HLE_DRAW_MAX_BIND];
+    uint32_t nb;
+    if (c->nbind) {
+        nb = MIN(c->nbind, (uint32_t)HLE_DRAW_MAX_BIND);
+        for (uint32_t i = 0; i < nb; i++) {
+            strides[i] = c->bind_stride[i];
+            bufs[i] = (c->guest_vb >> i) & 1 ? g_hram.buf : g_harena.buf;  /* in place */
+            offs[i] = c->bind_off[i];
+        }
+    } else {
+        nb = 1;
+        strides[0] = c->stride;
+        na = c->imm ? imm_attrs(fixed_fvf, ad) : fvf_attrs(c->fvf, ad);
+        bufs[0] = (c->guest_vb & HLE_DRAW_GUEST_FVF) ? g_hram.buf : g_harena.buf;
+        offs[0] = c->vb_off;
+        if (cur_diffuse) {
+            ad[na++] = (VkVertexInputAttributeDescription2EXT){
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .location = 2, .binding = 1, .format = VK_FORMAT_R32G32B32A32_SFLOAT };
+            strides[1] = 0;
+            bufs[1] = g_harena.buf;
+            offs[1] = c->diffuse_cur - 1;
+            nb = 2;
+        }
+    }
+    for (uint32_t i = 0; i < nb; i++) {
+        bd[i] = (VkVertexInputBindingDescription2EXT){
+            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+            .binding = i, .stride = strides[i],
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1 };
+    }
+    uint32_t vfirst = g_norec & 2 ? 0 : first_vertex(nb, strides, offs);
+    if (use_uber) {
+        uber_vi(&nb, bd, bufs, offs, strides, &na, ad);
+    }
+    if (!g_hvk.caps.vids) {
+        /* the layout is the pipeline's (k.vi): only the buffers and strides */
+        bool vi = rec_vertex_input(nb, bd, na, ad);
+        if (rec_vertex_buffers(nb, bufs, offs) || vi) {
+            VkDeviceSize st[HLE_DRAW_MAX_BIND];
+            for (uint32_t i = 0; i < nb; i++) {
+                st[i] = strides[i];
+            }
+            if (g_hvk.caps.eds1) {
+                T.vkCmdBindVertexBuffers2(cb, 0, nb, bufs, offs, NULL, st);
+            } else {                    /* the strides are the pipeline's too (k.ds) */
+                T.vkCmdBindVertexBuffers(cb, 0, nb, bufs, offs);
+            }
+            g_dr.emits[EM_VB]++;
+        }
+    } else {
+        if (rec_vertex_input(nb, bd, na, ad)) {
+            T.vkCmdSetVertexInputEXT(cb, nb, bd, na, ad);
+            g_dr.emits[EM_VI]++;
+        }
+        if (rec_vertex_buffers(nb, bufs, offs)) {
+            T.vkCmdBindVertexBuffers(cb, 0, nb, bufs, offs);
+            g_dr.emits[EM_VB]++;
+        }
+    }
+    return vfirst;
+}
+
+/* Merge potential (counted, not done yet): a non-indexed list draw that
+ * recorded no state and nothing else since the previous one, and whose
+ * vertices continue the previous one's with the same topology. */
+static void count_draw_merge_candidates(const HleCmdDraw *c, uint32_t vfirst)
+{
+    extern uint64_t hle_back_breaks;
+    static struct {
+        bool valid;
+        uint64_t emits, breaks;
+        uint32_t prim, end;
+    } previous_nonindexed;
+    uint64_t state_emits = 0;
+    for (unsigned i = 0; i < EM_N; i++) {
+        state_emits += g_dr.emits[i];
+    }
+    const bool list_topology = c->prim == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ||
+                c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+                c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const bool nonindexed_list = c->ib_off == UINT32_MAX && list_topology;
+    if (!list_topology) {
+        g_dr.nomerge[0]++;
+    } else if (c->ib_off != UINT32_MAX) {
+        g_dr.nomerge[1]++;
+    } else if (!previous_nonindexed.valid || state_emits != previous_nonindexed.emits || previous_nonindexed.prim != c->prim) {
+        g_dr.nomerge[2]++;
+    } else if (hle_back_breaks != previous_nonindexed.breaks) {
+        g_dr.nomerge[3]++;
+    } else if (previous_nonindexed.end != vfirst) {
+        g_dr.nomerge[4]++;
+    } else {
+        g_dr.mergeable++;
+    }
+    /* indexed: no state since the previous indexed draw (same topology),
+     * and of those, the ones whose indices also follow its own at the
+     * same vertex base (one draw as they are) */
+    static struct {
+        bool valid;
+        uint64_t emits, breaks;
+        uint32_t prim, iend, vbase;
+    } previous_indexed;
+    if (c->ib_off != UINT32_MAX) {
+        if (previous_indexed.valid && state_emits == previous_indexed.emits && hle_back_breaks == previous_indexed.breaks && previous_indexed.prim == c->prim) {
+            g_dr.idx_same++;
+            g_dr.idx_contig += previous_indexed.iend == c->ib_off / 2 && previous_indexed.vbase == vfirst;
+        }
+        previous_indexed.iend = c->ib_off / 2 + c->count;
+        previous_indexed.vbase = vfirst;
+    }
+    previous_indexed.valid = c->ib_off != UINT32_MAX && list_topology;
+    previous_indexed.emits = state_emits;
+    previous_indexed.breaks = hle_back_breaks;
+    previous_indexed.prim = c->prim;
+    previous_nonindexed.valid = nonindexed_list;
+    previous_nonindexed.emits = state_emits;
+    previous_nonindexed.breaks = hle_back_breaks;
+    previous_nonindexed.prim = c->prim;
+    previous_nonindexed.end = vfirst + c->count;
+}
+
+static void record_draw_call(VkCommandBuffer cb, const HleCmdDraw *c, uint32_t vfirst)
+{
+    if (c->ib_off != UINT32_MAX) {
+        /* A strip run still held binds its index buffer as it is recorded,
+         * which this draw's own recording would set off after the check
+         * below: the draw then read the run's indices. Nightcaster's terrain
+         * lost tiles so, its strips read in place sharing one binding (no
+         * state recorded between them and the indexed draw after). */
+        hle_batch_flush(cb);
+        /* 16-bit indices from the arena, bound once: the offset is firstIndex */
+        if (REC_CHANGED(ibuf, g_harena.buf)) {
+            T.vkCmdBindIndexBuffer(cb, g_harena.buf, 0, VK_INDEX_TYPE_UINT16);
+        }
+        int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
+                                : -1;
+        if (g_hle_gpucut != 2) {
+            T.vkCmdDrawIndexed(cb, g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count, 1,
+                               c->ib_off / 2, (int32_t)vfirst, 0);
+        }
+        if (q >= 0) {
+            T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
+        }
+    } else {
+        int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
+                                : -1;
+        if (g_hle_gpucut == 2) {
+            /* debug: the state alone */
+        } else if (g_hle_gpucut == 4) {
+            T.vkCmdDraw(cb, MIN(c->count, 3u), 1, vfirst, 0);  /* debug: a draw's own cost */
+        } else if (q < 0 && (c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                      c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+                      c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
+            hle_batch_draw(cb, (VkPrimitiveTopology)c->prim, vfirst, c->count)) {
+            /* held: recorded with the strips that follow it (a probed draw never is) */
+        } else {
+            T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
+        }
+        if (q >= 0) {
+            T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
+        }
+    }
+}
+
+static void prepare_fixed_texture_stages(PipeKey *k, HleFfPush *pc, const HleCmdDraw *c,
+                                         const HleCmdState *s, uint32_t rt_id)
+{
+    /* POINTSPRITEENABLE: the cascade is texture stage 3 alone (ff.h) */
+    unsigned first = s->rs[RS_POINTSPRITEENABLE] ? HLE_FF_SPRITE_STAGE : 0;
+    for (unsigned st = first; st < HLE_FF_STAGES; st++) {
+        const uint32_t *t = s->tss[st];
+        if (t[TSS_COLOROP] <= 1) {        /* DISABLE ends the cascade */
+            break;
+        }
+        unsigned ki = st - first;         /* the key's stage */
+        HleFfStage *fs = &k->ps.st[ki];
+        fs->colorop = t[TSS_COLOROP];
+        fs->colorarg0 = t[TSS_COLORARG0];
+        fs->colorarg1 = t[TSS_COLORARG1];
+        fs->colorarg2 = t[TSS_COLORARG2];
+        fs->alphaop = t[TSS_ALPHAOP];
+        fs->alphaarg0 = t[TSS_ALPHAARG0];
+        fs->alphaarg1 = t[TSS_ALPHAARG1];
+        fs->alphaarg2 = t[TSS_ALPHAARG2];
+        fs->resultarg = t[TSS_RESULTARG];
+        uint32_t lin = 0;
+        /* fixed-function shadow buffers: not yet (white, as before) */
+        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin);
+        pc->flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8);
+        fs->texture = c->tex[st] != 0;
+        fs->unset = c->tex_unset >> st & 1;
+        fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
+        pc->tex[ki] = slot | sampler_index(t, stage_lod_down(c, st, rt_id), false) << 16;
+        k->vs.texcoord[ki] = t[TSS_TEXCOORDINDEX] & 7;
+        k->ps.nstages = ki + 1;
+        k->vs.ntex = ki + 1;
+    }
+    k->ps.fbfetch = (uint8_t)ff_fb_stages(c, rt_id);
+}
+
+static uint32_t prepare_register_combiners(PipeKey *k, HleFfPush *pc, const HleCmdDraw *c,
+                                           const HleCmdState *s, uint32_t rt_id, const HleVkSurf *rt, bool prog)
+{
+    uint32_t rect = 0;          /* first stage's rectangle for fixed-function vertex processing */
+    /* register combiners: every stage samples its texture; FF vertex
+     * shaders feed all four coordinate sets */
+    memset(&k->ps, 0, sizeof(k->ps));
+    pc->flags = 0;
+    for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
+        pc->tex[st] = stage_slot(c, st, rt_id, &pc->flags) |
+                     sampler_index(s->tss[st], stage_lod_down(c, st, rt_id), shadow_fmt(c->tex[st]) == 2) << 16;
+        k->vs.texcoord[st] = s->tss[st][TSS_TEXCOORDINDEX] & 7;
+    }
+    k->vs.ntex = HLE_FF_STAGES;
+    k->psh = 1;
+    hle_psh_key(s->rs, &k->pk);
+    k->pk.fbfetch = hle_draw_fb_stages(c, rt_id);
+    k->pk.alpha_test = s->rs[RS_ALPHATESTENABLE] != 0;
+    k->pk.alpha_func = s->rs[RS_ALPHAFUNC] >= 0x200 ? (s->rs[RS_ALPHAFUNC] - 0x200) & 7 : 7;
+    k->pk.flat = s->rs[RS_SHADEMODE] == 0x1D00;
+    k->pk.fog = s->rs[RS_FOGENABLE] ? (s->rs[RS_FOGTABLEMODE] & 3) + 1 : 0;
+    k->pk.fog_abs = (s->rs[RS_FOGTABLEMODE] >> 8) & 1;
+    k->pk.specular = s->rs[RS_SPECULARENABLE] != 0;
+    k->pk.point_sprite = c->prim == 0 && s->rs[RS_POINTSPRITEENABLE] != 0;
+    k->pk.out_bgra = rt && hle_surf_out_bgra(rt->fmt);
+    for (unsigned st = 0; st < 4; st++) {
+        k->pk.alpha_kill |= (c->tex[st] && s->tss[st][TSS_ALPHAKILL] != 0) << st;
+    }
+    static int nosign = -1;             /* debug: XBASED_HLE_TEXSIGN=0, textures unsigned (A/B) */
+    if (nosign < 0) {
+        const char *e = getenv("XBASED_HLE_TEXSIGN");
+        nosign = e && !strcmp(e, "0");
+    }
+    for (unsigned st = 0; st < 4 && !nosign; st++) {
+        const unsigned sg = (s->tss[st][TSS_COLORSIGN] >> 28) & 15u;
+        HleVkTex *tx = c->tex[st] && sg ? tex_find(c->tex[st]) : NULL;
+        unsigned eff = 0;
+        if (tx && hle_tex_sign_xor(tx->xfmt, sg, &eff)) {
+            /* defined with its signed bytes flipped (pbdraw.c texture) */
+            k->pk.dot_map |= eff << (16 + 4 * st);
+            k->pk.input_tex |= 1u << st;
+        } else if (c->tex[st]) {
+            k->pk.dot_map |= sg << (16 + 4 * st);
+        }
+    }
+    for (unsigned st = 0; st < 4; st++) {   /* signed stages read point-sampled (HLE_PSH_TPOINT) */
+        if (((HLE_PSH_TSIGN(&k->pk) >> (4 * st)) & 15) && s->tss[st][TSS_MAGFILTER] == 1) {
+            k->pk.dot_map |= 1u << (12 + st);
+        }
+    }
+    if (HLE_PSH_TSIGN(&k->pk)) {
+        static unsigned s_logged;
+        if (s_logged < 8) {
+            s_logged++;
+            hle_log("xbased-hle-pipe", "signed texture draw: channels %04x modes %05x "
+                    "(first 8 logged)", HLE_PSH_TSIGN(&k->pk), k->pk.tex_modes);
+        }
+    }
+    for (unsigned st = 0; st < 4; st++) {
+        unsigned sf = shadow_fmt(c->tex[st]);
+        if (sf) {
+            k->pk.shadow |= 1u << st;
+            k->pk.shadow_fmt |= sf << (2 * st);
+        }
+    }
+    for (unsigned st = 0; st < 4; st++) {
+        /* the colour key (psh.c color_key): the stage's operation and
+         * colour, its alpha left out for a texture without one */
+        const unsigned op = s->tss[st][TSS_COLORKEYOP] & 3;
+        if (op && c->tex[st]) {
+            const HleVkTex *t = tex_find(c->tex[st]);
+            const HleVkSurf *sf = t ? NULL : hle_surf_get(c->tex[st]);
+            const uint32_t xf = t ? t->xfmt : sf ? sf->d.xfmt : 0;
+            const bool noalpha = xf == HLE_XFMT_X8R8G8B8 || xf == HLE_XFMT_LIN_X8R8G8B8 ||
+                                 xf == HLE_XFMT_X1R5G5B5 || xf == HLE_XFMT_LIN_X1R5G5B5;
+            k->pk.tex_modes |= HLE_PSH_CKEY_BITS(st, op, noalpha);
+            k->pk.ckey[st] = s->tss[st][TSS_COLORKEYCOLOR] & (noalpha ? 0x00FFFFFFu : 0xFFFFFFFFu);
+        }
+    }
+    for (unsigned st = 0; st < 4; st++) {
+        /* the bound texture's dimensionality picks the fetch, as on the
+         * NV2A (and LLE): a volume under a 2D-coordinate mode is read in
+         * 3D (Conker's menu: animated electricity, a 256 x 128 x 4 volume,
+         * bump-env mapped), PROJECT3D on a 2D texture s/q, t/q */
+        unsigned m = (k->pk.tex_modes >> (5 * st)) & 0x1F;
+        HleVkTex *t = c->tex[st] ? tex_find(c->tex[st]) : NULL;
+        const HleVkSurf *sf = c->tex[st] && !t ? hle_surf_get(c->tex[st]) : NULL;
+        bool vol = t && t->vol, cube = (t && t->faces == 6) || (sf && sf->d.faces == 6);
+        bool flat = c->tex[st] && !vol && !cube;
+        if (vol) {
+            k->pk.vol |= 1u << st;
+        } else if (m == HLE_PST_PROJECT3D && flat && !((k->pk.shadow >> st) & 1)) {
+            k->pk.tex_modes -= (HLE_PST_PROJECT3D - HLE_PST_PROJECT2D) << (5 * st);
+        }
+        /* ... and a 2D texture under a mode that fetches a cube or a
+         * volume, a cube under PROJECT2D (psh.h HLE_PSH_TKIND): the
+         * other kinds' views of its slot are the white texture's */
+        const bool cube_mode = m == HLE_PST_CUBEMAP || m == HLE_PST_DOT_STR_CUBE ||
+                               m == HLE_PST_DOT_RFLCT_DIFF || m == HLE_PST_DOT_RFLCT_SPEC ||
+                               m == HLE_PST_DOT_RFLCT_SPEC_CONST;
+        if (!((k->pk.fbfetch >> st) & 1) && !((k->pk.shadow >> st) & 1) &&
+            ((flat && (cube_mode || m == HLE_PST_DOT_STR_3D)) || (cube && m == HLE_PST_PROJECT2D))) {
+            k->pk.compare |= HLE_PSH_TKIND_BIT(st);
+        }
+    }
+    /* the stages that sample a 2D image through samp() (as psh.c
+     * generates it) whose linear texture is part of a larger surface:
+     * their texel coordinates kept to the texture's own size. Vertex
+     * program draws (pc->scr unused) have one in each of pc->scr's words
+     * (HLE_PSH_RECT4); fixed function, the first stage's in fog.w.
+     * Prince of Persia: The Sands of Time's glow adds four levels of a
+     * blur in one draw, 10 x 7, 20 x 15 and 40 x 30 images in 16-, 32-
+     * and 48-pixel targets (the pitch's 64-byte multiple): kept to the
+     * first one's size alone, the others' filters read the columns never
+     * drawn, and the glow put a band of their stale colours down the
+     * right of the screen. */
+    for (unsigned st = 0; st < 4; st++) {
+        const unsigned m = (k->pk.tex_modes >> (5 * st)) & 0x1F;
+        const bool v = (k->pk.vol >> st) & 1;
+        const bool samp2d = m == HLE_PST_DOT_ST || m == HLE_PST_BRDF || m == HLE_PST_DOT_ZW ||
+                            m > HLE_PST_DOT_RFLCT_SPEC_CONST ||
+                            ((m == HLE_PST_PROJECT2D || m == HLE_PST_BUMPENVMAP ||
+                              m == HLE_PST_BUMPENVMAP_LUM) && !v) ||
+                            ((m == HLE_PST_DPNDNT_AR || m == HLE_PST_DPNDNT_GB) && !st);
+        if (samp2d && !((k->pk.shadow >> st) & 1) && !((k->pk.fbfetch >> st) & 1) &&
+            (pc->tex[st] & 0xFFFFu)) {
+            const uint32_t r = lin_rect(c, s, st);
+            if (r && prog) {
+                memcpy(&pc->scr[st], &r, 4);
+                k->pk.vol |= HLE_PSH_RECT4;
+            } else if (r && !rect) {
+                rect = r;
+            }
+        }
+    }
+    if (rect) {
+        k->pk.vol |= HLE_PSH_RECT;           /* the stage fog.w names, kept to its size */
+    }
+    if (k->pk.shadow) {
+        uint32_t f = s->rs[RS_SHADOWFUNC];
+        static int lit = -1;                /* debug: XBASED_HLE_SHADOWLIT, always lit */
+        if (lit < 0) {
+            lit = getenv("XBASED_HLE_SHADOWLIT") != NULL;
+        }
+        /* D3DCMP_* (0x200 + n), or SET_SHADOW_COMPARE_FUNC's word as
+         * pushed: the NV2A keeps its low 3 bits */
+        k->pk.shadow |= (lit ? 7 : f & 7) << 4;
+        static unsigned s_logged;
+        if (s_logged < 4) {
+            s_logged++;
+            hle_log("xbased-hle-pipe", "shadow draw: stages=%x fmt=%x func=%x modes=%05x "
+                    "tex=%u,%u,%u,%u", k->pk.shadow & 15, k->pk.shadow_fmt, f,
+                    k->pk.tex_modes, c->tex[0], c->tex[1], c->tex[2], c->tex[3]);
+        }
+    }
+    static int psdbg = -1;
+    if (psdbg < 0) {
+        const char *e = getenv("XBASED_HLE_PSDBG");     /* debug: HlePshKey.debug */
+        psdbg = e ? atoi(e) : 0;
+    }
+#if defined(__ANDROID__) || defined(_WIN32) || defined(NC_DESKTOP)
+    {   /* on demand: debug.xbased.psdbg=<view> (0 = off) switches the combiner
+         * debug view live; with pixhist.sh, a stage's value at a pixel. Polled
+         * by program draws seen, not drawn: a view whose pipelines cannot be
+         * made drops every draw, and must still be switched off. */
+        static unsigned polled;
+        if (polled != g_prop_gen) {
+            char v[PROP_VALUE_MAX] = "";
+            polled = g_prop_gen;
+            if (hle_prop_get("debug.xbased.psdbg", v) > 0) {
+                psdbg = atoi(v);
+            }
+        }
+    }
+#endif
+    k->pk.debug = psdbg;
+    static int pbtint = -1;         /* debug: push-buffer runs' draws in magenta */
+    if (pbtint < 0) {
+        pbtint = getenv("XBASED_HLE_PBTINT") != NULL;
+    }
+    if (pbtint && c->dbg) {
+        k->pk.debug = 18;
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        pc->psc[i] = s->rs[HLE_PS_C0 + i];
+        pc->psc[8 + i] = s->rs[HLE_PS_C1 + i];
+    }
+    pc->psc[16] = s->rs[HLE_PS_FINAL_C0];
+    pc->psc[17] = s->rs[HLE_PS_FINAL_C1];
+    for (unsigned st = 1; st < 4; st++) {   /* each bump stage's matrix */
+        unsigned m = (k->pk.tex_modes >> (5 * st)) & 0x1F;
+        if (m == HLE_PST_BUMPENVMAP || m == HLE_PST_BUMPENVMAP_LUM) {
+            const uint32_t *t = s->tss[st];
+            uint32_t *mt = st == 3 ? pc->bump3 : &pc->bump[2 * (st - 1)];
+            mt[0] = half2(t[TSS_BUMPENVMAT00], t[TSS_BUMPENVMAT00 + 1]);
+            mt[1] = half2(t[TSS_BUMPENVMAT00 + 2], t[TSS_BUMPENVMAT00 + 3]);
+            pc->bumpl[st - 1] = half2(t[TSS_BUMPENVLSCALE], t[TSS_BUMPENVLSCALE + 1]);
+        }
+    }
+    return rect;
+}
+
 void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, uint32_t ds_id,
                        const HleCmdViewport *vpc)
 {
@@ -5084,234 +5518,10 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     memcpy(&pc.fog[0], &s->rs[RS_FOGSTART], 4);
     memcpy(&pc.fog[1], &s->rs[RS_FOGEND], 4);
     memcpy(&pc.fog[2], &s->rs[RS_FOGDENSITY], 4);
-    uint32_t rect = 0;                  /* lin_rect's (register combiners: a stage's that samples by it) */
-    /* POINTSPRITEENABLE: the cascade is texture stage 3 alone (ff.h) */
-    unsigned first = s->rs[RS_POINTSPRITEENABLE] ? HLE_FF_SPRITE_STAGE : 0;
-    for (unsigned st = first; st < HLE_FF_STAGES; st++) {
-        const uint32_t *t = s->tss[st];
-        if (t[TSS_COLOROP] <= 1) {        /* DISABLE ends the cascade */
-            break;
-        }
-        unsigned ki = st - first;         /* the key's stage */
-        HleFfStage *fs = &k.ps.st[ki];
-        fs->colorop = t[TSS_COLOROP];
-        fs->colorarg0 = t[TSS_COLORARG0];
-        fs->colorarg1 = t[TSS_COLORARG1];
-        fs->colorarg2 = t[TSS_COLORARG2];
-        fs->alphaop = t[TSS_ALPHAOP];
-        fs->alphaarg0 = t[TSS_ALPHAARG0];
-        fs->alphaarg1 = t[TSS_ALPHAARG1];
-        fs->alphaarg2 = t[TSS_ALPHAARG2];
-        fs->resultarg = t[TSS_RESULTARG];
-        uint32_t lin = 0;
-        /* fixed-function shadow buffers: not yet (white, as before) */
-        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin);
-        pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8);
-        fs->texture = c->tex[st] != 0;
-        fs->unset = c->tex_unset >> st & 1;
-        fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
-        pc.tex[ki] = slot | sampler_index(t, stage_lod_down(c, st, rt_id), false) << 16;
-        k.vs.texcoord[ki] = t[TSS_TEXCOORDINDEX] & 7;
-        k.ps.nstages = ki + 1;
-        k.vs.ntex = ki + 1;
-    }
-    k.ps.fbfetch = (uint8_t)ff_fb_stages(c, rt_id);
+    prepare_fixed_texture_stages(&k, &pc, c, s, rt_id);
+    uint32_t rect = 0;
     if (s->psh) {
-        /* register combiners: every stage samples its texture; FF vertex
-         * shaders feed all four coordinate sets */
-        memset(&k.ps, 0, sizeof(k.ps));
-        pc.flags = 0;
-        for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
-            pc.tex[st] = stage_slot(c, st, rt_id, &pc.flags) |
-                         sampler_index(s->tss[st], stage_lod_down(c, st, rt_id), shadow_fmt(c->tex[st]) == 2) << 16;
-            k.vs.texcoord[st] = s->tss[st][TSS_TEXCOORDINDEX] & 7;
-        }
-        k.vs.ntex = HLE_FF_STAGES;
-        k.psh = 1;
-        hle_psh_key(s->rs, &k.pk);
-        k.pk.fbfetch = hle_draw_fb_stages(c, rt_id);
-        k.pk.alpha_test = s->rs[RS_ALPHATESTENABLE] != 0;
-        k.pk.alpha_func = s->rs[RS_ALPHAFUNC] >= 0x200 ? (s->rs[RS_ALPHAFUNC] - 0x200) & 7 : 7;
-        k.pk.flat = s->rs[RS_SHADEMODE] == 0x1D00;
-        k.pk.fog = s->rs[RS_FOGENABLE] ? (s->rs[RS_FOGTABLEMODE] & 3) + 1 : 0;
-        k.pk.fog_abs = (s->rs[RS_FOGTABLEMODE] >> 8) & 1;
-        k.pk.specular = s->rs[RS_SPECULARENABLE] != 0;
-        k.pk.point_sprite = c->prim == 0 && s->rs[RS_POINTSPRITEENABLE] != 0;
-        k.pk.out_bgra = rt && hle_surf_out_bgra(rt->fmt);
-        for (unsigned st = 0; st < 4; st++) {
-            k.pk.alpha_kill |= (c->tex[st] && s->tss[st][TSS_ALPHAKILL] != 0) << st;
-        }
-        static int nosign = -1;             /* debug: XBASED_HLE_TEXSIGN=0, textures unsigned (A/B) */
-        if (nosign < 0) {
-            const char *e = getenv("XBASED_HLE_TEXSIGN");
-            nosign = e && !strcmp(e, "0");
-        }
-        for (unsigned st = 0; st < 4 && !nosign; st++) {
-            const unsigned sg = (s->tss[st][TSS_COLORSIGN] >> 28) & 15u;
-            HleVkTex *tx = c->tex[st] && sg ? tex_find(c->tex[st]) : NULL;
-            unsigned eff = 0;
-            if (tx && hle_tex_sign_xor(tx->xfmt, sg, &eff)) {
-                /* defined with its signed bytes flipped (pbdraw.c texture) */
-                k.pk.dot_map |= eff << (16 + 4 * st);
-                k.pk.input_tex |= 1u << st;
-            } else if (c->tex[st]) {
-                k.pk.dot_map |= sg << (16 + 4 * st);
-            }
-        }
-        for (unsigned st = 0; st < 4; st++) {   /* signed stages read point-sampled (HLE_PSH_TPOINT) */
-            if (((HLE_PSH_TSIGN(&k.pk) >> (4 * st)) & 15) && s->tss[st][TSS_MAGFILTER] == 1) {
-                k.pk.dot_map |= 1u << (12 + st);
-            }
-        }
-        if (HLE_PSH_TSIGN(&k.pk)) {
-            static unsigned s_logged;
-            if (s_logged < 8) {
-                s_logged++;
-                hle_log("xbased-hle-pipe", "signed texture draw: channels %04x modes %05x "
-                        "(first 8 logged)", HLE_PSH_TSIGN(&k.pk), k.pk.tex_modes);
-            }
-        }
-        for (unsigned st = 0; st < 4; st++) {
-            unsigned sf = shadow_fmt(c->tex[st]);
-            if (sf) {
-                k.pk.shadow |= 1u << st;
-                k.pk.shadow_fmt |= sf << (2 * st);
-            }
-        }
-        for (unsigned st = 0; st < 4; st++) {
-            /* the colour key (psh.c color_key): the stage's operation and
-             * colour, its alpha left out for a texture without one */
-            const unsigned op = s->tss[st][TSS_COLORKEYOP] & 3;
-            if (op && c->tex[st]) {
-                const HleVkTex *t = tex_find(c->tex[st]);
-                const HleVkSurf *sf = t ? NULL : hle_surf_get(c->tex[st]);
-                const uint32_t xf = t ? t->xfmt : sf ? sf->d.xfmt : 0;
-                const bool noalpha = xf == HLE_XFMT_X8R8G8B8 || xf == HLE_XFMT_LIN_X8R8G8B8 ||
-                                     xf == HLE_XFMT_X1R5G5B5 || xf == HLE_XFMT_LIN_X1R5G5B5;
-                k.pk.tex_modes |= HLE_PSH_CKEY_BITS(st, op, noalpha);
-                k.pk.ckey[st] = s->tss[st][TSS_COLORKEYCOLOR] & (noalpha ? 0x00FFFFFFu : 0xFFFFFFFFu);
-            }
-        }
-        for (unsigned st = 0; st < 4; st++) {
-            /* the bound texture's dimensionality picks the fetch, as on the
-             * NV2A (and LLE): a volume under a 2D-coordinate mode is read in
-             * 3D (Conker's menu: animated electricity, a 256 x 128 x 4 volume,
-             * bump-env mapped), PROJECT3D on a 2D texture s/q, t/q */
-            unsigned m = (k.pk.tex_modes >> (5 * st)) & 0x1F;
-            HleVkTex *t = c->tex[st] ? tex_find(c->tex[st]) : NULL;
-            const HleVkSurf *sf = c->tex[st] && !t ? hle_surf_get(c->tex[st]) : NULL;
-            bool vol = t && t->vol, cube = (t && t->faces == 6) || (sf && sf->d.faces == 6);
-            bool flat = c->tex[st] && !vol && !cube;
-            if (vol) {
-                k.pk.vol |= 1u << st;
-            } else if (m == HLE_PST_PROJECT3D && flat && !((k.pk.shadow >> st) & 1)) {
-                k.pk.tex_modes -= (HLE_PST_PROJECT3D - HLE_PST_PROJECT2D) << (5 * st);
-            }
-            /* ... and a 2D texture under a mode that fetches a cube or a
-             * volume, a cube under PROJECT2D (psh.h HLE_PSH_TKIND): the
-             * other kinds' views of its slot are the white texture's */
-            const bool cube_mode = m == HLE_PST_CUBEMAP || m == HLE_PST_DOT_STR_CUBE ||
-                                   m == HLE_PST_DOT_RFLCT_DIFF || m == HLE_PST_DOT_RFLCT_SPEC ||
-                                   m == HLE_PST_DOT_RFLCT_SPEC_CONST;
-            if (!((k.pk.fbfetch >> st) & 1) && !((k.pk.shadow >> st) & 1) &&
-                ((flat && (cube_mode || m == HLE_PST_DOT_STR_3D)) || (cube && m == HLE_PST_PROJECT2D))) {
-                k.pk.compare |= HLE_PSH_TKIND_BIT(st);
-            }
-        }
-        /* the stages that sample a 2D image through samp() (as psh.c
-         * generates it) whose linear texture is part of a larger surface:
-         * their texel coordinates kept to the texture's own size. Vertex
-         * program draws (pc.scr unused) have one in each of pc.scr's words
-         * (HLE_PSH_RECT4); fixed function, the first stage's in fog.w.
-         * Prince of Persia: The Sands of Time's glow adds four levels of a
-         * blur in one draw, 10 x 7, 20 x 15 and 40 x 30 images in 16-, 32-
-         * and 48-pixel targets (the pitch's 64-byte multiple): kept to the
-         * first one's size alone, the others' filters read the columns never
-         * drawn, and the glow put a band of their stale colours down the
-         * right of the screen. */
-        for (unsigned st = 0; st < 4; st++) {
-            const unsigned m = (k.pk.tex_modes >> (5 * st)) & 0x1F;
-            const bool v = (k.pk.vol >> st) & 1;
-            const bool samp2d = m == HLE_PST_DOT_ST || m == HLE_PST_BRDF || m == HLE_PST_DOT_ZW ||
-                                m > HLE_PST_DOT_RFLCT_SPEC_CONST ||
-                                ((m == HLE_PST_PROJECT2D || m == HLE_PST_BUMPENVMAP ||
-                                  m == HLE_PST_BUMPENVMAP_LUM) && !v) ||
-                                ((m == HLE_PST_DPNDNT_AR || m == HLE_PST_DPNDNT_GB) && !st);
-            if (samp2d && !((k.pk.shadow >> st) & 1) && !((k.pk.fbfetch >> st) & 1) &&
-                (pc.tex[st] & 0xFFFFu)) {
-                const uint32_t r = lin_rect(c, s, st);
-                if (r && prog) {
-                    memcpy(&pc.scr[st], &r, 4);
-                    k.pk.vol |= HLE_PSH_RECT4;
-                } else if (r && !rect) {
-                    rect = r;
-                }
-            }
-        }
-        if (rect) {
-            k.pk.vol |= HLE_PSH_RECT;           /* the stage fog.w names, kept to its size */
-        }
-        if (k.pk.shadow) {
-            uint32_t f = s->rs[RS_SHADOWFUNC];
-            static int lit = -1;                /* debug: XBASED_HLE_SHADOWLIT, always lit */
-            if (lit < 0) {
-                lit = getenv("XBASED_HLE_SHADOWLIT") != NULL;
-            }
-            /* D3DCMP_* (0x200 + n), or SET_SHADOW_COMPARE_FUNC's word as
-             * pushed: the NV2A keeps its low 3 bits */
-            k.pk.shadow |= (lit ? 7 : f & 7) << 4;
-            static unsigned s_logged;
-            if (s_logged < 4) {
-                s_logged++;
-                hle_log("xbased-hle-pipe", "shadow draw: stages=%x fmt=%x func=%x modes=%05x "
-                        "tex=%u,%u,%u,%u", k.pk.shadow & 15, k.pk.shadow_fmt, f,
-                        k.pk.tex_modes, c->tex[0], c->tex[1], c->tex[2], c->tex[3]);
-            }
-        }
-        static int psdbg = -1;
-        if (psdbg < 0) {
-            const char *e = getenv("XBASED_HLE_PSDBG");     /* debug: HlePshKey.debug */
-            psdbg = e ? atoi(e) : 0;
-        }
-#if defined(__ANDROID__) || defined(_WIN32) || defined(NC_DESKTOP)
-        {   /* on demand: debug.xbased.psdbg=<view> (0 = off) switches the combiner
-             * debug view live; with pixhist.sh, a stage's value at a pixel. Polled
-             * by program draws seen, not drawn: a view whose pipelines cannot be
-             * made drops every draw, and must still be switched off. */
-            static unsigned polled;
-            if (polled != g_prop_gen) {
-                char v[PROP_VALUE_MAX] = "";
-                polled = g_prop_gen;
-                if (hle_prop_get("debug.xbased.psdbg", v) > 0) {
-                    psdbg = atoi(v);
-                }
-            }
-        }
-#endif
-        k.pk.debug = psdbg;
-        static int pbtint = -1;         /* debug: push-buffer runs' draws in magenta */
-        if (pbtint < 0) {
-            pbtint = getenv("XBASED_HLE_PBTINT") != NULL;
-        }
-        if (pbtint && c->dbg) {
-            k.pk.debug = 18;
-        }
-        for (unsigned i = 0; i < 8; i++) {
-            pc.psc[i] = s->rs[HLE_PS_C0 + i];
-            pc.psc[8 + i] = s->rs[HLE_PS_C1 + i];
-        }
-        pc.psc[16] = s->rs[HLE_PS_FINAL_C0];
-        pc.psc[17] = s->rs[HLE_PS_FINAL_C1];
-        for (unsigned st = 1; st < 4; st++) {   /* each bump stage's matrix */
-            unsigned m = (k.pk.tex_modes >> (5 * st)) & 0x1F;
-            if (m == HLE_PST_BUMPENVMAP || m == HLE_PST_BUMPENVMAP_LUM) {
-                const uint32_t *t = s->tss[st];
-                uint32_t *mt = st == 3 ? pc.bump3 : &pc.bump[2 * (st - 1)];
-                mt[0] = half2(t[TSS_BUMPENVMAT00], t[TSS_BUMPENVMAT00 + 1]);
-                mt[1] = half2(t[TSS_BUMPENVMAT00 + 2], t[TSS_BUMPENVMAT00 + 3]);
-                pc.bumpl[st - 1] = half2(t[TSS_BUMPENVLSCALE], t[TSS_BUMPENVLSCALE + 1]);
-            }
-        }
+        rect = prepare_register_combiners(&k, &pc, c, s, rt_id, rt, prog);
         psframe_log(c, s, &k.pk, rt_id, pc.psc);
         static unsigned s_logged, s_cube;
         HleVkTex *t3 = tex_find(c->tex[3]);
@@ -5913,178 +6123,10 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
                 s->rs[RS_ZWRITEENABLE], s->rs[RS_ZFUNC], stn, k.wmask, k.blend_en,
                 k.ps.alpha_test, c->tex[0], s->tss[0][TSS_COLOROP], s->tss[0][TSS_ALPHAKILL]);
     }
-    uint32_t bc = s->rs[RS_BLENDCOLOR];
-    if (rt && hle_surf_out_bgra(rt->fmt)) {             /* red and blue swap places */
-        bc = (bc & 0xFF00FF00u) | ((bc >> 16) & 0xFF) | ((bc & 0xFF) << 16);
-    }
-    float bcf[4] = { ((bc >> 16) & 0xFF) / 255.0f, ((bc >> 8) & 0xFF) / 255.0f,
-                     (bc & 0xFF) / 255.0f, (bc >> 24) / 255.0f };
-    /* HLE_QUIRK_BLEND_CONST_RESET: the first colour draw after a pipeline
-     * without colour sets other constants first, so its own are recorded */
-    bool bc_reset = g_rec.bc_lost && k.cfmt;
-    if (!g_rec.valid || memcmp(g_rec.bc, bcf, sizeof(bcf)) || bc_reset) {
-        memcpy(g_rec.bc, bcf, sizeof(bcf));
-        if (bc_reset) {
-            const float other[4] = { bcf[0], bcf[1], bcf[2], bcf[3] == 0.0f ? 1.0f : 0.0f };
-            T.vkCmdSetBlendConstants(cb, other);
-            g_rec.bc_lost = false;
-        }
-        T.vkCmdSetBlendConstants(cb, bcf);
-        g_dr.emits[EM_DYN]++;
-    }
-    /* vertex input: the vertex offset goes into firstVertex (vertexOffset),
-     * so draws walking one buffer keep their binding */
-    VkVertexInputBindingDescription2EXT bd[HLE_DRAW_MAX_BIND];
-    VkBuffer bufs[HLE_DRAW_MAX_BIND];
-    VkDeviceSize offs[HLE_DRAW_MAX_BIND];
-    uint32_t strides[HLE_DRAW_MAX_BIND];
-    uint32_t nb;
-    if (c->nbind) {
-        nb = MIN(c->nbind, (uint32_t)HLE_DRAW_MAX_BIND);
-        for (uint32_t i = 0; i < nb; i++) {
-            strides[i] = c->bind_stride[i];
-            bufs[i] = (c->guest_vb >> i) & 1 ? g_hram.buf : g_harena.buf;  /* in place */
-            offs[i] = c->bind_off[i];
-        }
-    } else {
-        nb = 1;
-        strides[0] = c->stride;
-        na = c->imm ? imm_attrs(k.vs.fvf, ad) : fvf_attrs(c->fvf, ad);
-        bufs[0] = (c->guest_vb & HLE_DRAW_GUEST_FVF) ? g_hram.buf : g_harena.buf;
-        offs[0] = c->vb_off;
-        if (cur_diffuse) {
-            ad[na++] = (VkVertexInputAttributeDescription2EXT){
-                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
-                .location = 2, .binding = 1, .format = VK_FORMAT_R32G32B32A32_SFLOAT };
-            strides[1] = 0;
-            bufs[1] = g_harena.buf;
-            offs[1] = c->diffuse_cur - 1;
-            nb = 2;
-        }
-    }
-    for (uint32_t i = 0; i < nb; i++) {
-        bd[i] = (VkVertexInputBindingDescription2EXT){
-            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
-            .binding = i, .stride = strides[i],
-            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1 };
-    }
-    uint32_t vfirst = g_norec & 2 ? 0 : first_vertex(nb, strides, offs);
-    if (us >= 0) {
-        uber_vi(&nb, bd, bufs, offs, strides, &na, ad);
-    }
-    if (!g_hvk.caps.vids) {
-        /* the layout is the pipeline's (k.vi): only the buffers and strides */
-        bool vi = rec_vertex_input(nb, bd, na, ad);
-        if (rec_vertex_buffers(nb, bufs, offs) || vi) {
-            VkDeviceSize st[HLE_DRAW_MAX_BIND];
-            for (uint32_t i = 0; i < nb; i++) {
-                st[i] = strides[i];
-            }
-            if (eds1) {
-                T.vkCmdBindVertexBuffers2(cb, 0, nb, bufs, offs, NULL, st);
-            } else {                    /* the strides are the pipeline's too (k.ds) */
-                T.vkCmdBindVertexBuffers(cb, 0, nb, bufs, offs);
-            }
-            g_dr.emits[EM_VB]++;
-        }
-    } else {
-        if (rec_vertex_input(nb, bd, na, ad)) {
-            T.vkCmdSetVertexInputEXT(cb, nb, bd, na, ad);
-            g_dr.emits[EM_VI]++;
-        }
-        if (rec_vertex_buffers(nb, bufs, offs)) {
-            T.vkCmdBindVertexBuffers(cb, 0, nb, bufs, offs);
-            g_dr.emits[EM_VB]++;
-        }
-    }
-    /* Merge potential (counted, not done yet): a non-indexed list draw that
-     * recorded no state and nothing else since the previous one, and whose
-     * vertices continue the previous one's with the same topology. */
-    {
-        extern uint64_t hle_back_breaks;
-        static struct { bool valid; uint64_t emits, breaks; uint32_t prim, end; } mp;
-        uint64_t em = 0;
-        for (unsigned i = 0; i < EM_N; i++) {
-            em += g_dr.emits[i];
-        }
-        bool list = c->prim == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ||
-                    c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
-                    c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        bool flat = c->ib_off == UINT32_MAX && list;
-        if (!list) {
-            g_dr.nomerge[0]++;
-        } else if (c->ib_off != UINT32_MAX) {
-            g_dr.nomerge[1]++;
-        } else if (!mp.valid || em != mp.emits || mp.prim != c->prim) {
-            g_dr.nomerge[2]++;
-        } else if (hle_back_breaks != mp.breaks) {
-            g_dr.nomerge[3]++;
-        } else if (mp.end != vfirst) {
-            g_dr.nomerge[4]++;
-        } else {
-            g_dr.mergeable++;
-        }
-        /* indexed: no state since the previous indexed draw (same topology),
-         * and of those, the ones whose indices also follow its own at the
-         * same vertex base (one draw as they are) */
-        static struct { bool valid; uint64_t emits, breaks; uint32_t prim, iend, vbase; } mi;
-        if (c->ib_off != UINT32_MAX) {
-            if (mi.valid && em == mi.emits && hle_back_breaks == mi.breaks && mi.prim == c->prim) {
-                g_dr.idx_same++;
-                g_dr.idx_contig += mi.iend == c->ib_off / 2 && mi.vbase == vfirst;
-            }
-            mi.iend = c->ib_off / 2 + c->count;
-            mi.vbase = vfirst;
-        }
-        mi.valid = c->ib_off != UINT32_MAX && list;
-        mi.emits = em;
-        mi.breaks = hle_back_breaks;
-        mi.prim = c->prim;
-        mp.valid = flat;
-        mp.emits = em;
-        mp.breaks = hle_back_breaks;
-        mp.prim = c->prim;
-        mp.end = vfirst + c->count;
-    }
-    if (c->ib_off != UINT32_MAX) {
-        /* A strip run still held binds its index buffer as it is recorded,
-         * which this draw's own recording would set off after the check
-         * below: the draw then read the run's indices. Nightcaster's terrain
-         * lost tiles so, its strips read in place sharing one binding (no
-         * state recorded between them and the indexed draw after). */
-        hle_batch_flush(cb);
-        /* 16-bit indices from the arena, bound once: the offset is firstIndex */
-        if (REC_CHANGED(ibuf, g_harena.buf)) {
-            T.vkCmdBindIndexBuffer(cb, g_harena.buf, 0, VK_INDEX_TYPE_UINT16);
-        }
-        int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
-                                : -1;
-        if (g_hle_gpucut != 2) {
-            T.vkCmdDrawIndexed(cb, g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count, 1,
-                               c->ib_off / 2, (int32_t)vfirst, 0);
-        }
-        if (q >= 0) {
-            T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
-        }
-    } else {
-        int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
-                                : -1;
-        if (g_hle_gpucut == 2) {
-            /* debug: the state alone */
-        } else if (g_hle_gpucut == 4) {
-            T.vkCmdDraw(cb, MIN(c->count, 3u), 1, vfirst, 0);  /* debug: a draw's own cost */
-        } else if (q < 0 && (c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
-                      c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-                      c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
-            hle_batch_draw(cb, (VkPrimitiveTopology)c->prim, vfirst, c->count)) {
-            /* held: recorded with the strips that follow it (a probed draw never is) */
-        } else {
-            T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
-        }
-        if (q >= 0) {
-            T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
-        }
-    }
+    record_blend_constants(cb, s->rs[RS_BLENDCOLOR], rt, k.cfmt != VK_FORMAT_UNDEFINED);
+    const uint32_t vfirst = record_vertex_bindings(cb, c, k.vs.fvf, cur_diffuse, us >= 0, na, ad);
+    count_draw_merge_candidates(c, vfirst);
+    record_draw_call(cb, c, vfirst);
     g_rec.valid = true;
     g_dr.draws++;
     g_dr.verts += c->count;

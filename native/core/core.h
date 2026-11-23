@@ -8,6 +8,7 @@
  * quotient that doesn't fit, not a divisor of zero (fault_win.c) */
 #define NC_FPE_OVERFLOW 0x4E43
 
+#include "native/core/options.h"
 #include "native/core/vm.h"
 #include "native/core/xbe_load.h"
 #include "native/core/xdvdfs.h"
@@ -26,20 +27,13 @@ typedef struct NcCore {
     NcKernel kernel;
     NcXbe xbe;
     NcCpu *cpu;
+    NcThread *boot_thread;
+    bool restored_state;
 } NcCore;
 
-/* Sets up guest memory and the kernel, loads default.xbe from the disc and
+/* Sets up guest memory and the kernel, loads the selected XBE and
  * prepares the title's main thread. Takes ownership of disc_fd. */
-bool nc_core_boot(NcCore *c, int disc_fd);
-/* The next boot goes into the savestate at path (native/state): the XBE it
- * was running boots, then the state replaces what the boot made. */
-void nc_core_set_loadstate(const char *path);
-/* The next boot is a relaunch: it boots the XBE the saved launch data page
- * names (nc_kernel_relaunch_file) instead of default.xbe. */
-void nc_core_set_relaunch(bool on);
-/* The next boot is the dashboard's (C:\xboxdash.xbe), with no disc: the app's
- * Dashboard, where Xbox Live accounts are made. */
-void nc_core_set_dashboard(bool on);
+bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot);
 
 /* Runs the guest until it stops; logs the frontier summary. */
 void nc_core_run(NcCore *c);

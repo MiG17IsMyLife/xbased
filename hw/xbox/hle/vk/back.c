@@ -2540,6 +2540,66 @@ uint64_t hle_back_submits(void)
     return g_back.st.submits;
 }
 
+static HleVkSurf *draw_local_read_target(uint32_t id, unsigned reads)
+{
+    HleVkSurf *surface = reads ? hle_surf_get(id) : NULL;
+    if (surface && !surface->general && !surface->local_read) {
+        surface->local_read = true;
+        close_pass_why(PE_LREAD);
+    }
+    return surface;
+}
+
+static void cmd_draw(const HleCmdDraw *draw)
+{
+    /* a draw reading the target it renders: the pass renders in
+     * RENDERING_LOCAL_READ (reopened once when it was not) */
+    const unsigned fb = hle_draw_fb_stages(draw, g_back.rt);
+    HleVkSurf *fbrt = draw_local_read_target(g_back.rt, fb);
+    /* The same local-read transition applies to an EQUAL pass that reads depth. */
+    const unsigned zq = hle_draw_zeq(draw, g_back.ds);
+    HleVkSurf *zds = draw_local_read_target(g_back.ds, zq);
+    if (hle_draw_tex_needs_prep(draw, g_back.rt)) {
+        close_pass_why(PE_PREP);             /* sampled render targets change layout */
+        hle_draw_tex_prep(draw, g_back.rt, cb_get());
+    }
+    /* combiner stages reading the target at their own coordinates: a
+     * copy of it, made outside the pass */
+    bool snap = hle_draw_snap_needed(draw, g_back.rt);
+    if (snap) {
+        close_pass_why(PE_COPY);
+        hle_draw_snap(cb_get(), hle_surf_get(g_back.rt));
+    }
+    if (g_hle_gpucut == 3) {
+        if (!g_back.pass_open) {
+            open_pass(true);        /* debug: the passes alone, no draw state */
+        }
+    } else if (g_back.pass_open || open_pass(hle_draw_lrz_off())) {
+        vis_draw(g_back.fr[g_back.cur].cb);
+        VkImageView zv = zds ? hle_zread_depth_view(zds) : VK_NULL_HANDLE;
+        if (fbrt || zv) {
+            /* the depth read waits for the pass's depth writes since the last */
+            bool zbar = zv && zds->wgen != g_back.zeq_wgen;
+            hle_draw_fb_bind(g_back.fr[g_back.cur].cb, fbrt, zds, zv, zbar);
+            if (zbar) {
+                g_back.zeq_wgen = zds->wgen;
+            }
+            g_pt.fb++;
+        }
+        g_hle_zeq = zv ? zq : 0;
+        hle_draw_cmd_draw(draw, g_back.fr[g_back.cur].cb, g_back.rt, g_back.ds, &g_back.vp);
+        g_back.st.draws++;
+        if (g_pix.active) {
+            pix_after(draw);
+        }
+    } else {
+        draw_nopass();
+    }
+    if (snap) {
+        hle_draw_snap_end();
+    }
+}
+
 static void dispatch(const HleCmdHdr *h)
 {
     const void *p = hle_cmd_payload(h);
@@ -2607,63 +2667,7 @@ static void dispatch(const HleCmdHdr *h)
         close_pass_why(PE_TEX);                 /* uploads never split a pass (P3 Task 9 hoists) */
         hle_draw_cmd_tex(p, cb_get());
         break;
-    case HLE_OP_DRAW: {
-        /* a draw reading the target it renders: the pass renders in
-         * RENDERING_LOCAL_READ (reopened once when it was not) */
-        unsigned fb = hle_draw_fb_stages(p, g_back.rt);
-        HleVkSurf *fbrt = fb ? hle_surf_get(g_back.rt) : NULL;
-        if (fbrt && !fbrt->general && !fbrt->local_read) {
-            fbrt->local_read = true;
-            close_pass_why(PE_LREAD);
-        }
-        /* an EQUAL pass reading the depth buffer (hle_draw_zeq): the same */
-        unsigned zq = hle_draw_zeq(p, g_back.ds);
-        HleVkSurf *zds = zq ? hle_surf_get(g_back.ds) : NULL;
-        if (zds && !zds->general && !zds->local_read) {
-            zds->local_read = true;
-            close_pass_why(PE_LREAD);
-        }
-        if (hle_draw_tex_needs_prep(p, g_back.rt)) {
-            close_pass_why(PE_PREP);             /* sampled render targets change layout */
-            hle_draw_tex_prep(p, g_back.rt, cb_get());
-        }
-        /* combiner stages reading the target at their own coordinates: a
-         * copy of it, made outside the pass */
-        bool snap = hle_draw_snap_needed(p, g_back.rt);
-        if (snap) {
-            close_pass_why(PE_COPY);
-            hle_draw_snap(cb_get(), hle_surf_get(g_back.rt));
-        }
-        if (g_hle_gpucut == 3) {
-            if (!g_back.pass_open) {
-                open_pass(true);        /* debug: the passes alone, no draw state */
-            }
-        } else if (g_back.pass_open || open_pass(hle_draw_lrz_off())) {
-            vis_draw(g_back.fr[g_back.cur].cb);
-            VkImageView zv = zds ? hle_zread_depth_view(zds) : VK_NULL_HANDLE;
-            if (fbrt || zv) {
-                /* the depth read waits for the pass's depth writes since the last */
-                bool zbar = zv && zds->wgen != g_back.zeq_wgen;
-                hle_draw_fb_bind(g_back.fr[g_back.cur].cb, fbrt, zds, zv, zbar);
-                if (zbar) {
-                    g_back.zeq_wgen = zds->wgen;
-                }
-                g_pt.fb++;
-            }
-            g_hle_zeq = zv ? zq : 0;
-            hle_draw_cmd_draw(p, g_back.fr[g_back.cur].cb, g_back.rt, g_back.ds, &g_back.vp);
-            g_back.st.draws++;
-            if (g_pix.active) {
-                pix_after(p);
-            }
-        } else {
-            draw_nopass();
-        }
-        if (snap) {
-            hle_draw_snap_end();
-        }
-        break;
-    }
+    case HLE_OP_DRAW:     cmd_draw(p); break;
     default:
         hle_log("xbased-hle-back", "unknown op %u (len %u)", h->op, h->len);
         break;
@@ -2846,38 +2850,60 @@ void hle_back_ahead(void)
     g_ahd.vp = vp;
 }
 
+static void drain_render_commands(HleRing *r)
+{
+    const HleCmdHdr *h;
+    int64_t t0 = hle_prof_begin();
+    while ((h = hle_ring_peek(r)) != NULL) {
+        if (unlikely(hle_vk_lost())) {
+            /* nothing goes to a lost device: the ring drains (the
+             * front end's waits on the timeline all return) */
+            hle_ring_consume(r);
+            continue;
+        }
+        dispatch(h);
+        hle_ring_consume(r);
+        g_back.st.cmds++;
+        pend_age_check();
+        if (!(g_back.st.cmds & 1023)) {
+            /* a ring that never drains (DOA2 uncapped at 400 frames a
+             * second, a target chain made and dropped every frame) must
+             * still free: the surface table filled in a second */
+            reap();
+        }
+    }
+    hle_prof_end(HLE_PROF_BACK, t0);
+    uint32_t used = hle_ring_used(r);
+    if (used > g_back.st.ring_hw) {
+        g_back.st.ring_hw = used;
+    }
+    reap();
+}
+
+static void wait_for_render_work(HleRing *r)
+{
+    /* asleep from here: a commit sets the event only now (hle_back_kick),
+     * and the ring is checked again after the flag (a publish before it
+     * is seen here, one after it sets the event) */
+    __atomic_store_n(&g_back.sleeping, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (hle_ring_peek(r)) {
+        __atomic_store_n(&g_back.sleeping, 0, __ATOMIC_RELAXED);
+        return;
+    }
+    uint32_t pa = hle_hitch_enter(HLE_ACT_IDLE);
+    hle_event_wait(&g_back.kick);
+    __atomic_store_n(&g_back.sleeping, 0, __ATOMIC_RELAXED);
+    hle_hitch_leave(pa);
+}
+
 static void *render_thread(void *opaque)
 {
     HleRing *r = hle_fe_ring();
     hle_hitch_thread(HLE_HT_RENDER);
     for (;;) {
         hle_event_reset(&g_back.kick);
-        const HleCmdHdr *h;
-        int64_t t0 = hle_prof_begin();
-        while ((h = hle_ring_peek(r)) != NULL) {
-            if (unlikely(hle_vk_lost())) {
-                /* nothing goes to a lost device: the ring drains (the
-                 * front end's waits on the timeline all return) */
-                hle_ring_consume(r);
-                continue;
-            }
-            dispatch(h);
-            hle_ring_consume(r);
-            g_back.st.cmds++;
-            pend_age_check();
-            if (!(g_back.st.cmds & 1023)) {
-                /* a ring that never drains (DOA2 uncapped at 400 frames a
-                 * second, a target chain made and dropped every frame) must
-                 * still free: the surface table filled in a second */
-                reap();
-            }
-        }
-        hle_prof_end(HLE_PROF_BACK, t0);
-        uint32_t used = hle_ring_used(r);
-        if (used > g_back.st.ring_hw) {
-            g_back.st.ring_hw = used;
-        }
-        reap();
+        drain_render_commands(r);
         uint32_t seen = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
         if (hle_ring_peek(r) || ring_wait_brief(r, seen)) {
             continue;
@@ -2892,19 +2918,7 @@ static void *render_thread(void *opaque)
         if (hle_ring_peek(r)) {
             continue;
         }
-        /* asleep from here: a commit sets the event only now (hle_back_kick),
-         * and the ring is checked again after the flag (a publish before it
-         * is seen here, one after it sets the event) */
-        __atomic_store_n(&g_back.sleeping, 1, __ATOMIC_SEQ_CST);
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        if (hle_ring_peek(r)) {
-            __atomic_store_n(&g_back.sleeping, 0, __ATOMIC_RELAXED);
-            continue;
-        }
-        uint32_t pa = hle_hitch_enter(HLE_ACT_IDLE);
-        hle_event_wait(&g_back.kick);
-        __atomic_store_n(&g_back.sleeping, 0, __ATOMIC_RELAXED);
-        hle_hitch_leave(pa);
+        wait_for_render_work(r);
     }
     return NULL;
 }

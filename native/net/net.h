@@ -61,6 +61,8 @@ typedef enum NcNetMode { NC_NET_OFF, NC_NET_NAT, NC_NET_LAN, NC_NET_KAI } NcNetM
  *   dns=A.B.C.D[,A.B.C.D]   nat: the DNS servers DHCP gives the guest
  *   lanport=N               lan: the UDP port (all consoles the same)
  *   lanbcast=A.B.C.D[/BITS] lan: the local network's broadcast address
+ *   lansubnet=A.B.C.D/BITS  lan: select an interface for multicast discovery
+ *   lanip=A.B.C.D          lan: name the multicast interface directly
  *                           (and its prefix: who is outside it)
  *   lanpeers=IP[:PORT],...  lan: consoles also reached directly (another
  *                           subnet, a tunnel's far end)
@@ -71,7 +73,7 @@ typedef enum NcNetMode { NC_NET_OFF, NC_NET_NAT, NC_NET_LAN, NC_NET_KAI } NcNetM
 bool nc_net_option(const char *arg);
 NcNetMode nc_net_mode(void);
 /* The boot: the backend's thread starts (nothing in mode off). */
-void nc_net_start(void);
+void nc_net_start(bool enabled);
 /* Whether the NIC's link is up (a backend running). */
 bool nc_net_link(void);
 
@@ -80,6 +82,7 @@ void nc_net_send(const uint8_t *frame, size_t len);
 /* The NIC: the station address the guest gave it (its frames' source).
  * nc_net_mac: it, copied to mac; false while the guest hasn't set one. */
 void nc_net_set_mac(const uint8_t mac[6]);
+void nc_net_set_rx_notify(void (*notify)(void));
 bool nc_net_mac(uint8_t mac[6]);
 /* The NIC's thread: the oldest frame received, copied to buf (cap bytes);
  * its length, 0 when none. nc_net_peek gives the next one's length without
@@ -122,6 +125,8 @@ typedef struct NcNetConfig {
     uint16_t lan_port;
     uint32_t lan_bcast;                 /* network order, 0: 255.255.255.255 */
     uint32_t lan_mask;                  /* network order, 0: not known */
+    char lan_subnet[32];                /* CIDR for multicast discovery */
+    char lan_ip[32];                    /* explicit multicast interface */
     unsigned npeers;
     uint32_t peer_ip[8];                /* network order */
     uint16_t peer_port[8];

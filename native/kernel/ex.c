@@ -7,6 +7,8 @@
  * call into guest code).
  */
 #include "native/kernel/kernel.h"
+#include "native/core/chihiro_boot.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/xbe_load.h"
 #include "native/core/xdvdfs.h"
 #include "native/dev/dev.h"
@@ -562,6 +564,11 @@ static uint8_t *eeprom(NcKernel *k)
     return g_eeprom;
 }
 
+void nc_ex_console_serial(NcKernel *k, char serial[12])
+{
+    memcpy(serial, eeprom(k) + 0x34, 12);
+}
+
 static const NvSetting *nv_find(uint32_t index)
 {
     static int no_sections = -1;        /* debug: NC_NV_NO_SECTIONS=1, XC_MAX_OS / FACTORY unknown (A/B) */
@@ -1041,10 +1048,14 @@ bool nc_kernel_launch_xbe(const uint8_t page[NC_LAUNCH_PAGE], char *out, size_t 
     memcpy(p, page + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN);
     p[LAUNCH_PATH_LEN] = 0;
     static const char cd[] = "\\Device\\CdRom0";
+    static const char mbfs[] = NC_CHIHIRO_MBFS;
     static const char hd[] = "\\Device\\Harddisk0\\Partition";
     size_t dev;
     if (!strncasecmp(p, cd, sizeof(cd) - 1)) {
         dev = sizeof(cd) - 1;
+    } else if (nc_io_disc_relative(mbfs) && !strncasecmp(p, mbfs, sizeof(mbfs) - 1) &&
+               (p[sizeof(mbfs) - 1] == '\\' || p[sizeof(mbfs) - 1] == ';')) {
+        dev = sizeof(mbfs) - 1;
     } else if (!strncasecmp(p, hd, sizeof(hd) - 1) && p[sizeof(hd) - 1] >= '1' && p[sizeof(hd) - 1] <= '5') {
         dev = sizeof(hd);               /* the partition's digit too */
     } else {
@@ -1100,6 +1111,41 @@ void nc_kernel_launch_page_restore(NcKernel *k, const uint8_t page[NC_LAUNCH_PAG
     nc_vm_wr32(k->vm, slot, va);
 }
 
+/* Chihiro: a return to the firmware reboots the game, or its test program
+ * when TEST was just pressed. Leaving the test program goes back to the game. */
+static bool chihiro_reboot(NcKernel *k, NcFrame *f, uint32_t routine, uint32_t page, const char *launch)
+{
+    const char *game = nc_io_chihiro_boot(false);
+    const char *test_xbe = nc_io_chihiro_boot(true);
+    if (!game || (routine != 1 && routine != 2)) {
+        return false;
+    }
+    const bool in_test = !strcasecmp(k->image_path, test_xbe) && strcasecmp(test_xbe, game);
+    const bool test = !in_test && nc_chihiro_board_test_pressed();
+    const char *xbe = test ? test_xbe : game;
+    uint8_t pg[NC_LAUNCH_PAGE] = {0};
+    snprintf((char *)pg + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s", xbe);
+    char path[512];
+    nc_kernel_relaunch_file(path, sizeof(path));
+    FILE *fp = fopen(path, "wb");
+    const bool ok = fp && fwrite(pg, 1, sizeof(pg), fp) == sizeof(pg);
+    if (fp) {
+        fclose(fp);
+    }
+    if (!ok) {
+        nc_log("xbased-native", "relaunch: can't write %s", path);
+        return false;
+    }
+    k->relaunch = true;
+    if (page) {
+        nc_mm_keep_drop(page);
+    }
+    nc_mm_keep_save(k, g_av_saved);
+    nc_kernel_request_stop(k, f, "Chihiro reboot: %s%s (routine %u%s%s)", xbe, test ? ", TEST pressed" : "",
+                           routine, *launch ? ", asked for " : "", launch);
+    return true;
+}
+
 /* HalReturnToFirmware(Routine): 2 (ReturnFirmwareQuickReboot) with a launch
  * data page is XLaunchNewImage. The core can't reboot in place (its state
  * lives for one run), so the page goes to a file and the app starts the core
@@ -1117,7 +1163,7 @@ static uint64_t HalReturnToFirmware(NcKernel *k, NcFrame *f, const uint32_t *a)
         const bool named = nc_kernel_launch_xbe(pg, xbe, sizeof(xbe));
         go = dashboard_page(pg, xbe, sizeof(xbe)) ||
              (named && strcasecmp(xbe, NC_DASHBOARD_PATH) &&
-              (!strncasecmp(xbe, "\\Device\\CdRom0", 14) || nc_io_host_file(xbe, host, sizeof(host))));
+              (nc_io_disc_relative(xbe) || nc_io_host_file(xbe, host, sizeof(host))));
     }
     if (go) {
         char path[512];
@@ -1139,6 +1185,9 @@ static uint64_t HalReturnToFirmware(NcKernel *k, NcFrame *f, const uint32_t *a)
     char launch[LAUNCH_PATH_LEN + 1] = "";
     if (page) {
         memcpy(launch, nc_vm_host(k->vm, page + LAUNCH_PATH_OFF), LAUNCH_PATH_LEN);
+    }
+    if (chihiro_reboot(k, f, a[0], page, launch)) {
+        return 0;
     }
     /* the title is done (the dashboard, a reboot): the game closes; asking
      * the dashboard for a page of its (an Xbox Live account's creation or

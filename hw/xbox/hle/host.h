@@ -105,8 +105,8 @@ uint64_t hle_host_vblank_ns(void);
  * the next one's for a flip in the last quarter of a frame. */
 uint64_t hle_host_flip_vblank_ns(void);
 /* Frame latency (pb/pbmode.c): the guest thread that pushed a finished
- * frame waits, from its next instruction, until the next flip (the guest's
- * vCPU thread, in its DMA_PUT); and a flip came (any thread). */
+ * frame waits from its next instruction. With delay_ns == 0, it waits
+ * for the next flip. Nonzero waits for the given duration. */
 void hle_host_frame_wait(void);
 void hle_host_frame_flipped(void);
 /* The least time between two flips a trap's handler does (D3D's IMMEDIATE

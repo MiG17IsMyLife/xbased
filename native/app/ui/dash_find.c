@@ -460,7 +460,7 @@ void scr_find(void)
     In in = D.in;
     if (F.editing) {
         /* the keys go to the keyboard, typed or on the screen */
-        if (D.in.text) {
+        if (D.in.text[0]) {
             type(D.in.text);
         }
         if (D.in.key == SDLK_BACKSPACE || D.in.key == SDLK_DELETE || D.in.x) {

@@ -163,8 +163,7 @@ VkImage hle_disp_image(int slot)
     return g_disp.s[slot].img;
 }
 
-/* Slot i (holding swap_id) becomes the front image; the front one before
- * and older frames not shown are let go. Under the lock. */
+/* Promote the swap and release the previous front and older pending frames. */
 static void to_front(int i, uint32_t swap_id)
 {
     for (int j = 0; j < HLE_DISP_SLOTS; j++) {

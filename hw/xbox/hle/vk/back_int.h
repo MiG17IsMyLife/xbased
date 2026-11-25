@@ -117,7 +117,7 @@ bool hle_surf_read_pending(HleVkSurf *s, uint32_t rt_id);
  * layout, blitted down to w x h (guest size) into a scratch image left in
  * TRANSFER_SRC_OPTIMAL. VK_NULL_HANDLE = the format cannot be blitted. */
 VkImage hle_surf_down(VkCommandBuffer cb, HleVkSurf *o, VkImageLayout layout,
-                      uint32_t level, uint32_t layer, uint32_t w, uint32_t h);
+                      uint32_t level, uint32_t layer, uint32_t w, uint32_t h, bool nearest);
 /* A w x h scratch image of fmt (transfer source and destination) for texels
  * on their way up; VK_NULL_HANDLE = none (the format cannot be blitted). */
 VkImage hle_surf_scratch(VkFormat fmt, uint32_t w, uint32_t h);

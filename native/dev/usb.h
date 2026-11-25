@@ -111,6 +111,10 @@ void nc_pad_rumble(unsigned player, uint16_t *left, uint16_t *right);
  * for the players in NC_PAD_MASK (or NC_PADS from player 1; default 1). */
 struct NcVm;
 void nc_dev_xbox_usb_init(struct NcVm *vm);
+void nc_dev_ohci_flush_cabinet(void);
+struct NcChihiroForce;
+/* Snapshot of the cabinet's current force; false if its motor is off. */
+bool nc_dev_ohci_cabinet_force(struct NcChihiroForce *force);
 /* The players with a controller now (bit n: player n + 1): the others'
  * controllers pulled out, theirs plugged in, as the title would see it. */
 void nc_dev_ohci_set_pads(unsigned mask);

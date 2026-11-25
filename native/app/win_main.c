@@ -34,11 +34,14 @@
 #include "native/app/ui/input_map.h"
 #include "native/app/ui/pointer.h"
 #include "native/app/ui/ui.h"
+#include "native/app/wheel_ffb.h"
 #include "hw/xbox/hle/vk/swapchain.h"
 #include "hw/xbox/hle/vk/share.h"
 #include "native/app/ui/xbox_data.h"
 #include "native/app/ui/xemu_import.h"
 #include "native/app/win_aslr.h"
+#include "native/core/chihiro_boot.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/nbd_image.h"
 #include "native/core/fold_image.h"
 #include "native/app/win_frame.h"
@@ -91,12 +94,18 @@ bool hle_pb_active(void);
 static NcCore g_core;
 
 static void pause_core(bool on);
+static void chihiro_wheel_open(void);
+static void chihiro_wheel_close(void);
+static bool chihiro_wheel_is(SDL_JoystickID id);
 static int g_disc_fd = -1;
 static SDL_AtomicInt g_core_state; /* 0 booting, 1 running, -1 failed or stopped */
 static struct ANativeWindow g_nw;
 static char g_exe_dir[MAX_PATH];
 static char g_data_dir[MAX_PATH]; /* settings, saves, states, the log (cfg_data_dir) */
 static char g_disc[1024];
+static bool g_chihiro;
+static bool g_chihiro_link_requested;
+static bool g_chihiro_test;  /* g_disc is a Chihiro game's test program */
 static char *g_args[MAX_ARGS];     /* the options: xbased.ini's, the game's, the command line's */
 static int g_nargs;
 /* The command line's own options, which a run started again gets: the
@@ -109,7 +118,8 @@ static char *g_cmdline[MAX_ARGS];
 static int g_ncmdline;
 static int g_ncfg_args;            /* how many of them xbased.ini gave */
 static ImMap g_map;     /* the controls: the game's file over xbased.ini (input_map.h) */
-static char g_key[24];  /* the game's "<TITLE ID>.<version>" */
+static char g_key[24];  /* the game's settings key */
+static char g_game_title[128];
 static uint32_t g_title_id;  /* ... its title id */
 
 /* ------------------------------------------------------------ helpers */
@@ -202,15 +212,25 @@ static bool want_fullscreen(void)
  * ones and before the command line's (which come last and win); the
  * console's language and video flags as console_cfg.c keeps them; the dashboard's
  * "uncap=1" as the flag the core takes, "fullscreen" (on unless "=0") once. */
+static void resolve_game_input(const Config *global, const Config *game)
+{
+    if (g_chihiro) {
+        im_resolve_cabinet(&g_map, global, game);
+    } else {
+        im_resolve(&g_map, global, game);
+    }
+}
+
 static void game_options(const char *disc)
 {
     XdGame g;
     xd_read_game(disc, &g);
     xd_free_game(&g);
+    g_chihiro = g.chihiro;
     char path[MAX_PATH + 64];
     snprintf(path, sizeof(path), "%sgames/%s.ini", g_data_dir, g.key);
     Config c;
-    cfg_load(&c, path);
+    cfg_load_game(&c, path, g_chihiro);
     if (cfg_shaders_migrate(&c)) {
         cfg_save(&c);
     }
@@ -239,11 +259,12 @@ static void game_options(const char *disc)
         nc_log("xbased-app", "%d options of the game's (%s)", c.n, path);
     }
     snprintf(g_key, sizeof(g_key), "%s", g.key);
+    snprintf(g_game_title, sizeof(g_game_title), "%s", g.title);
     g_title_id = g.title_id;
     Config global;
     snprintf(path, sizeof(path), "%s", cfg_global_path());
     cfg_load(&global, path);
-    im_resolve(&g_map, &global, &c);
+    resolve_game_input(&global, &c);
     /* flags written as values */
     static const char *const k_flags[] = {"uncap", "fullscreen"};
     for (int f = 0; f < 2; f++) {
@@ -369,6 +390,9 @@ static void paused_note(void)
 /* The emulation paused or let go, its time paused counted (g_paused_ms) */
 static void pause_core(bool on)
 {
+    if (on) {
+        nc_wheel_ffb_stop();
+    }
     nc_kernel_set_paused(&g_core.kernel, on);
     const uint64_t now = SDL_GetTicks();
     if (on && !g_paused_ms.on) {
@@ -383,7 +407,9 @@ static void saves_finish(void);
 
 static _Noreturn void exit_now(int code)
 {
+    chihiro_wheel_close();
     saves_finish();         /* a savestate being written: whole first */
+    nc_dev_ohci_flush_cabinet();
     paused_note();
     const bool closing = g_frame && !(code & NC_FRAME_HANDOFF_FLAG) && !g_frame_keep;
     if (closing) {
@@ -456,6 +482,7 @@ static void run_again(const char *extra, bool hold)
     nc_log("xbased-app", "running again: %s%s%s", argv[1], extra ? " " : "", extra ? extra : "");
 #endif
     pause_core(true);    /* the picture held is the last one */
+    chihiro_wheel_close();  /* give up exclusive FFB access before the next run opens the wheel */
     nc_audio_set_paused(true);
     char hold_path[MAX_PATH + 32] = "";
     if (hold) {
@@ -479,6 +506,11 @@ static void run_again(const char *extra, bool hold)
     if (g_nw.hwnd && !g_frame) {
         SetWindowPos((HWND)g_nw.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+    const bool fresh_frame = g_frame && extra && !strcmp(extra, "relaunch") && nc_chihiro_board_active();
+    if (fresh_frame) {
+        SetEnvironmentVariableA("XBASED_FRAME_HWND", NULL);
+        SetEnvironmentVariableA("XBASED_FRAME_TOKEN", NULL);
+    }
     PROCESS_INFORMATION pi;
     if (xb_spawn(exe, cmd, g_exe_dir, &pi)) {
         CloseHandle(pi.hThread);
@@ -487,6 +519,10 @@ static void run_again(const char *extra, bool hold)
         /* the dashboard waits for this process: the new one's id in the
          * exit code (bit 30 set) lets it follow the game on (dash.c) */
         exit_now(nc_frame_handoff_code(pi.dwProcessId));
+    }
+    if (fresh_frame) {
+        SetEnvironmentVariableA("XBASED_FRAME_HWND", getenv("XBASED_FRAME_HWND"));
+        SetEnvironmentVariableA("XBASED_FRAME_TOKEN", nc_frame_token());
     }
     if (g_nw.hwnd && !g_frame) {
         SetWindowPos((HWND)g_nw.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -585,6 +621,9 @@ static void pads_changed(void)
 
 static void pad_added(SDL_JoystickID id)
 {
+    if (chihiro_wheel_is(id)) {
+        return;
+    }
     for (unsigned i = 0; i < 4; i++) {
         if (g_pads[i] && SDL_GetGamepadID(g_pads[i]) == id) {
             return;
@@ -652,6 +691,9 @@ static void pad_removed(SDL_JoystickID id)
  * saw (one connected again there stayed out of the game). */
 static void pads_resync(void)
 {
+    if (g_chihiro) {
+        chihiro_wheel_open();
+    }
     for (unsigned i = 0; i < 4; i++) {
         if (g_pads[i] && !SDL_GamepadConnected(g_pads[i])) {
             SDL_CloseGamepad(g_pads[i]);
@@ -700,8 +742,216 @@ static bool pad_in_shortcut(SDL_Gamepad *pad)
     return pad_guide_held(pad);
 }
 
+/* Chihiro: a host wheel (KittenTools' WMMT3 DirectInput layout).
+ *   chihiro.wheel=NAME            joystick name to match (default "R3", then "Wheel")
+ *   chihiro.wheel.steer/gas/brake axis: X 0, Y 1, Z 2, RX 3, RY 4, RZ 5; -1 none
+ *   chihiro.wheel.<button>=N      1-based button, 0 none
+ * NC_TRACE_WHEEL logs moving axes and pressed buttons. */
+static struct {
+    SDL_Joystick *js;
+    SDL_Joystick *shifter;
+    bool tried;
+    int axes[IM_CAB_WHEEL_AXES];
+    int btn[IM_CAB_INPUTS];
+    int gear[6];
+    unsigned ffb_attempts;
+    Uint64 ffb_retry_at, shifter_retry_at;
+    int16_t rest[IM_CAB_WHEEL_MAX_AXES];
+    ImPedalDirection direction[IM_CAB_WHEEL_AXES];
+    bool trace;
+} g_wheel;
+
+static int opt_int(const char *name, int dflt)
+{
+    const char *v = opt_value(name);
+    return v ? atoi(v) : dflt;
+}
+
+static void chihiro_wheel_open(void)
+{
+    if (g_wheel.js) {
+        return;
+    }
+    const bool first = !g_wheel.tried;
+    g_wheel.tried = true;
+    g_wheel.trace = getenv("NC_TRACE_WHEEL") != NULL;
+    for (int i = 0; i < (int)SDL_arraysize(g_wheel.gear); i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "chihiro.wheel.gear%d", i + 1);
+        const int number = opt_int(key, 0);
+        g_wheel.gear[i] = number > 0 ? number - 1 : -1;
+    }
+    const char *want = opt_value("chihiro.wheel");
+    if (want && !strcmp(want, "off")) {
+        if (first) {
+            nc_log("xbased-app", "chihiro: wheel off; the controller drives");
+        }
+        return;
+    }
+    g_wheel.js = im_cabinet_open_wheel(want);
+    if (!g_wheel.js) {
+        if (first) {
+            nc_log("xbased-app", "chihiro: no wheel found%s%s; the controller drives", want ? " named " : "",
+                   want ? want : "");
+        }
+        return;
+    }
+    const int axes = SDL_GetNumJoystickAxes(g_wheel.js), buttons = SDL_GetNumJoystickButtons(g_wheel.js);
+    for (int i = 0; i < IM_CAB_WHEEL_AXES; i++) {
+        const ImCabinetAxis *axis = &im_cabinet_axes[i];
+        const int index = opt_int(axis->option, axis->default_axis);
+        g_wheel.axes[i] = index >= 0 && index < axes && index < (int)SDL_arraysize(g_wheel.rest) ? index : -1;
+        if (axis->invert_option) {
+            g_wheel.direction[i] = im_cabinet_pedal_direction(opt_value(axis->invert_option));
+        }
+    }
+    for (int i = 0; i < IM_CAB_INPUTS; i++) {
+        const ImCabinetControl *control = &im_cabinet_controls[i];
+        const int number = control->wheel_button ? opt_int(control->wheel_button, control->wheel_default) : 0;
+        g_wheel.btn[i] = number > 0 && number <= buttons ? number - 1 : -1;
+    }
+    for (int a = 0; a < axes && a < (int)SDL_arraysize(g_wheel.rest); a++) {
+        g_wheel.rest[a] = SDL_GetJoystickAxis(g_wheel.js, a);
+    }
+    nc_log("xbased-app", "chihiro: wheel \"%s\" (%d axes, %d buttons, %d hats): steering axis %d, gas %d, brake %d",
+           SDL_GetJoystickName(g_wheel.js), axes, buttons, SDL_GetNumJoystickHats(g_wheel.js),
+           g_wheel.axes[IM_CAB_WHEEL_STEER], g_wheel.axes[IM_CAB_WHEEL_ACCEL], g_wheel.axes[IM_CAB_WHEEL_BRAKE]);
+}
+
+static bool chihiro_wheel_is(SDL_JoystickID id)
+{
+    return g_wheel.js && SDL_GetJoystickID(g_wheel.js) == id;
+}
+
+static void chihiro_wheel_close(void)
+{
+    nc_wheel_ffb_close();
+    if (g_wheel.shifter) {
+        SDL_CloseJoystick(g_wheel.shifter);
+    }
+    if (g_wheel.js) {
+        SDL_CloseJoystick(g_wheel.js);
+    }
+    memset(&g_wheel, 0, sizeof(g_wheel));
+    nc_chihiro_board_wheel(false, &(NcChihiroInput){0});
+}
+
+static uint16_t wheel_pedal(int pedal)
+{
+    const int axis = g_wheel.axes[pedal];
+    if (axis < 0) {
+        return 0;
+    }
+    return im_cabinet_pedal_value(SDL_GetJoystickAxis(g_wheel.js, axis), g_wheel.rest[axis], g_wheel.direction[pedal]);
+}
+
+static void chihiro_shifter_poll(NcChihiroInput *in)
+{
+    const char *name = opt_value("chihiro.shifter");
+    SDL_Joystick *device = g_wheel.js;
+    if (name && *name) {
+        if (g_wheel.shifter && !SDL_JoystickConnected(g_wheel.shifter)) {
+            SDL_CloseJoystick(g_wheel.shifter);
+            g_wheel.shifter = NULL;
+        }
+        const Uint64 now = SDL_GetTicks();
+        if (!g_wheel.shifter && now >= g_wheel.shifter_retry_at) {
+            g_wheel.shifter = im_cabinet_open_wheel(name);
+            g_wheel.shifter_retry_at = now + 1000;
+        }
+        device = g_wheel.shifter;
+    }
+    if (!device) {
+        return;
+    }
+    const int buttons = SDL_GetNumJoystickButtons(device);
+    for (int i = 0; i < (int)SDL_arraysize(g_wheel.gear); i++) {
+        const int button = g_wheel.gear[i];
+        if (button >= 0 && button < buttons) {
+            in->h_shifter = true;
+            if (!in->gear && SDL_GetJoystickButton(device, button)) {
+                in->gear = i + 1;
+            }
+        }
+    }
+}
+
+static void chihiro_wheel_poll(bool focused)
+{
+    if (!nc_chihiro_board_active()) {
+        return;
+    }
+    if (!g_wheel.tried) {
+        chihiro_wheel_open();
+    }
+    if (g_wheel.js && !SDL_JoystickConnected(g_wheel.js)) {
+        chihiro_wheel_close();
+        return;
+    }
+    NcChihiroInput in = {0};
+    chihiro_shifter_poll(&in);
+    if (!g_wheel.js) {
+        nc_chihiro_board_wheel(false, &in);
+        return;
+    }
+#ifdef _WIN32
+    if (g_frame) {
+        /* The session frame can lose activation without a child focus event. */
+        HWND foreground = GetForegroundWindow();
+        focused = foreground == (HWND)g_frame || IsChild((HWND)g_frame, foreground);
+    }
+#endif
+    const bool running = focused && !g_paused_ms.on && SDL_GetAtomicInt(&g_core_state) == 1;
+    const Uint64 now = SDL_GetTicks();
+    if (running && g_wheel.ffb_attempts < 4 && now >= g_wheel.ffb_retry_at &&
+        g_wheel.axes[IM_CAB_WHEEL_STEER] >= 0 && opt_int("chihiro.ffb", 0)) {
+        const bool opened = nc_wheel_ffb_open(g_wheel.js,
+            opt_int("chihiro.ffb.strength", NC_WHEEL_FFB_STRENGTH_DEFAULT),
+            opt_int("chihiro.ffb.deadband", NC_WHEEL_FFB_DEADBAND_DEFAULT), opt_int("chihiro.ffb.invert", 0) != 0);
+        g_wheel.ffb_attempts = opened ? 4 : g_wheel.ffb_attempts + 1;
+        g_wheel.ffb_retry_at = now + 1000;
+    }
+    nc_wheel_ffb_poll(running);
+    if (g_wheel.trace) {
+        static int16_t last[SDL_arraysize(g_wheel.rest)];
+        static bool down[IM_CAB_WHEEL_MAX_BUTTONS];
+        const int axes = SDL_GetNumJoystickAxes(g_wheel.js);
+        for (int a = 0; a < axes && a < (int)SDL_arraysize(last); a++) {
+            const int16_t v = SDL_GetJoystickAxis(g_wheel.js, a);
+            if (abs(v - last[a]) > 6000) {
+                nc_log("xbased-app", "chihiro wheel: axis %d = %d (rest %d)", a, v, g_wheel.rest[a]);
+                last[a] = v;
+            }
+        }
+        const int buttons = SDL_GetNumJoystickButtons(g_wheel.js);
+        for (int b = 0; b < buttons && b < (int)SDL_arraysize(down); b++) {
+            const bool d = SDL_GetJoystickButton(g_wheel.js, b);
+            if (d && !down[b]) {
+                nc_log("xbased-app", "chihiro wheel: button %d", b);
+            }
+            down[b] = d;
+        }
+    }
+    const int steer = g_wheel.axes[IM_CAB_WHEEL_STEER];
+    in.steering = steer >= 0 ? (uint16_t)(SDL_GetJoystickAxis(g_wheel.js, steer) + 0x8000) : 0x8000;
+    in.gas = wheel_pedal(IM_CAB_WHEEL_ACCEL);
+    in.brake = wheel_pedal(IM_CAB_WHEEL_BRAKE);
+    bool *const outs[IM_CAB_INPUTS] = {
+        [IM_CAB_START] = &in.start, [IM_CAB_COIN] = &in.coin, [IM_CAB_TEST] = &in.test, [IM_CAB_SERVICE] = &in.service,
+        [IM_CAB_VIEW] = &in.view, [IM_CAB_INTRUDE] = &in.perspective, [IM_CAB_SHIFT_UP] = &in.shift_up,
+        [IM_CAB_SHIFT_DOWN] = &in.shift_down, [IM_CAB_CARD] = &in.card,
+    };
+    for (int i = 0; i < IM_CAB_INPUTS; i++) {
+        if (outs[i] && g_wheel.btn[i] >= 0) {
+            *outs[i] = SDL_GetJoystickButton(g_wheel.js, g_wheel.btn[i]);
+        }
+    }
+    nc_chihiro_board_wheel(true, &in);
+}
+
 static void update_pads(bool focused)
 {
+    chihiro_wheel_poll(focused);
     const bool *keys = SDL_GetKeyboardState(NULL);
     static bool kept[SDL_SCANCODE_COUNT];
     if (g_hk_any_eaten) {
@@ -724,7 +974,7 @@ static void update_pads(bool focused)
         memset(&s, 0, sizeof(s));
         SDL_Gamepad *pad = player_pad((int)i);
         /* the keyboard: player 1 on auto, any player set to it */
-        const bool kb = focused && (g_map.device[i] == -1 || (i == 0 && g_map.device[i] == 0));
+        const bool kb = focused && (g_map.device[i] == -1 || (i == 0 && (g_chihiro || g_map.device[i] == 0)));
         ImPad m;
         im_mouse_buttons(g_mbuttons, g_mgrab);
         im_read_mouse(&g_map, (int)i, kb ? keys : NULL, pad_in_shortcut(pad) ? NULL : pad, kb && i == 0 && g_mgrab,
@@ -804,8 +1054,17 @@ static void *save_thread(void *arg)
     return NULL;
 }
 
+static bool chihiro_link_active(void)
+{
+    return SDL_GetAtomicInt(&g_core_state) == 1 ? nc_chihiro_lpc_link_active() : g_chihiro_link_requested;
+}
+
 static void save_state(int slot)
 {
+    if (chihiro_link_active()) {
+        nc_log("xbased-app", "savestate: unavailable in Chihiro link mode");
+        return;
+    }
     if (SDL_GetAtomicInt(&g_core_state) != 1 || !hle_pb_active()) {
         nc_log("xbased-app", "savestate: not available now");
         SDL_SetAtomicInt(&g_saved_slot, -1);
@@ -833,6 +1092,10 @@ static void saves_finish(void)
 
 static void load_state(int slot)
 {
+    if (chihiro_link_active()) {
+        nc_log("xbased-app", "savestate: unavailable in Chihiro link mode");
+        return;
+    }
     saves_finish();
     char path[MAX_PATH * 2], opt[MAX_PATH * 2 + 16];
     state_path(slot, path, sizeof(path));
@@ -1402,86 +1665,78 @@ static void quit_to_dash(SDL_Window *win)
     exit_now(0);
 }
 
-/* The in-game menu: the emulation paused, the menu drawn by the game's own
- * presenter over its picture, blurred (the overlay). Without the overlay:
- * the presenter off the window (its Vulkan surface dropped) while the
- * dashboard's renderer draws the menu over the last frame; then the
- * presenter takes the window back. */
-static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
+/* Link play needs the live overlay so the presenter can keep running. */
+static void ingame_menu(SDL_Window *win, bool paused, bool minimized)
 {
     if (SDL_GetAtomicInt(&g_core_state) != 1) {
         return;
     }
-    pause_core(true);
-    nc_audio_set_paused(true);
+    const bool overlay = ov_ok();
+    if (chihiro_link_active() && !overlay) {
+        return;
+    }
+    if (chihiro_link_active()) {
+        update_pads(false);
+    } else {
+        pause_core(true);
+        nc_audio_set_paused(true);
+    }
     mouse_hold(false);      /* the menu's pointer */
-    int slot = 0;
-    const char *title = strrchr(g_disc, '\\');
-    if (ov_ok()) {
+    char pic[MAX_PATH + 32];
+    if (overlay) {
         ui_overlay_off();
         g_ov_up = false;
         g_notice[0] = 0;
-        const int act = dash_ingame(win, g_key, title ? title + 1 : g_disc, NULL, &slot, live_cfg);
-        pads_resync();
-        play_pointer_off();
-        nc_auto_resync();
+    } else {
+        snprintf(pic, sizeof(pic), "%smenu_frame.bmp", g_data_dir);
+        remove(pic);
+        hle_present_shot(pic);
+        for (int i = 0; i < 30 && GetFileAttributesA(pic) == INVALID_FILE_ATTRIBUTES; i++) {
+            nc_present_frame(&g_nw);
+            SDL_Delay(5);
+        }
+        nc_present_frame(NULL);
+    }
+    const char *base = strrchr(g_disc, '\\');
+    const char *title = g_chihiro && g_game_title[0] ? g_game_title : base ? base + 1 : g_disc;
+    int slot = 0;
+    const int act = dash_ingame(win, g_key, title, g_chihiro, chihiro_link_active(),
+                                overlay ? NULL : pic, &slot, overlay ? live_cfg : NULL);
+    pads_resync();
+    if (!overlay) {
+        remove(pic);
+        if (act == DASH_INGAME_QUIT) {
+            quit_to_dash(win);
+        }
+    }
+    play_pointer_off();
+    nc_auto_resync();
+    if (overlay) {
         if (act == DASH_INGAME_QUIT) {
             fx_out();
             quit_to_dash(win);
         }
-        if (act == DASH_INGAME_RESTART) {
+        if (act == DASH_INGAME_RESTART && !chihiro_link_active()) {
             fx_out();
             run_again(NULL, false);
         }
         ui_overlay_off();
         g_ov_up = false;
-        pause_core(*paused || minimized);
-        nc_audio_set_paused(*paused || minimized);
-        char path[MAX_PATH + 64];
-        snprintf(path, sizeof(path), "%s", cfg_global_path());
-        Config global, game;
-        cfg_load(&global, path);
-        snprintf(path, sizeof(path), "%sgames/%s.ini", g_data_dir, g_key);
-        cfg_load(&game, path);
-        im_resolve(&g_map, &global, &game);
-        pads_changed();
-        apply_cfg(&global, &game, true);
-        if (act == DASH_INGAME_SAVE) {
-            save_state(slot);
-        } else if (act == DASH_INGAME_LOAD) {
-            load_state(slot);
-        }
-        return;
-    }
-    char pic[MAX_PATH + 32];
-    snprintf(pic, sizeof(pic), "%smenu_frame.bmp", g_data_dir);
-    remove(pic);
-    hle_present_shot(pic);
-    for (int i = 0; i < 30 && GetFileAttributesA(pic) == INVALID_FILE_ATTRIBUTES; i++) {
+    } else {
+        SDL_Delay(50);
         nc_present_frame(&g_nw);
-        SDL_Delay(5);
     }
-    nc_present_frame(NULL);     /* the surface goes */
-    const int act = dash_ingame(win, g_key, title ? title + 1 : g_disc, pic, &slot, NULL);
-    pads_resync();
-    remove(pic);
-    if (act == DASH_INGAME_QUIT) {
-        quit_to_dash(win);
+    if (!chihiro_link_active()) {
+        pause_core(paused || minimized);
+        nc_audio_set_paused(paused || minimized);
     }
-    play_pointer_off();   /* the game doesn't use the mouse; the menu may have shown it */
-    nc_auto_resync();
-    /* the presenter back on the window before anything is shown or saved */
-    SDL_Delay(50);
-    nc_present_frame(&g_nw);
-    pause_core(*paused || minimized);
-    nc_audio_set_paused(*paused || minimized);
     char path[MAX_PATH + 64];
     snprintf(path, sizeof(path), "%s", cfg_global_path());
     Config global, game;
     cfg_load(&global, path);
     snprintf(path, sizeof(path), "%sgames/%s.ini", g_data_dir, g_key);
-    cfg_load(&game, path);
-    im_resolve(&g_map, &global, &game);
+    cfg_load_game(&game, path, g_chihiro);
+    resolve_game_input(&global, &game);
     pads_changed();
     apply_cfg(&global, &game, true);
     switch (act) {
@@ -1492,7 +1747,9 @@ static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
         load_state(slot);
         break;
     case DASH_INGAME_RESTART:
-        run_again(NULL, false);
+        if (!overlay) {
+            run_again(NULL, false);
+        }
         break;
     default:
         break;
@@ -1713,6 +1970,9 @@ static void hotkey_do(SDL_Window *win, int h, bool down, int slot, bool *paused,
         SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
         break;
     case IM_HK_PAUSE:
+        if (chihiro_link_active()) {
+            break;
+        }
         *paused = !*paused;
         pause_core(*paused || minimized);
         nc_audio_set_paused(*paused || minimized);
@@ -1737,7 +1997,7 @@ static void hotkey_do(SDL_Window *win, int h, bool down, int slot, bool *paused,
         screenshot();
         break;
     case IM_HK_MENU:
-        ingame_menu(win, paused, minimized);
+        ingame_menu(win, *paused, minimized);
         break;
     default:
         break;
@@ -1755,9 +2015,10 @@ static void frame_fullscreen(void)
 static const char k_usage[] =
     "xbased " XBASED_VERSION ", an original Xbox emulator\n"
     "\n"
-    "Usage: xbased [options] [disc image]\n"
+    "Usage: xbased [options] [game path]\n"
     "\n"
     "  -i, --input FILE     the disc image to play (.iso, .xiso, .chd), or nbd://host:port/export\n"
+    "                       For Maximum Tune 1 or 2, pass the extracted folder or its boot.id.\n"
     "  -c, --config FILE    the settings file to use instead of xbased.ini\n"
     "  -h, --help           this help\n"
     "\n"
@@ -1772,6 +2033,8 @@ static const char k_usage[] =
     "  online               online mode: the console's frame rate and speed, no mods or cheats\n"
     "  lang=N               the console's language (1 English ... 9 Portuguese)\n"
     "  loadstate=FILE       start from a save state\n"
+    "  chihirotest          start the cabinet test program named in boot.id\n"
+    "  chihiro.data=DIR     the cabinet's card data directory\n"
     "  hdd=DIR              the hard disk folder\n"
     "  mod=ID, cheat=NAME   a mod or cheat of the game's on\n"
     "  net=off|nat|lan|kai  the network\n"
@@ -1974,6 +2237,9 @@ typedef struct GameWindowState {
 static void set_game_minimized(GameWindowState *state, bool minimized)
 {
     state->minimized = minimized;
+    if (chihiro_link_active()) {
+        return;
+    }
     const bool paused = state->paused || minimized;
     pause_core(paused);
     nc_audio_set_paused(paused);
@@ -2031,7 +2297,7 @@ static void gamepad_button_down(SDL_Window *win, GameWindowState *state, const S
         g_guide_alone = false;
     } else if (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) &&
                SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_START)) {
-        ingame_menu(win, &state->paused, state->minimized);
+        ingame_menu(win, state->paused, state->minimized);
     } else if (gp && b != SDL_GAMEPAD_BUTTON_BACK && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK)) {
         code = IM_HKP_BACK_WITH + b;
     }
@@ -2095,7 +2361,18 @@ static void handle_game_event(SDL_Window *win, GameWindowState *state, const SDL
         gamepad_button_up(win, state, &event->gbutton);
         break;
     case SDL_EVENT_JOYSTICK_ADDED:
-        joystick_added(event->jdevice.which);
+        if (g_chihiro) {
+            chihiro_wheel_open();
+        }
+        /* SDL treats mapped joysticks as gamepads and excludes them from haptics. */
+        if (!chihiro_wheel_is(event->jdevice.which)) {
+            joystick_added(event->jdevice.which);
+        }
+        break;
+    case SDL_EVENT_JOYSTICK_REMOVED:
+        if (chihiro_wheel_is(event->jdevice.which)) {
+            chihiro_wheel_close();
+        }
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
         pad_added(event->gdevice.which);
@@ -2118,6 +2395,7 @@ static void handle_game_event(SDL_Window *win, GameWindowState *state, const SDL
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         state->focused = false;
+        nc_wheel_ffb_stop();
         mouse_hold(false);
         mods_released();
         if (g_mute_bg) {
@@ -2158,24 +2436,27 @@ static void run_game_window(SDL_Window *win)
         while (SDL_PollEvent(&event)) {
             handle_game_event(win, &state, &event);
         }
+        if (state.quit) {
+            break;
+        }
         play_pointer_tick();
         nc_auto_tick();
 #ifdef XBASED_DEVCTL
         nc_devctl_tick(&state.paused, state.minimized);
 #endif
         if (nc_auto_take_menu()) {
-            ingame_menu(win, &state.paused, state.minimized);
+            ingame_menu(win, state.paused, state.minimized);
         }
         if (g_dc_player) {
             /* a player's controller gone: the menu, which pauses, and why */
             const int p = g_dc_player;
             g_dc_player = 0;
-            if (g_map.dc_pause && SDL_GetAtomicInt(&g_core_state) == 1) {
+            if (!chihiro_link_active() && g_map.dc_pause && SDL_GetAtomicInt(&g_core_state) == 1) {
                 char msg[256];
                 snprintf(msg, sizeof(msg), T(S_PAD_DC), p);
                 nc_log("xbased-app", "player %d's controller disconnected: the menu opens", p);
                 dash_ingame_notice(msg);
-                ingame_menu(win, &state.paused, state.minimized);
+                ingame_menu(win, state.paused, state.minimized);
             }
         }
         update_pads(state.focused);
@@ -2389,7 +2670,9 @@ int main(int argc, char *argv[])
     }
     if (!xbox_dash) {
         snprintf(g_disc, sizeof(g_disc), "%s", disc);
-        {
+        char boot_file[MAX_PATH * 2];
+        const bool chihiro_folder = nc_chihiro_boot_path(g_disc, boot_file, sizeof(boot_file), &g_chihiro_test);
+        if (!chihiro_folder) {
             /* a folder with an ISO attacher's default.xbe beside the game's
              * image, as a modded Xbox keeps them: the image (#367) */
             char img[MAX_PATH * 2];
@@ -2399,9 +2682,9 @@ int main(int argc, char *argv[])
             }
         }
         game_options(g_disc);
-        /* an extracted game: its folder (or default.xbe) read as the disc it makes */
-        char xbe[MAX_PATH * 2];
-        g_disc_fd = open(nc_fold_xbe_path(g_disc, xbe, sizeof(xbe)) ? xbe : g_disc, O_RDONLY | O_BINARY);
+        /* an extracted game: its folder read as a disc */
+        const bool folder = chihiro_folder || nc_fold_xbe_path(g_disc, boot_file, sizeof(boot_file));
+        g_disc_fd = open(folder ? boot_file : g_disc, O_RDONLY | O_BINARY);
         if (g_disc_fd < 0) {
             nc_log("xbased-app", "can't open the disc %s", g_disc);
         }
@@ -2442,6 +2725,53 @@ int main(int argc, char *argv[])
         }
     }
     nc_io_set_hdd_root(hdd);
+    {
+        /* the Chihiro cabinet's card files (chihiro.bios: the old name) */
+        const char *cb = opt_value("chihiro.data");
+        cb = cb ? cb : opt_value("chihiro.bios");
+        char dir[1100];
+        if (cb) {
+            snprintf(dir, sizeof(dir), "%s", cb);
+        } else {
+            snprintf(dir, sizeof(dir), "%schihiro", g_data_dir);
+        }
+        setenv("NC_CHIHIRO_DIR", dir, 0);
+        const char *card = opt_value("chihiro.card");
+        nc_chihiro_card_select(card ? atoi(card) : 0);
+        const char *region = opt_value("chihiro.region");
+        if (region) {
+            setenv("NC_CHIHIRO_REGION", region, 1);
+        }
+        /* link play: the network board on xbased's LAN network, the other
+         * cabinets reached by broadcast and at the addresses named (a VPN's) */
+        const char *link = opt_value("chihiro.link");
+        if (link) {
+            setenv("NC_CHIHIRO_LINK", link, 1);
+        }
+        char firmware[1200];
+        g_chihiro_link_requested = g_chihiro && nc_chihiro_link_cabinet() != 0 &&
+            nc_chihiro_link_firmware(getenv("NC_CHIHIRO_DIR"), firmware, sizeof(firmware));
+        if (g_chihiro_link_requested) {
+            add_arg("net=lan");
+            const char *subnet = opt_value("chihiro.link_subnet");
+            const char *ip = opt_value("chihiro.link_ip");
+            char adapter[64];
+            if (subnet && *subnet) {
+                snprintf(adapter, sizeof(adapter), "lansubnet=%s", subnet);
+                add_arg(adapter);
+            }
+            if (ip && *ip) {
+                snprintf(adapter, sizeof(adapter), "lanip=%s", ip);
+                add_arg(adapter);
+            }
+            const char *peers = opt_value("chihiro.peers");
+            if (peers && *peers) {
+                char a[600];
+                snprintf(a, sizeof(a), "lanpeers=%s", peers);
+                add_arg(a);
+            }
+        }
+    }
     setenv("XBASED_HLE_MODE", "replace", 0);
     {
         char base[1100];
@@ -2455,6 +2785,7 @@ int main(int argc, char *argv[])
     nc_options_init(&opt);
     apply_online_mode();
     parse_game_options(&opt);
+    opt.boot.chihiro_test |= g_chihiro_test;
     if (g_online) {
         nc_win_mods_cleanup(g_exe_dir);     /* none of the mods, the widescreen database's included */
     } else {
@@ -2583,7 +2914,9 @@ int main(int argc, char *argv[])
     nc_vsync_start();
     nc_auto_init(g_data_dir, save_state, load_state);
 #ifdef XBASED_DEVCTL
-    nc_devctl_init(g_data_dir, &g_core);   /* (dev builds: win_devctl.h) */
+    if (!g_chihiro_link_requested) {
+        nc_devctl_init(g_data_dir, &g_core);
+    }
 #endif
     nc_core_fault_install(&g_core);
     pads_changed();

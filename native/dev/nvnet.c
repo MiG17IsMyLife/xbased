@@ -14,6 +14,7 @@
  *   Copyright (c) 2015-2025 Matt Borgerson
  * its definitions after forcedeth.c (cromwell, GPL-2+).
  */
+#include "native/dev/chihiro_board.h"
 #include "native/dev/dev.h"
 #include "native/core/irq.h"
 #include "native/core/mmio.h"
@@ -436,6 +437,9 @@ static bool accept(const Nvnet *s, const uint8_t *f, size_t len)
 /* The backend learns the station address the guest set (lan: its hellos). */
 static void station_address(Nvnet *s)
 {
+    if (nc_chihiro_board_active()) {
+        return;                 /* a Chihiro's network is its network board's */
+    }
     uint8_t a[8];
     nc_wr32(a, reg(s, MAC_ADDR_A));
     nc_wr32(a + 4, reg(s, MAC_ADDR_B));
@@ -449,7 +453,7 @@ static void station_address(Nvnet *s)
 static bool receive_one(Nvnet *s)
 {
     static uint8_t buf[NC_NET_FRAME_MAX];
-    if (!nc_net_peek()) {
+    if (nc_chihiro_board_active() || !nc_net_peek()) {
         return false;
     }
     if (!rx_on(s)) {

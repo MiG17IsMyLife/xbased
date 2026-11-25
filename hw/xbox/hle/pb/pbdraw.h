@@ -99,7 +99,8 @@ void hle_pbd_copy_done(uint32_t dlo, uint32_t dp, uint32_t row, uint32_t rows, u
 void hle_pbd_coh_counts(uint64_t *lands, uint64_t *copies, uint64_t *waits);
 /* After a blit's copy in memory (dep: queued, hle_pbd_copy_begin): the
  * linear render target at dbase takes the rows into its image. */
-void hle_pbd_blit(uint32_t dbase, uint32_t dp, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint64_t dep);
+void hle_pbd_blit(uint32_t dbase, uint32_t dp, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint32_t row,
+                  uint64_t dep);
 /* Decode thread: a fence (a semaphore release, a report, the push buffer
  * consumed): the images of targets the guest reads (learned) landed for it. */
 void hle_pbd_fence(void);

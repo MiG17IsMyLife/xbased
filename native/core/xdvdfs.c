@@ -93,7 +93,7 @@ bool nc_disc_open(NcDisc *d, int fd)
 {
     memset(d, 0, sizeof(*d));
     d->fd = fd;
-    /* a CHD image, or a game folder's default.xbe: read through it from here on */
+    /* A CHD, a network image or a game folder's boot file. */
     if (!nc_chd_attach(fd) && !nc_nbd_attach(fd)) {
         nc_fold_attach(fd);
     }

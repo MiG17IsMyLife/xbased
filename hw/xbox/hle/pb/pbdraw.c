@@ -153,6 +153,7 @@ typedef struct PbObj {
     uint32_t armed_drops;               /* hle_barrier_guard_drops() when guarded (0: not) */
     uint32_t mn_epoch;                  /* coh_mem_newer's answer (mn) as of this write epoch */
     bool mn;
+    bool depth_readable;                /* linear D24S8 with stencil writes */
     bool learned;                       /* the guest reads it: landed at fences (coh_fence) */
     bool want;                          /* ... drawn into since its last landing */
     uint8_t unread;                     /* its landings in a row the guest didn't take */
@@ -200,7 +201,7 @@ static struct {
      * from the depth image (HLE_OP_ZREAD) at each use, or the CPU's bytes
      * when it wrote the memory since (zread) */
     struct {
-        uint32_t id, src, pa, w, h, xfmt;
+        uint32_t id, src, pa, w, h, pitch, xfmt;
         uint64_t edge_hash[2];          /* the memory's bytes on its first and last page */
     } zr[MAX_ZREADS];
     uint64_t zr_uploads;                /* CPU-written zread memory uploaded (debug) */
@@ -310,6 +311,10 @@ static void coh_serve(void);
 static void coh_shown(PbObj *o);
 static bool coh_display_over(uint32_t pa, uint32_t len);
 static bool coh_len(const PbObj *o, uint32_t *len);
+static bool coh_span(const PbObj *o, uint32_t *len);
+static void obj_owns(PbObj *o);
+static void coh_snap_take(uint32_t pa, uint32_t len, CohSnap *s);
+static void coh_drawn(PbObj *o);
 /* Presents (coh_shown: a swap, a display start), and how many ago a frame
  * buffer still counts as one (a flip chain's take turns) */
 static uint64_t g_coh_shows;
@@ -819,7 +824,7 @@ static uint64_t span_hash(uint32_t pa, uint32_t len);
 
 /* The bound depth target was (or may have been) written: its written, as a
  * colour target's at its draws (zread: the memory's last writer). */
-static void ds_written(void)
+static void ds_written(bool stencil, bool clear_stencil)
 {
     if (!g_pd.ds) {
         return;
@@ -828,7 +833,18 @@ static void ds_written(void)
         g_pd.ds_obj = obj_of(g_pd.ds);  /* its slot was reused */
     }
     if (g_pd.ds_obj) {
-        g_pd.ds_obj->written = ++g_pd.wseq;
+        PbObj *o = g_pd.ds_obj;
+        o->written = ++g_pd.wseq;
+        if (o->d.xfmt == HLE_XFMT_LIN_D24S8 && o->d.pitch && (stencil || o->depth_readable)) {
+            o->depth_readable = true;
+            if (clear_stencil) {
+                /* The clear supersedes older CPU writes to the stencil. */
+                obj_owns(o);
+                coh_snap_take(o->d.pa, o->d.pitch * o->d.h, &o->snap);
+                o->mn_epoch = 0;
+            }
+            coh_drawn(o);
+        }
     }
 }
 static bool edge_dirty(uint32_t page);
@@ -1267,7 +1283,6 @@ static void mode_sync(void)
     g_pd.disp_h = h;
 }
 
-static void coh_drawn(PbObj *o);
 static void coh_first_write(PbObj *o, bool full);
 static bool coh_managed(const PbObj *o, uint32_t *len);
 static void coh_land_over(const PbObj *o, uint32_t len);
@@ -1507,6 +1522,13 @@ static void clear(uint32_t flags)
     if (!g_pd.rt && !g_pd.ds) {
         return;
     }
+    if (hle_pb_real_hw_speed()) {
+        const uint64_t width = MAX(0, MIN(r.x2, (int32_t)g_pd.rt_w) - r.x1);
+        const uint64_t height = MAX(0, MIN(r.y2, (int32_t)g_pd.rt_h) - r.y1);
+        const unsigned bytes = (g_pd.rt && (flags & 0xF0) ? 4 : 0) +
+                               (g_pd.ds && (flags & 0x03) ? 4 : 0);
+        hle_pb_account_gpu_work(0, 0, width * height * bytes);
+    }
     uint32_t zs = R(NV097_SET_ZSTENCIL_CLEAR_VALUE), zf = (R(NV097_SET_SURFACE_FORMAT) >> 4) & 0xF;
     bool zfloat = R(NV097_SET_CONTROL0) & 0x1000u;
     HleCmdClear *c = begin(HLE_OP_CLEAR, sizeof(*c));
@@ -1535,7 +1557,8 @@ static void clear(uint32_t flags)
         coh_drawn(g_pd.rt_obj);
     }
     if (c->flags & (HLE_CLEAR_ZBUFFER | HLE_CLEAR_STENCIL)) {
-        ds_written();
+        const bool stencil = (c->flags & HLE_CLEAR_STENCIL) != 0;
+        ds_written(stencil, stencil && !c->nrects);
     }
     g_pd.clears++;
 }
@@ -2699,7 +2722,8 @@ bool hle_pbd_blit_images(uint32_t sbase, uint32_t sp, uint32_t dbase, uint32_t d
  * image still the newer elsewhere if it was, and guarded again); else its
  * memory is the newer, uploaded at its next draw. One the old paths keep
  * waits for a queued copy first. */
-void hle_pbd_blit(uint32_t dbase, uint32_t dp, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint64_t dep)
+void hle_pbd_blit(uint32_t dbase, uint32_t dp, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint32_t row,
+                  uint64_t dep)
 {
     const uint32_t rows_id = g_coh_rows.id;
     g_coh_rows.id = 0;
@@ -2718,6 +2742,25 @@ void hle_pbd_blit(uint32_t dbase, uint32_t dp, uint32_t ox, uint32_t oy, uint32_
     }
     if (!kept && dep) {
         coh_wait(dep);
+    }
+    /* CopyRects writes the movie's rows into RAM and queues the same rows
+     * into the image. If those pages stay dirty, the swap uploads the movie
+     * again over the sprites drawn after the copy. Clear only pages covered
+     * by this upload so unrelated CPU writes on a shared page stay visible. */
+    const HleFmtInfo *fi = hle_fmt_info(dd->d.xfmt);
+    if (!kept && !ox && row == dp && dp == dd->d.pitch && fi && w * (fi->bpp / 8) == row &&
+        w <= dd->d.w && oy + h <= dd->d.h) {
+        const uint32_t first = dbase + oy * dp;
+        const uint32_t size = h * dp;
+        if (!(first & 4095u) && !(size & 4095u)) {
+            hle_mem_written(first, size);
+            if (!oy) {
+                dd->edge_hash[0] = span_hash(dbase, 4096);
+            }
+            if (oy + h == dd->d.h && dd->d.h * dp > 4096) {
+                dd->edge_hash[1] = span_hash(first + size - 4096, 4096);
+            }
+        }
     }
     const HleRect r = { (int32_t)ox, (int32_t)oy, (int32_t)(ox + w), (int32_t)(oy + h) };
     const int32_t pt[1][2] = { { (int32_t)ox, (int32_t)oy } };
@@ -2862,6 +2905,41 @@ static void tex_evict(void)
             "of them last used %llu frames ago)", n - nkeep, nkeep, (unsigned long long)(g_pd.epoch - cut));
 }
 
+static unsigned zread_view(uint32_t pa, uint32_t w, uint32_t h, uint32_t pitch,
+                           uint32_t xfmt, bool halves, uint32_t src_id, bool *fresh)
+{
+    unsigned i = 0;
+    while (i < g_pd.nzr && !(g_pd.zr[i].pa == pa && g_pd.zr[i].w == w && g_pd.zr[i].h == h &&
+                             g_pd.zr[i].pitch == pitch && g_pd.zr[i].xfmt == xfmt)) {
+        i++;
+    }
+    *fresh = i == g_pd.nzr;
+    if (*fresh) {
+        if (g_pd.nzr == MAX_ZREADS) {
+            i = (unsigned)(g_pd.binds % MAX_ZREADS);  /* one replaced */
+            HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+            x->after = 0;
+            x->id = g_pd.zr[i].id;
+            hle_fe_commit();
+        } else {
+            g_pd.nzr++;
+        }
+        g_pd.zr[i].id = g_pd.next_id++;
+        g_pd.zr[i].pa = pa;
+        g_pd.zr[i].w = w;
+        g_pd.zr[i].h = h;
+        g_pd.zr[i].pitch = pitch;
+        g_pd.zr[i].xfmt = xfmt;
+        HleCmdObj *c = begin(HLE_OP_OBJ_CREATE, sizeof(*c));
+        memset(c, 0, sizeof(*c));
+        c->s = (HleSurfDesc){ .id = g_pd.zr[i].id, .xfmt = halves ? xfmt : HLE_XFMT_LIN_A8R8G8B8,
+                              .w = w, .h = h, .pa = pa, .pitch = pitch, .levels = 1, .faces = 1 };
+        hle_fe_commit();
+        hle_log("xbased-hle-pb", "texture %08x (%ux%u) reads depth target %u", pa, w, h, src_id);
+    }
+    return i;
+}
+
 /* A 32-bit linear colour texture (w x h at pa, channels from the depth
  * word's bytes as map says) over a D24S8 target's memory reads the target's
  * depth words, as the NV2A's memory holds them (Conker's glow mask: its
@@ -2912,34 +2990,8 @@ static uint32_t zread(uint32_t pa, uint32_t w, uint32_t h, const uint8_t map[4],
             return 0;
         }
     }
-    unsigned i = 0;
-    while (i < g_pd.nzr && !(g_pd.zr[i].pa == pa && g_pd.zr[i].w == w && g_pd.zr[i].h == h &&
-                             g_pd.zr[i].xfmt == xfmt)) {
-        i++;
-    }
-    const bool fresh = i == g_pd.nzr;
-    if (fresh) {
-        if (g_pd.nzr == MAX_ZREADS) {
-            i = (unsigned)(g_pd.binds % MAX_ZREADS);  /* one replaced */
-            HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
-            x->after = 0;
-            x->id = g_pd.zr[i].id;
-            hle_fe_commit();
-        } else {
-            g_pd.nzr++;
-        }
-        g_pd.zr[i].id = g_pd.next_id++;
-        g_pd.zr[i].pa = pa;
-        g_pd.zr[i].w = w;
-        g_pd.zr[i].h = h;
-        g_pd.zr[i].xfmt = xfmt;
-        HleCmdObj *c = begin(HLE_OP_OBJ_CREATE, sizeof(*c));
-        memset(c, 0, sizeof(*c));
-        c->s = (HleSurfDesc){ .id = g_pd.zr[i].id, .xfmt = halves ? xfmt : HLE_XFMT_LIN_A8R8G8B8,
-                              .w = w, .h = h, .pa = pa, .pitch = w * bpp, .levels = 1, .faces = 1 };
-        hle_fe_commit();
-        hle_log("xbased-hle-pb", "texture %08x (%ux%u) reads depth target %u", pa, w, h, src->id);
-    }
+    bool fresh;
+    const unsigned i = zread_view(pa, w, h, w * bpp, xfmt, halves, src->id, &fresh);
     /* What the CPU wrote into the memory since is the memory's now: its rows
      * go into the texture's image, and the back end converts the depth image
      * again only once the depth buffer is written after them (cmd_zread).
@@ -3843,6 +3895,28 @@ static void resolve_draw_textures(HleCmdDraw *d)
  * textures, the constants (a program's, or the fixed-function stage's from
  * its methods) and the attributes' current values after them, the state
  * and the vertex shader; emitted. */
+static void account_draw(const HleCmdDraw *d, bool fixed_function)
+{
+    const uint64_t vertices = d->count;
+    const uint64_t area = (uint64_t)g_pd.rt_w * g_pd.rt_h;
+    const unsigned vertex_ops = fixed_function ? 12 : MAX(1u, g_vh_prog.n);
+    unsigned textures = 0;
+    for (unsigned i = 0; i < HLE_TSS_STAGES; i++) {
+        textures += d->tex[i] != 0;
+    }
+    // Approximate raster coverage in guest pixels, independent of Vulkan scale.
+    const uint64_t fragments = MIN(vertices * 32, area * 2);
+    const unsigned taps = textures * 2;
+    const unsigned color_bytes = g_pd.rt && R(0x0358) ? (R(0x0304) ? 8 : 4) : 0;
+    const unsigned depth_bytes = g_pd.ds && R(0x030C) ? (R(0x035C) ? 8 : 4) : 0;
+    uint64_t vertex_bytes = d->nbind ? 0 : d->stride;
+    for (unsigned i = 0; i < d->nbind; i++) {
+        vertex_bytes += d->bind_stride[i];
+    }
+    hle_pb_account_gpu_work(vertices * vertex_ops, fragments * MAX(1u, (taps + 1) / 2),
+                            vertices * vertex_bytes + fragments * (color_bytes + depth_bytes + taps * 2));
+}
+
 static void emit_draw(HleCmdDraw *d)
 {
     const bool ff = (R(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3) != 2;
@@ -3867,12 +3941,15 @@ static void emit_draw(HleCmdDraw *d)
         coh_drawn(g_pd.rt_obj);
     }
     if (g_pd.ds && ((R(0x030C) && R(0x035C)) || (R(0x032C) && (R(0x0360) & 0xFF)))) {
-        ds_written();                   /* depth test and writes, or stencil writes */
+        ds_written(R(0x032C) && (R(0x0360) & 0xFF), false);
     }
     resolve_draw_textures(d);
     state();
     uint32_t zf = (R(NV097_SET_SURFACE_FORMAT) >> 4) & 0xF;
     d->vsh = ff ? ff_program() : program();
+    if (hle_pb_real_hw_speed()) {
+        account_draw(d, ff);
+    }
     d->consts_off = c_off;
     /* the integer formats' 2^-n, the shaders adding the rest (HLE_ZNORM_GLSL);
      * a float format's own (zfloat_scale) */
@@ -4778,8 +4855,20 @@ static bool coh_display(const PbObj *o)
     return o->display && g_coh_shows - o->shown_seq <= COH_SHOWN_RECENT;
 }
 
+static bool coh_span(const PbObj *o, uint32_t *len)
+{
+    if (o->depth_readable && !o->owner && !o->d.parent) {
+        *len = o->d.pitch * o->d.h;
+        return *len != 0;
+    }
+    return coh_len(o, len);
+}
+
 static bool coh_managed(const PbObj *o, uint32_t *len)
 {
+    if (o->depth_readable) {
+        return coh_span(o, len);
+    }
     return coh_len(o, len) && !coh_display(o) && (!o->d.pitch || (*len > WRITEBACK_MAX && !o->cpu_used));
 }
 
@@ -4986,8 +5075,18 @@ static uint64_t coh_land(PbObj *o)
     if (coh_mem_newer(o)) {
         return 0;                           /* its memory is the newer */
     }
-    if (obj_freed(o)) {
-        return 0;                           /* its memory is the title's no longer */
+    if (obj_freed(o) || (o->depth_readable && obj_superseded(o))) {
+        return 0;
+    }
+    if (o->depth_readable) {
+        for (unsigned i = 0; i < g_pd.nobjs; i++) {
+            const PbObj *other = &g_pd.objs[i];
+            uint32_t span;
+            if (other->written > o->written && coh_span(other, &span) &&
+                other->d.pa < o->d.pa + len && o->d.pa < other->d.pa + span) {
+                return 0;
+            }
+        }
     }
     for (int tries = 0; !hle_tl_land_room(2) && tries < 4; tries++) {
         const uint64_t ov = tries < 3 ? hle_tl_land_oldest() : 0;
@@ -5023,11 +5122,23 @@ static uint64_t coh_land(PbObj *o)
     l->linear = o->d.pitch != 0;
     l->landed = false;
     __atomic_store_n(&l->state, 1, __ATOMIC_RELEASE);
+    uint32_t copy_id = o->id;
+    if (o->depth_readable) {
+        /* Pack the depth and stencil aspects into the NV2A's 32-bit words. */
+        bool fresh;
+        const unsigned i = zread_view(o->d.pa, o->d.w, o->d.h, o->d.pitch,
+                                      HLE_XFMT_LIN_D24S8, false, o->id, &fresh);
+        copy_id = g_pd.zr[i].id;
+        HleCmdZRead *z = begin(HLE_OP_ZREAD, sizeof(*z));
+        *z = (HleCmdZRead){ .src = o->id, .dst = copy_id, .map = {2, 1, 0, 3} };
+        hle_fe_commit();
+    }
     HleCmdReadback *rb = begin(HLE_OP_READBACK, sizeof(*rb));
     memset(rb, 0, sizeof(*rb));
     const uint64_t v = rb->value = hle_fe_next_value();     /* a submission of its own */
     l->v = v;
-    rb->surf = o->id;
+    rb->surf = copy_id;
+    rb->nearest = o->depth_readable;
     bool queued;
     if (!o->d.pitch) {
         rb->arena_off = HLE_RB_PACKED;
@@ -5174,7 +5285,7 @@ uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp
     uint64_t v = MAX(coh_pend_any(s0, s1, false), coh_pend_any(d0, d1, true));
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         const PbObj *o = &g_pd.objs[i];
-        if (o->land_last > done && coh_len(o, &len) &&
+        if (o->land_last > done && coh_span(o, &len) &&
             ((o->d.pa < s1 && o->d.pa + len > s0) || (o->d.pa < d1 && o->d.pa + len > d0))) {
             v = MAX(v, o->land_last);
         }
@@ -5329,7 +5440,7 @@ static void coh_serve(void)
     uint64_t v = 0;
     if (best) {
         uint32_t len;
-        if (coh_len(best, &len) && best->d.pa == pa && len == g_fill.len) {
+        if (coh_span(best, &len) && best->d.pa == pa && len == g_fill.len) {
             /* the guest uses it (reads it, or writes it, which needs the
              * rest of it there): landed at fences from now on */
             best->learned = true;
@@ -5622,12 +5733,12 @@ static bool coh_display_over(uint32_t pa, uint32_t len)
 static void coh_forget(const PbObj *o)
 {
     uint32_t len, xl;
-    if (!coh_len(o, &len)) {
+    if (!coh_span(o, &len)) {
         return;
     }
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         const PbObj *x = &g_pd.objs[i];
-        if (x != o && x->d.pa == o->d.pa && coh_len(x, &xl) && xl == len) {
+        if (x != o && x->d.pa == o->d.pa && coh_span(x, &xl) && xl == len) {
             return;
         }
     }

@@ -21,6 +21,9 @@ void hle_pb_stop(void);
 bool hle_pb_active(void);
 /* The host: the guest wrote channel 0's DMA_PUT (any thread). */
 void hle_pb_kick(void);
+void hle_pb_set_real_hw_speed(bool enabled);
+bool hle_pb_real_hw_speed(void);
+void hle_pb_account_gpu_work(uint64_t vertex_ops, uint64_t pixel_cycles, uint64_t bytes);
 /* Any thread: the decoder stops at its next method (pbdraw.c
  * hle_pbd_boundary: what was recorded up to value submitted, a guest
  * thread's landing request served), or at its next pass. */

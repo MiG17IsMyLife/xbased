@@ -135,7 +135,9 @@ static void act(const char *a, const char *label)
     }
     if (!_stricmp(a, "quit")) {
         nc_log("xbased-auto", "%.1f s: quit", now_s() - g_auto.t0);
-        _exit(0);
+        SDL_Event quit = {.type = SDL_EVENT_QUIT};
+        SDL_PushEvent(&quit);
+        return;
     }
     char name[48];
     snprintf(name, sizeof(name), "%s", a);

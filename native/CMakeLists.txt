@@ -84,6 +84,24 @@ if(NC_LINUX_X64)
   target_compile_options(nc_slirp PRIVATE "SHELL:-include signal.h")   # misc.c's (Android's headers bring it)
 endif()
 
+# Chihiro USB, DIMM and cabinet peripherals.
+add_library(nc_chihiro STATIC
+  dev/chihiro/chihiro_board.c
+  dev/chihiro/chihiro_usb.c
+  dev/chihiro/chihiro_media.c
+  dev/chihiro/asic/chihiro-asic.c
+  dev/chihiro/asic/chihiro-v850.c
+  dev/chihiro/asic/chihiro-spd.c
+  dev/chihiro/asic/chihiro-pic.c
+  dev/chihiro/asic/chihiro-des.c
+  dev/chihiro/jvs.c
+  dev/chihiro/v257.c
+  dev/chihiro/crp1231.c
+  dev/chihiro/net/chihiro-mips.c
+  dev/chihiro/net/chihiro-netboard.c)
+target_include_directories(nc_chihiro PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/dev/chihiro" "${NC_REPO}")
+target_compile_options(nc_chihiro PRIVATE -Wall -Wno-unused-parameter)
+
 if(NC_LINUX_X64)
   set(NC_PLATFORM_SOURCES core/vm.c core/fault_win.c core/jmp_x64.c cpu/cpu_x86.cpp cpu/x64emu.cpp
       compat/linux/seh.c compat/linux/linux.c)
@@ -110,11 +128,13 @@ add_library(xbased_native STATIC
   core/xcheat.c
   core/memscan.c
   core/core.c
+  core/chihiro_boot.c
   core/xbox_boot.c
   core/mmio.c
   core/irq.c
   dev/nv2a.c
   dev/ports.c
+  dev/chihiro_lpc.c
   dev/usb.c
   dev/usb_hub.c
   dev/xid.c
@@ -156,7 +176,7 @@ target_include_directories(xbased_native PUBLIC "${NC_REPO}")
 target_include_directories(xbased_native PRIVATE "${NC_XXHASH_DIR}")
 # The HLE layer's pure modules build without QEMU in this mode.
 target_compile_definitions(xbased_native PRIVATE HLE_HOST_TEST)
-target_link_libraries(xbased_native PUBLIC ${NC_CPU_LIB} xbased_hle xbased_apu nc_slirp ${NC_SYS_LIBS} z)
+target_link_libraries(xbased_native PUBLIC ${NC_CPU_LIB} xbased_hle xbased_apu nc_slirp nc_chihiro ${NC_SYS_LIBS} z)
 target_compile_options(xbased_native PRIVATE -Wall -Wno-unused-parameter)
 target_sources(xbased_native PRIVATE core/chd_image.c core/fold_image.c core/nbd_image.c)
 

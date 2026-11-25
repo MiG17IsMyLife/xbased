@@ -453,7 +453,7 @@ static void poll_input(void)
 
             break;
         case SDL_EVENT_TEXT_INPUT:
-            in->text = e.text.text;
+            dash_text_type(in->text, sizeof(in->text), e.text.text);
             break;
         case SDL_EVENT_MOUSE_MOTION: {
             /* a real move, not the window appearing under the pointer: 2 pixels
@@ -705,9 +705,7 @@ static void auto_poll(void)
             }
         } else if (!strncmp(line, "TEXT ", 5)) {
             /* text typed into a text field, as the keyboard sends it */
-            static char typed[256];
-            snprintf(typed, sizeof(typed), "%s", line + 5);
-            in->text = typed;
+            dash_text_type(in->text, sizeof(in->text), line + 5);
         } else if (!strncmp(line, "KEY ", 4)) {
             /* a key as the keyboard sends it (its SDL name: Return, Backspace, Down, X) */
             SDL_Event e = {0};
@@ -1041,6 +1039,23 @@ bool list_row(List *l, const char *label, const char *value, int *delta)
     return row_chosen(l, i);
 }
 
+/* A setting the game's hardware fixes: greyed, its value shown, never changed. */
+void list_row_fixed(List *l, const char *label, const char *value, const char *help)
+{
+    float ry;
+    bool sel;
+    if (row_common(l, NULL, &ry, &sel)) {
+        const UiColor dim = ui_alpha(UI_GREY, 0.45f);
+        const float ty = ry + (l->row_h - 26) / 2 - 2;
+        const float vw = ui_text_width(value, 26, UI_FONT_REGULAR);
+        ui_text_fit(l->x + 12, ty, label, 26, UI_FONT_REGULAR, dim, UI_ALIGN_LEFT, l->w - 64 - vw);
+        ui_text_fit(l->x + l->w - 12, ty, value, 26, UI_FONT_REGULAR, dim, UI_ALIGN_RIGHT, l->w * 0.5f);
+    }
+    if (help && list_selected(l)) {
+        dash_help(help, HELP_NOW);
+    }
+}
+
 void list_heading(List *l, const char *title)
 {
     const int i = l->count++;
@@ -1340,6 +1355,7 @@ static const struct {
     {S_PAUSE_DC, S_H_PAUSE_DC, HELP_ON_RESUME},
     {S_FACE_LAYOUT, S_H_FACE, HELP_ON_RESUME}, {S_MOUSE_STICK, S_H_MOUSE, HELP_ON_RESUME},
     {S_MOUSE_SENS, S_H_MOUSE_SENS, HELP_ON_RESUME}, {S_COMMUNICATOR, S_H_COMMUNICATOR, HELP_NEXT_START},
+    {S_CH_REGION, S_H_CH_REGION, HELP_NEXT_START}, {S_CH_CABINET, S_H_CH_LINK, HELP_NEXT_START}, {S_CH_WHEEL, S_H_CH_WHEEL, HELP_NEXT_START},
 };
 
 /* the option's help when its row is the selected one */
@@ -1817,7 +1833,9 @@ static void wait_child(void)
     if (D.cur && D.game.path[0]) {
         /* and its own (the in-game menu's Game settings): the ones read
          * before it ran went back over them as it was played again (#210) */
-        cfg_load(&D.game, D.game.path);
+        char path[sizeof(D.game.path)];
+        snprintf(path, sizeof(path), "%s", D.game.path);
+        cfg_load_game(&D.game, path, D.cur->g.chihiro);
         upscale_migrate(&D.game);
         cfg_shaders_migrate(&D.game);
     }
@@ -2149,7 +2167,7 @@ static void open_game(LibGame *g)
     D.cur = g;
     char p[1200];
     game_cfg_path(g, p, sizeof(p));
-    cfg_load(&D.game, p);
+    cfg_load_game(&D.game, p, g->g.chihiro);
     upscale_migrate(&D.game);
     if (cfg_shaders_migrate(&D.game)) {
         cfg_save(&D.game);
@@ -2498,9 +2516,7 @@ static void rename_row(List *l, LibGame *g)
         }
     }
     if (editing) {
-        if (D.in.text && strlen(D.edit_tmp) + strlen(D.in.text) < sizeof(D.edit_tmp)) {
-            strcat(D.edit_tmp, D.in.text);
-        }
+        dash_text_type(D.edit_tmp, sizeof(D.edit_tmp), D.in.text);
         if (D.in.key == SDLK_BACKSPACE && D.edit_tmp[0]) {
             size_t n = strlen(D.edit_tmp);
             do {
@@ -2562,7 +2578,10 @@ static void scr_game(void)
     if (list_row(&l, T(S_PLAY), NULL, NULL)) {
         launch_game(g, NULL);
     }
-    if (list_row(&l, T(S_LOAD_STATE), NULL, NULL)) {
+    const int cabinet = cfg_int(&D.game, "chihiro.link", cfg_int(&D.global, "chihiro.link", 0));
+    if (g->g.chihiro && cabinet >= 1 && cabinet <= 4 && dash_chihiro_firmware(NULL, 0)) {
+        list_row_fixed(&l, T(S_LOAD_STATE), "", T(S_H_CH_LINK_STATE));
+    } else if (list_row(&l, T(S_LOAD_STATE), NULL, NULL)) {
         D.sel[SCR_STATES] = 0;
         dash_push(SCR_STATES);
     }
@@ -2990,6 +3009,8 @@ int dash_run(SDL_Window *win, const char *exe)
         case SCR_STATES: scr_states(); break;
         case SCR_SETTINGS: scr_settings(); break;
         case SCR_CONTROLS: scr_controls(); break;
+        case SCR_CABINET_WHEEL: scr_cabinet_wheel(); break;
+        case SCR_CABINET_TUNING: scr_cabinet_tuning(); break;
         case SCR_REMAP: scr_remap(); break;
         case SCR_STICKS: scr_sticks(); break;
         case SCR_TRIGGERS: scr_triggers(); break;
@@ -3077,6 +3098,7 @@ int dash_run(SDL_Window *win, const char *exe)
         }
         last_sig = sig;
     }
+    dash_wheel_capture_close();
     dash_save_cfg();
     lib_shutdown();
     snd_shutdown();
@@ -3094,6 +3116,21 @@ static int g_ig_result, g_ig_slot;
 static bool g_ig_saving;            /* the slots screen: saving (else loading) */
 static bool g_ig_thumbs_stale;   /* the slots' pictures to read again */
 static bool g_ig_done;
+static bool g_ig_link;
+
+static void ingame_state_row(List *l, bool saving)
+{
+    const char *label = T(saving ? S_SAVE_STATE : S_LOAD_STATE);
+    if (g_ig_link) {
+        list_row_fixed(l, label, "", T(S_H_CH_LINK_STATE));
+    } else if (list_row(l, label, NULL, NULL)) {
+        g_ig_saving = saving;
+        D.sel[SCR_INGAME_SLOTS] = 0;
+        states_forget();
+        g_ig_thumbs_stale = true;
+        dash_push(SCR_INGAME_SLOTS);
+    }
+}
 
 static void scr_ingame(void)
 {
@@ -3106,27 +3143,16 @@ static void scr_ingame(void)
         g_ig_result = DASH_INGAME_RESUME;
         g_ig_done = true;
     }
-    if (list_row(&l, T(S_SAVE_STATE), NULL, NULL)) {
-        g_ig_saving = true;
-        D.sel[SCR_INGAME_SLOTS] = 0;
-        states_forget();
-        g_ig_thumbs_stale = true;
-        dash_push(SCR_INGAME_SLOTS);
-    }
-    if (list_row(&l, T(S_LOAD_STATE), NULL, NULL)) {
-        g_ig_saving = false;
-        D.sel[SCR_INGAME_SLOTS] = 0;
-        states_forget();
-        g_ig_thumbs_stale = true;
-        dash_push(SCR_INGAME_SLOTS);
-    }
+    ingame_state_row(&l, true);
+    ingame_state_row(&l, false);
     if (list_row(&l, T(S_GAME_SETTINGS), NULL, NULL)) {
         D.editing_game = true;
         D.sel[SCR_GAME_SETTINGS] = 0;
         dash_push(SCR_GAME_SETTINGS);
     }
-    if (list_row(&l, T(S_CONTROLS), NULL, NULL)) {
-        D.editing_game = false;
+    const bool chihiro = D.cur->g.chihiro;
+    if (list_row(&l, T(chihiro ? S_GAME_CONTROLS : S_CONTROLS), NULL, NULL)) {
+        D.editing_game = chihiro;
         D.player = 0;
         dash_push(SCR_CONTROLS);
     }
@@ -3134,7 +3160,9 @@ static void scr_ingame(void)
         D.tab = 0;
         dash_push(SCR_SETTINGS);
     }
-    if (list_row(&l, T(S_RESTART), NULL, NULL)) {
+    if (g_ig_link) {
+        list_row_fixed(&l, T(S_RESTART), "", T(S_H_CH_LINK_RESTART));
+    } else if (list_row(&l, T(S_RESTART), NULL, NULL)) {
         g_ig_result = DASH_INGAME_RESTART;
         g_ig_done = true;
     }
@@ -3213,11 +3241,12 @@ void dash_ingame_notice(const char *msg)
     snprintf(g_ig_notice, sizeof(g_ig_notice), "%s", msg ? msg : "");
 }
 
-int dash_ingame(SDL_Window *win, const char *key, const char *title, const char *frame_bmp, int *slot,
+int dash_ingame(SDL_Window *win, const char *key, const char *title, bool chihiro, bool link, const char *frame_bmp, int *slot,
                 void (*live)(const struct Config *global, const struct Config *game))
 {
     memset(&D, 0, sizeof(D));
     g_game_running = true;
+    g_ig_link = link;
     g_win = win;
     ptr_install(win);   /* xbased's pointer (pointer.h) */
     SDL_HideCursor();   /* it shows when the mouse moves (poll_input) */
@@ -3232,11 +3261,16 @@ int dash_ingame(SDL_Window *win, const char *key, const char *title, const char 
     i18n_set(cfg_get(&D.global, "ui.lang"));
     static LibGame game;
     memset(&game, 0, sizeof(game));
+    game.g.chihiro = chihiro;
     snprintf(game.g.key, sizeof(game.g.key), "%s", key);
-    xd_clean_name(title, game.g.title, sizeof(game.g.title));
+    if (chihiro) {
+        snprintf(game.g.title, sizeof(game.g.title), "%s", title);
+    } else {
+        xd_clean_name(title, game.g.title, sizeof(game.g.title));
+    }
     D.cur = &game;
     game_cfg_path(&game, p, sizeof(p));
-    cfg_load(&D.game, p);
+    cfg_load_game(&D.game, p, chihiro);
     upscale_migrate(&D.game);
     if (cfg_shaders_migrate(&D.game)) {
         cfg_save(&D.game);
@@ -3322,7 +3356,6 @@ int dash_ingame(SDL_Window *win, const char *key, const char *title, const char 
         }
         ui_set_frame43(cfg_bool(&D.global, "ui.43", false));
         ui_begin();
-        /* the paused game under a green veil: blurred, over the overlay */
         if (ov) {
             ui_cover(true);
             ui_fill(ui_scene(false), UI_WHITE);
@@ -3338,6 +3371,8 @@ int dash_ingame(SDL_Window *win, const char *key, const char *title, const char 
         case SCR_INGAME_SLOTS: scr_ingame_slots(); break;
         case SCR_GAME_SETTINGS: scr_game_settings(); break;
         case SCR_CONTROLS: scr_controls(); break;
+        case SCR_CABINET_WHEEL: scr_cabinet_wheel(); break;
+        case SCR_CABINET_TUNING: scr_cabinet_tuning(); break;
         case SCR_REMAP: scr_remap(); break;
         case SCR_STICKS: scr_sticks(); break;
         case SCR_TRIGGERS: scr_triggers(); break;
@@ -3365,6 +3400,7 @@ int dash_ingame(SDL_Window *win, const char *key, const char *title, const char 
         ui_end();
         D.anim += 1.0f / 60;
     }
+    dash_wheel_capture_close();
     dash_save_cfg();
     for (int i = 0; i < 11; i++) {
         if (g_ig_thumb[i]) {

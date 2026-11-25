@@ -9,6 +9,7 @@
  * (its descriptor opened when first read, a few kept open).
  */
 #include "native/core/fold_image.h"
+#include "native/core/chihiro_boot.h"
 #include "native/core/nc.h"
 #include "native/core/xdvdfs.h"
 
@@ -46,7 +47,7 @@ typedef struct {
 } FFile;
 
 typedef struct {
-    int fd;                     /* the default.xbe's: the key (-1: free) */
+    int fd;                     /* the folder's boot file (-1: free) */
     uint8_t *meta;              /* sectors [0, meta_sectors): descriptor and tables */
     uint32_t meta_sectors;
     FFile *files;               /* by sector */
@@ -345,7 +346,8 @@ static bool fd_dir(int fd, char *out, size_t cap)
 bool nc_fold_attach(int fd)
 {
     char magic[4];
-    if (fd < 0 || pread(fd, magic, 4, 0) != 4 || memcmp(magic, "XBEH", 4)) {
+    if (fd < 0 || pread(fd, magic, 4, 0) != 4 ||
+        (memcmp(magic, "XBEH", 4) && memcmp(magic, NC_CHIHIRO_BOOT_MAGIC, 4))) {
         return false;
     }
     pthread_mutex_lock(&g_mu);

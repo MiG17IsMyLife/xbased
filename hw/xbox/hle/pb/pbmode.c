@@ -102,6 +102,11 @@ static struct {
     uint32_t trap_flips;                /* ... the flips counted as it came (pace_flip) */
     int64_t pace_until;                 /* a flip in a trap's handler: no further till then */
     int64_t pace_slot;                  /* ... the last one's slot on the limit's grid */
+    struct {
+        uint64_t vertex_ops, pixel_cycles, bytes, commands;
+        int64_t started, ready, average;
+    } real_gpu;
+    bool real_gpu_logged;
     uint64_t paced;                     /* ... holds */
     uint32_t sub_r[8][0x400 / 4];       /* the 2D objects' methods, by subchannel */
     uint32_t s2d[0x400 / 4];            /* the 2D surfaces' (one at a time in D3D) */
@@ -294,6 +299,55 @@ static bool flip_done(void)
     return surf_get(SURF_READ) != surf_get(SURF_WRITE);
 }
 
+static bool g_real_hw_speed;
+
+void hle_pb_set_real_hw_speed(bool enabled)
+{
+    g_real_hw_speed = enabled;
+}
+
+bool hle_pb_real_hw_speed(void)
+{
+    return g_real_hw_speed;
+}
+
+void hle_pb_account_gpu_work(uint64_t vertex_ops, uint64_t pixel_cycles, uint64_t bytes)
+{
+    if (!g_pb.real_gpu.commands++) {
+        g_pb.real_gpu.started = hle_now_ns();
+    }
+    g_pb.real_gpu.vertex_ops += vertex_ops;
+    g_pb.real_gpu.pixel_cycles += pixel_cycles;
+    g_pb.real_gpu.bytes += bytes;
+}
+
+static void real_gpu_frame(void)
+{
+    if (!g_real_hw_speed || !g_pb.real_gpu.commands) {
+        return;
+    }
+    // perf-experimental's NV2A throughput model. The stages overlap.
+    const uint64_t vertex_ns = g_pb.real_gpu.vertex_ops * 1000 / 466;
+    const uint64_t pixel_ns = g_pb.real_gpu.pixel_cycles * 1000 / 932;
+    const uint64_t memory_ns = g_pb.real_gpu.bytes * 100 / 497;
+    const int64_t cost = MIN(100000000ull, MAX(MAX(vertex_ns, pixel_ns), memory_ns) +
+                             g_pb.real_gpu.commands * 1000 + 500000);
+    const int64_t now = hle_now_ns();
+    const bool restart = g_pb.real_gpu.ready < now - 50000000;
+    const int64_t start = MAX(now - 50000000, MAX(g_pb.real_gpu.started, g_pb.real_gpu.ready));
+    const int64_t average = restart ? cost : g_pb.real_gpu.average + (cost - g_pb.real_gpu.average) / 16;
+    memset(&g_pb.real_gpu, 0, sizeof(g_pb.real_gpu));
+    g_pb.real_gpu.average = average;
+    g_pb.real_gpu.ready = MIN(start + average, now + 100000000);
+    if (!g_pb.real_gpu_logged && pixel_ns) {
+        hle_log("xbased-hle-pb", "Chihiro GPU pacing active (first drawn frame: %.2f ms estimated)", cost / 1e6);
+        g_pb.real_gpu_logged = true;
+    }
+    if (g_pb.real_gpu.ready > now) {
+        g_pb.pace_until = MAX(g_pb.pace_until, g_pb.real_gpu.ready);
+    }
+}
+
 /* The Kelvin methods kelvin() acts on (its cases, by method / 4): every
  * other one is only its two register shadows' (hle_kelvin_method,
  * hle_pbd_method) and takes no look through the switch. */
@@ -339,6 +393,7 @@ static int kelvin(uint32_t m, uint32_t v)
         break;
     }
     case NV097_FLIP_STALL:
+        real_gpu_frame();
         if (!flip_done()) {
             hle_host_gpu_trace(HLE_GTR_FLIP_STALL, surf_get(SURF_READ) << 4 | surf_get(SURF_WRITE));
             __atomic_add_fetch(&g_flip_stalls, 1, __ATOMIC_RELEASE);
@@ -348,6 +403,9 @@ static int kelvin(uint32_t m, uint32_t v)
             if (g_flip_wait_cb) {
                 g_flip_wait_cb();
             }
+            return HLE_PB_STALL;
+        }
+        if (g_pb.pace_until) {
             return HLE_PB_STALL;
         }
         break;
@@ -364,6 +422,10 @@ static int kelvin(uint32_t m, uint32_t v)
         g_pb.report_inst = ramht_find(v);
         break;
     case NV097_GET_REPORT:
+        if (g_real_hw_speed) {
+            hle_pb_account_gpu_work(0, 0, 0);
+            g_pb.real_gpu.commands++;   /* report synchronization costs twice a draw setup */
+        }
         /* a visibility test's record: timestamp, the pixels that passed,
          * status 0 (done); D3D waits for the status it set to -1. The back
          * end writes it once the GPU ran the test's draws; with nothing to
@@ -595,10 +657,13 @@ static void blit(const uint32_t *r)
             hle_mem_mark_written(d, row);
         }
         hle_pbd_copy_done(dlo, dp, row, h, dep);
-        hle_pbd_blit(dbase, dp, ox, oy, w, h, dep);
+        hle_pbd_blit(dbase, dp, ox, oy, w, h, row, dep);
     }
     g_pb.blits++;
     g_pb.blit_bytes += (uint64_t)row * h;
+    if (g_real_hw_speed) {
+        hle_pb_account_gpu_work(0, 0, (uint64_t)row * h * 2);
+    }
 }
 
 /* NV039 BUFFER_NOTIFY: LINE_COUNT lines of LINE_LENGTH_IN bytes, OFFSET_IN
@@ -627,6 +692,9 @@ static void m2mf(const uint32_t *r)
     hle_pbd_copy_done(out, (uint32_t)pout, len, lines, dep);
     g_pb.m2mfs++;
     g_pb.m2mf_bytes += (uint64_t)len * lines;
+    if (g_real_hw_speed) {
+        hle_pb_account_gpu_work(0, 0, (uint64_t)len * lines * 2);
+    }
 }
 
 static void method_2d(unsigned subch, uint32_t m, uint32_t v)
@@ -1034,6 +1102,7 @@ static void consume_pass(void)
         hle_host_gpu_trace(HLE_GTR_RESUME, 1);
         if (__atomic_load_n(&g_fl_flips, __ATOMIC_ACQUIRE) != g_pb.trap_flips) {
             pace_flip();                            /* its handler flipped */
+            real_gpu_frame();
             __atomic_store_n(&g_trap_flip_ns, hle_now_ns(), __ATOMIC_RELAXED);
         }
     }
@@ -1815,6 +1884,10 @@ void hle_pb_state_set(const HlePbState *s)
     g_pb.sem_inst = s->sem_inst;
     g_pb.sem_offset = s->sem_offset;
     g_pb.report_inst = s->report_inst;
+    if (g_real_hw_speed) {
+        memset(&g_pb.real_gpu, 0, sizeof(g_pb.real_gpu));
+        g_pb.pace_until = 0;
+    }
     g_pb.flip_wait = s->flip_wait;
     g_pb.flip_wait_ns = hle_now_ns();
     g_pb.trap_wait = s->trap_wait;

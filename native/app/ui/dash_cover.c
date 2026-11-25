@@ -81,7 +81,7 @@ void scr_cover(void)
     In in = D.in;
     if (C.editing) {
         /* the keys go to the keyboard, typed or on the screen */
-        if (D.in.text) {
+        if (D.in.text[0]) {
             dash_text_type(C.q, sizeof(C.q), D.in.text);
         }
         if (D.in.key == SDLK_BACKSPACE || D.in.key == SDLK_DELETE || D.in.x) {

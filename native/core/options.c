@@ -36,6 +36,37 @@ static const char *value(const char *arg, const char *name)
     return !strncmp(arg, name, n) ? arg + n : NULL;
 }
 
+static bool chihiro_coin_option(NcChihiroCoinSettings *coins, const char *arg)
+{
+    const char *v = value(arg, "chihiro.coin_rate=");
+    if (v) {
+        char *end;
+        const long rate = strtol(v, &end, 10);
+        if (*v && !*end && rate >= 0 && rate <= 10) {
+            coins->rate = (uint8_t)rate;
+        }
+        return true;
+    }
+    static const char *const keys[NC_CH_COST_COUNT] = {
+        [NC_CH_COST_START] = "chihiro.cost.start=",
+        [NC_CH_COST_CONTINUE] = "chihiro.cost.continue=",
+        [NC_CH_COST_FULL_COURSE] = "chihiro.cost.full_course=",
+        [NC_CH_COST_NEW_CARD] = "chihiro.cost.new_card=",
+        [NC_CH_COST_RENEW_CARD] = "chihiro.cost.renew_card=",
+        [NC_CH_COST_TRANSFER_CARD] = "chihiro.cost.transfer_card=",
+    };
+    for (int i = 0; i < NC_CH_COST_COUNT; i++) {
+        v = value(arg, keys[i]);
+        if (v) {
+            if (v[0] >= '0' && v[0] <= '9' && !v[1]) {
+                coins->cost[i] = (uint8_t)(v[0] - '0');
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool nc_option(NcOptions *o, const char *arg)
 {
     const char *v;
@@ -45,6 +76,11 @@ bool nc_option(NcOptions *o, const char *arg)
         o->uncap = true;
     } else if (!strcmp(arg, "relaunch")) {
         o->boot.relaunch = true;
+    } else if (!strcmp(arg, "chihirotest")) {
+        o->boot.chihiro_test = true;
+    } else if ((v = value(arg, "chihiro.real_hw_speed="))) {
+        o->boot.chihiro_real_hw_speed = !strcmp(v, "1");
+    } else if (!strncmp(arg, "chihiro.", 8) && chihiro_coin_option(&o->boot.chihiro_coins, arg)) {
     } else if (!strcmp(arg, "dash")) {
         o->boot.dashboard = true;            /* no disc: the disc argument is "none" */
     } else if ((v = value(arg, "xcheat="))) {

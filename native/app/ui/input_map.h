@@ -94,6 +94,45 @@ typedef struct ImMap {
     float mouse_sens;
 } ImMap;
 void im_resolve(ImMap *m, const Config *global, const Config *game);
+
+enum {
+    IM_CAB_LEFT, IM_CAB_RIGHT, IM_CAB_ACCEL, IM_CAB_BRAKE,
+    IM_CAB_SHIFT_UP, IM_CAB_SHIFT_DOWN, IM_CAB_START, IM_CAB_VIEW, IM_CAB_INTRUDE,
+    IM_CAB_COIN, IM_CAB_CARD, IM_CAB_TEST, IM_CAB_SERVICE,
+    IM_CAB_INPUTS
+};
+typedef struct ImCabinetControl {
+    enum UiStr label;
+    const char *binding;
+    int slot;                      /* slot in the controller-to-cabinet adapter */
+    SDL_Keycode key;               /* optional cabinet-specific default */
+    const char *wheel_button;
+    int wheel_default;             /* 1-based; 0 unassigned */
+} ImCabinetControl;
+extern const ImCabinetControl im_cabinet_controls[IM_CAB_INPUTS];
+
+enum { IM_CAB_WHEEL_STEER, IM_CAB_WHEEL_ACCEL, IM_CAB_WHEEL_BRAKE, IM_CAB_WHEEL_AXES };
+enum { IM_CAB_WHEEL_MAX_AXES = 32, IM_CAB_WHEEL_MAX_BUTTONS = 128 };
+typedef struct ImCabinetAxis {
+    enum UiStr label;
+    const char *option;
+    int default_axis;
+    const char *invert_option;
+    enum UiStr invert_label;
+} ImCabinetAxis;
+extern const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES];
+SDL_Joystick *im_cabinet_open_wheel(const char *name);
+
+typedef enum ImPedalDirection { IM_PEDAL_AUTO, IM_PEDAL_NORMAL, IM_PEDAL_REVERSE } ImPedalDirection;
+ImPedalDirection im_cabinet_pedal_direction(const char *value);
+uint16_t im_cabinet_pedal_value(int value, int rest, ImPedalDirection direction);
+
+void im_cabinet_binding_name(const Config *global, const Config *game, int input, char *out, size_t n);
+/* A keyboard key, a gamepad button or signed axis changes its own assignment.
+ * With SDLK_UNKNOWN, -1 and 0 respectively, both assignments are cleared. */
+void im_cabinet_bind(Config *game, const Config *global, int input, SDL_Keycode key, int button, int signed_axis);
+void im_cabinet_reset(Config *game);
+void im_resolve_cabinet(ImMap *m, const Config *global, const Config *game);
 /* A stick's position (x, y: -1..1, up positive) as the title gets it,
  * -1..1 on each axis: the dead zone, the shape and the range applied. */
 void im_stick(float x, float y, float deadzone, float antidz, float range, bool round, float *ox, float *oy);

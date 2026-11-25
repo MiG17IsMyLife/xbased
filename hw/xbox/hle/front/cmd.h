@@ -230,6 +230,7 @@ typedef struct HleCmdReadback {
     /* HLE_RB_DIRECT: the rows from the top that go to memory, the ones the
      * GPU drew (0: all of them); the landing (fb_len) holds those */
     uint32_t rows;
+    uint32_t nearest;               /* packed depth and stencil words */
 } HleCmdReadback;
 #define HLE_RB_DIRECT 0xFFFFFFFFu
 /* arena_off: the subresource packed as above into the landing buffer (the

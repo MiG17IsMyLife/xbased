@@ -70,7 +70,8 @@ struct alignas(64) NcFrame {
     NcCpu *cpu;
     uint32_t shadow_reset;   /* the return predictions go at the next restore (the code they point into went) */
     uint32_t vac;            /* the guest's AC flag (the host's would check alignment in ring 3) */
-    uint64_t pad1;
+    int32_t pace_budget;
+    uint32_t pad1;
     alignas(16) uint8_t fx[512]; /* FXSAVE image: x87/MMX, MXCSR, XMM */
 };
 
@@ -179,6 +180,8 @@ struct NcCpu {
     volatile LONG poll_armed = 0;
     PVOID veh = nullptr;
     uint64_t translated = 0, flushes = 0;
+    uint64_t pace_due = 0;
+    bool pace_logged = false;
     ZydisDecoder dec {};
 };
 
@@ -1538,6 +1541,24 @@ static void register_translated_block(NcCpu *cpu, Block *b, uint64_t dep_end, bo
     }
 }
 
+enum { PACE_SYSOP = 0xFF, PACE_BUDGET = 4096 };
+
+static uint8_t *pace_block(Translator &t)
+{
+    Asm &a = t.a;
+    a.op(ZYDIS_MNEMONIC_PUSHFQ, {});
+    a.op(ZYDIS_MNEMONIC_CMP, {FR4(pace_budget, 0), I(0)});
+    uint8_t *ready = a.jcc(0xF, nullptr); /* jg */
+    a.op(ZYDIS_MNEMONIC_POPFQ, {});
+    t.sysop(t.eip, PACE_SYSOP, 0);
+    patch_rel32(ready, a.p);
+    // Force an imm32 operand and fill in the count when the block is complete.
+    a.op(ZYDIS_MNEMONIC_SUB, {FR4(pace_budget, 0), I(0x40000000)});
+    uint8_t *count = a.p - sizeof(uint32_t);
+    a.op(ZYDIS_MNEMONIC_POPFQ, {});
+    return count;
+}
+
 static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
 {
     if ((size_t)(cpu->code_end - cpu->code_p) < 64 * 1024) {
@@ -1556,6 +1577,7 @@ static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
         a.op(ZYDIS_MNEMONIC_MOV, {R(ZYDIS_REGISTER_R11B), A((const void *)cpu->poll, 1)});
     }
 
+    uint8_t *pace_count = cpu->cfg.real_hw_speed && !bypass ? pace_block(t) : nullptr;
     const unsigned max_insns = 256;
     unsigned n = 0;
     bool ended = false;
@@ -1633,6 +1655,10 @@ static Block *translate(NcCpu *cpu, uint32_t eip, bool bypass)
         delete b;
         flush_all(cpu);
         return translate(cpu, eip, bypass);
+    }
+    if (pace_count) {
+        const uint32_t count = std::max(n, 1u);
+        memcpy(pace_count, &count, sizeof(count));
     }
     b->code_end = a.p;
     cpu->code_p = (uint8_t *)(((uintptr_t)a.p + 15) & ~(uintptr_t)15);
@@ -1894,6 +1920,26 @@ extern "C" uint8_t *nc_x86_sysop_entry(NcFrame *f)
     NcCpu *cpu = f->cpu;
     const uint32_t info = f->sysop_info;
     f->sysop_info = 0;
+    if (info == PACE_SYSOP) {
+        // 1.45 cycles per instruction at 733 MHz, as in perf-experimental.
+        if (!cpu->pace_logged) {
+            nc_log("xbased-native", "Chihiro CPU pacing active (733 MHz, 1.45 cycles per instruction)");
+            cpu->pace_logged = true;
+        }
+        const uint64_t instructions = PACE_BUDGET - f->pace_budget;
+        const uint64_t ticks = instructions * 1977 * tsc_hz() / 1000000000000ull;
+        cpu->pace_due += ticks;
+        uint64_t now = rdtsc_now();
+        if (cpu->pace_due < now) {
+            cpu->pace_due = now;
+        }
+        while (now < cpu->pace_due && !cpu->poll_armed) {
+            __asm__ volatile("pause");
+            now = rdtsc_now();
+        }
+        f->pace_budget = PACE_BUDGET;
+        return next_for(cpu, f);
+    }
     const auto op = (enum NcSysOp)(info & 0xFF);
     const unsigned size = (info >> 8) & 0xFF;
     if (op == NC_SYSOP_INTERRUPT) {
@@ -2197,6 +2243,7 @@ extern "C" NcCpu *nc_cpu_create(const NcCpuConfig *cfg, uint32_t fs_base)
     f->tsc_ratio = tsc_ratio_q32();
     f->cycle_offset = rdtsc_now();
     f->host_mxcsr = 0x1F80;
+    f->pace_budget = PACE_BUDGET;
     fx_reset(f->fx);
     cpu->frame = f;
     g_cpu = cpu;
@@ -2436,6 +2483,10 @@ extern "C" void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
 {
     NcFrame *f = cpu->frame;
     cpu->thread_id = GetCurrentThreadId();
+    if (cpu->cfg.real_hw_speed) {
+        cpu->pace_due = rdtsc_now();
+        f->pace_budget = PACE_BUDGET;
+    }
 #if XBASED_DIAG && defined(_WIN32)
     /* XBASED_PROF (a build made to investigate): the environment was read at
      * every entry here, one for each kernel call's return */

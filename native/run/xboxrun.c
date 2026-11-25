@@ -28,6 +28,7 @@
  * XBE). xboxrun.sh adds 4: the app is running.
  */
 #include "native/app/app.h"
+#include "native/core/chihiro_boot.h"
 #include "native/core/core.h"
 #include "native/core/mmio.h"
 #include "native/core/options.h"
@@ -272,10 +273,12 @@ static void *watchdog(void *arg)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: xboxrun <disc image> [option...]\n");
+        fprintf(stderr, "usage: xboxrun <disc image or extracted Chihiro folder> [option...]\n");
         return 2;
     }
-    int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    char boot_file[1024];
+    const bool folder = nc_chihiro_boot_path(argv[1], boot_file, sizeof(boot_file), NULL);
+    int fd = open(folder ? boot_file : argv[1], O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         perror(argv[1]);
         return 2;

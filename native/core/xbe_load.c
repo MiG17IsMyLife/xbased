@@ -70,7 +70,7 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, NcKernel *k, Nc
 {
     memset(out, 0, sizeof(*out));
     out->fd = -1;
-    static const char cd[] = "\\Device\\CdRom0";
+    const char *relative = nc_io_disc_relative(path);
     char host[512];
     struct stat st;
     if (nc_io_host_file(path, host, sizeof(host))) {
@@ -81,8 +81,7 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, NcKernel *k, Nc
             return false;
         }
         out->file.size = (uint32_t)st.st_size;
-    } else if (!nc_disc_find(disc, !strncasecmp(path, cd, sizeof(cd) - 1) ? path + sizeof(cd) - 1 : path,
-                             &out->file)) {
+    } else if (!nc_disc_find(disc, relative ? relative : path, &out->file)) {
         nc_log("xbased-native", "xbe: %s not on the disc", path);
         return false;
     }

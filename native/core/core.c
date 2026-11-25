@@ -2,11 +2,14 @@
  * xbased native core — boot and run a title.
  */
 #include "native/core/core.h"
+#include "hw/xbox/hle/pb/pbmode.h"
 
 void (*nc_crash_hook)(void);
 #include "native/dev/dev.h"
 #include "native/dev/usb.h"
 #include "native/hle/hle_native.h"
+#include "native/core/chihiro_boot.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
 #include "native/core/xbox_boot.h"
@@ -32,14 +35,14 @@ static bool boot_failed(const char *why)
     return false;
 }
 
-static void init_xbox_devices(NcVm *vm)
+static void init_xbox_devices(NcVm *vm, bool network_enabled)
 {
     nc_dev_nv2a_init();
     nc_dev_nv2a_set_ram(vm->ram_size);
     nc_dev_apu_init(vm);
     nc_dev_xbox_usb_init(vm);
     nc_dev_aci_init(vm);
-    nc_net_start();
+    nc_net_start(network_enabled);
     nc_dev_nvnet_init(vm);
     /* Register last so the catch-all leaves APU and other devices first. */
     nc_dev_misc_init();
@@ -49,8 +52,34 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
 {
     memset(c, 0, sizeof(*c));
     c->disc.fd = -1;
+    NcChihiroBoot chihiro;
+    const char *probe_error = nc_chihiro_boot_probe(disc_fd, boot->chihiro_test, &chihiro);
+    if (probe_error) {
+        nc_log("xbased-native-chihiro", "%s", probe_error);
+        close(disc_fd);
+        return boot_failed(probe_error);
+    }
+    if (boot->chihiro_test && !chihiro.title) {
+        if (disc_fd >= 0) {
+            close(disc_fd);
+        }
+        return boot_failed("chihirotest requires an extracted WMMT1 or WMMT2 game folder.");
+    }
     const bool loadstate = boot->loadstate[0] != '\0';
-    const uint32_t ram = nc_xbox_boot_ram(disc_fd, boot);
+    const char *chihiro_dir = chihiro.title ? getenv("NC_CHIHIRO_DIR") : NULL;
+    unsigned cabinet = chihiro.title ? nc_chihiro_link_cabinet() : 0;
+    char firmware[1200];
+    if (cabinet && !nc_chihiro_link_firmware(chihiro_dir, firmware, sizeof(firmware))) {
+        nc_log("xbased-chihiro", "link: ver1305.bin unavailable at %s; playing alone", firmware);
+        cabinet = 0;
+    }
+    if (loadstate && cabinet) {
+        if (disc_fd >= 0) {
+            close(disc_fd);
+        }
+        return boot_failed("Save states are unavailable in Chihiro link mode.");
+    }
+    const uint32_t ram = chihiro.title ? NC_CHIHIRO_RAM : nc_xbox_boot_ram(disc_fd, boot);
     /* a savestate's kernel objects are where its boot made them (KERN v3
      * moved the pool's first range) */
     nc_kernel_pool_for(loadstate ? nc_kern_state_kprocess(boot->loadstate) : 0);
@@ -64,9 +93,44 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
         /* the last title's kept memory (D3D's saved display), where it was */
         nc_kernel_av_saved_set(nc_mm_keep_restore(&c->kernel));
     }
-    init_xbox_devices(&c->vm);
-    if (!nc_xbox_boot_xbe(c, disc_fd, boot)) {
+#if defined(__x86_64__)
+    const bool real_hw_speed = chihiro.title && boot->chihiro_real_hw_speed;
+#else
+    const bool real_hw_speed = false;
+#endif
+    hle_pb_set_real_hw_speed(real_hw_speed);
+    if (real_hw_speed) {
+        nc_log("xbased-native-chihiro", "real hardware speed enabled (CPU and GPU)");
+    }
+    nc_ports_set_chihiro(chihiro.title != NULL);
+    if (chihiro.title) {
+        char serial[12];
+        nc_ex_console_serial(&c->kernel, serial);
+        nc_chihiro_media_init(serial);
+        if (cabinet) {
+            char media_serial[16] = "XB-";
+            memcpy(media_serial + 3, serial, sizeof(serial));
+            if (!nc_chihiro_lpc_load_network(firmware, media_serial, cabinet)) {
+                cabinet = 0;
+            }
+        }
+        char save[600];
+        snprintf(save, sizeof(save), "%s/chihiro-%s.bin", nc_io_hdd_root(), chihiro.game_id);
+        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &boot->chihiro_coins, cabinet);
+    }
+    init_xbox_devices(&c->vm, !chihiro.title || cabinet != 0);
+    if (chihiro.title) {
+        nc_io_mount_chihiro_media(chihiro.game_executable, chihiro.test_executable);
+        nc_log("xbased-native-chihiro", "direct boot: %s, %s, 128 MiB", chihiro.title, chihiro.executable);
+    }
+    if (!nc_xbox_boot_xbe(c, disc_fd, boot, chihiro.title ? &chihiro : NULL)) {
         return false;
+    }
+    if (cabinet) {
+        nc_chihiro_lpc_attach_network();
+        if (!strcmp(chihiro.game_id, "SBKD") && !strcmp(chihiro.executable, chihiro.game_executable)) {
+            nc_kernel_wmmt2_link_fixup(&c->kernel);
+        }
     }
     nc_kernel_title_fixups(&c->kernel, &c->xbe.info);
     {
@@ -99,6 +163,7 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
         .idt_limit = 0x7FF,
         .gdt_base = c->kernel.gdt_va,
         .gdt_limit = NC_GDT_LIMIT,
+        .real_hw_speed = real_hw_speed,
     };
     c->cpu = nc_cpu_create(&cfg, c->kernel.kpcr_va);
     if (!c->cpu) {
@@ -149,6 +214,7 @@ void nc_core_run(NcCore *c)
     /* a savestate: the thread it was running, or the scheduler first */
     const NcCpuContext *start = c->restored_state ? nc_kstate_start_context(&c->kernel) : &c->boot_thread->ctx;
     nc_cpu_run(c->cpu, start ? start : &c->boot_thread->ctx);
+    nc_dev_ohci_flush_cabinet();
     const NcKernel *k = &c->kernel;
     if (k->stop) {
         nc_log("xbased-native-frontier", "stop: %s", k->stop_reason);

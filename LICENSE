@@ -32,6 +32,17 @@ above:
     decoder (David Bryant).
   The rest of native/dev/apu (apu_base.h, out.c, state.c, vp/mix_inline.h,
   vp/resample.*) is hakuX's own.
+- The CRP-1231 and V257 device emulation in native/dev/chihiro adapts
+  Tovarichtch's xemu implementation, copyright (c) 2026 Réda Chérif-Touil.
+  The adapted code retains the GNU Lesser General Public License, version 2
+  or later (licenses/LGPL-2.1.txt).
+- The Net DIMM host interface in native/dev/chihiro_lpc.c adapts
+  Tovarichtch's xemu implementation (hw/xbox/chihiro/chihiro.c, 98fbd75),
+  copyright (c) 2013 espes, 2018-2021 Matt Borgerson and 2026 Réda Chérif-Touil,
+  under the GNU Lesser General Public License, version 2 or later.
+- The media-board ASIC, V850, SPD, PIC and DES code in
+  native/dev/chihiro/asic adapts Tovarichtch's xemu implementation (98fbd75).
+  See the individual source files for the original copyright and license.
 - native/kernel/xboxkrnl.exe.def comes from nxdk: CC0-1.0.
 - The window presenter's shaders (hw/xbox/hle/vk/swapchain.c): its FXAA is
   FXAA 3.11 Quality (Timothy Lottes) as PCSX2's fxaa.fx tunes it, GNU

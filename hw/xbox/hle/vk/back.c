@@ -2159,7 +2159,7 @@ static bool readback_packed(const HleCmdReadback *c, VkBuffer buf, VkDeviceSize 
     VkImage img = o->img;
     VkImageLayout il = o->general ? VK_IMAGE_LAYOUT_GENERAL : o->layout;
     if (o->scale > 1) {                         /* the guest gets guest-size texels */
-        img = hle_surf_down(cb, o, il, level, layer, c->w, c->h);
+        img = hle_surf_down(cb, o, il, level, layer, c->w, c->h, false);
         if (!img) {
             return false;
         }
@@ -2244,7 +2244,7 @@ static void cmd_readback(const HleCmdReadback *c)
         if (s->scale > 1 || w != s->d.w || h != s->d.h) {
             /* the guest gets guest-size pixels (or the size asked for:
              * a multisampled display persisted at display size) */
-            img = hle_surf_down(cb, s, il, 0, 0, w, h);
+            img = hle_surf_down(cb, s, il, 0, 0, w, h, c->nearest != 0);
             il = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         }
         bool fb = !g_hram.zero_copy;

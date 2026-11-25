@@ -12,6 +12,7 @@
  * it from a file (debug.xbased.env holds 91 characters).
  */
 #include "native/dev/usb.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/irq.h"
 #include "hw/xbox/hle/vk/back.h"
 
@@ -346,8 +347,34 @@ NcUsbDev *nc_xid_gamepad_new(unsigned player)
     return &x->dev;
 }
 
+/* Chihiro: player 1's pad drives the cabinet (KittenTools' WMMT3 layout):
+ * left stick steer, RT/LT gas/brake, B view, X intrude, Y coin, white/black
+ * shift down/up, START, left/right stick click TEST/SERVICE.
+ * The front end uses the A slot for the cabinet's card reader. */
+static void chihiro_controls(const NcPadState *s)
+{
+    NcChihiroInput in;
+    memset(&in, 0, sizeof(in));
+    in.steering = (uint16_t)(0x8000 + s->lx);
+    in.gas = (uint16_t)(s->analog[7] * 257u);
+    in.brake = (uint16_t)(s->analog[6] * 257u);
+    in.card = s->analog[0] >= 0x30;
+    in.view = s->analog[1] >= 0x30;
+    in.perspective = s->analog[2] >= 0x30;
+    in.coin = s->analog[3] >= 0x30;
+    in.shift_up = s->analog[4] >= 0x30;
+    in.shift_down = s->analog[5] >= 0x30;
+    in.start = s->buttons & NC_PAD_START;
+    in.test = s->buttons & NC_PAD_LTHUMB;
+    in.service = s->buttons & NC_PAD_RTHUMB;
+    nc_chihiro_board_input(&in);
+}
+
 void nc_pad_set(unsigned player, const NcPadState *s)
 {
+    if (player == 0 && nc_chihiro_board_active()) {
+        chihiro_controls(s);
+    }
     if (player < XID_PLAYERS) {
         pthread_mutex_lock(&g_lock);
         g_pad[player] = *s;

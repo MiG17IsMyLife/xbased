@@ -67,6 +67,7 @@ int hle_xbe_parse(const uint8_t *hdr, uint32_t hdr_len, HleXbeInfo *out)
     uint32_t hi = out->base + out->sizeof_image;
     uint32_t e_retail = enc_entry ^ HLE_XBE_ENTRY_KEY_RETAIL;
     uint32_t e_debug = enc_entry ^ HLE_XBE_ENTRY_KEY_DEBUG;
+    uint32_t e_chihiro = enc_entry ^ HLE_XBE_ENTRY_KEY_CHIHIRO;
     if (e_retail >= lo && e_retail < hi) {
         out->entry = e_retail;
         out->kernel_thunk = enc_thunk ^ HLE_XBE_THUNK_KEY_RETAIL;
@@ -79,6 +80,9 @@ int hle_xbe_parse(const uint8_t *hdr, uint32_t hdr_len, HleXbeInfo *out)
         out->entry = enc_entry;
         out->kernel_thunk = enc_thunk;
         out->plain_entry = true;
+    } else if (e_chihiro >= lo && e_chihiro < hi) {
+        out->entry = e_chihiro;
+        out->kernel_thunk = enc_thunk ^ HLE_XBE_THUNK_KEY_CHIHIRO;
     } else {
         return HLE_XBE_ERR_ENTRY;
     }

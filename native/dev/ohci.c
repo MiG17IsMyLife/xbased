@@ -19,6 +19,7 @@
  */
 #include <stdio.h>
 #include "native/dev/usb.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/irq.h"
 #include "native/core/mmio.h"
 #include "native/core/vm.h"
@@ -618,6 +619,10 @@ static void publish_done_queue(Ohci *o, uint8_t *hcca)
 static void frame(Ohci *o)
 {
     o->frames++;
+    if (nc_chihiro_board_active()) {
+        nc_chihiro_board_frame();
+        nc_chihiro_lpc_frame();
+    }
     if (o->frames % 10000 == 0) {
         /* the stack's health every 10 s: a title whose USB stops polling
          * (a dead controller, a stalled endpoint) reads no input */
@@ -863,8 +868,14 @@ void nc_dev_xbox_usb_init(NcVm *vm)
     pthread_mutex_lock(&o->lock);
     o->vm = vm;
     g_trace = getenv("NC_TRACE_USB") != NULL;
-    const unsigned mask = initial_player_mask();
-    const bool front_hub = build_xbox_usb_ports(o->dev, mask);
+    const bool chihiro = nc_chihiro_board_active();
+    /* Chihiro: the baseboard's QC and SC on root ports 1 and 2, no pads */
+    const unsigned mask = chihiro ? 0 : initial_player_mask();
+    const bool front_hub = chihiro ? false : build_xbox_usb_ports(o->dev, mask);
+    if (chihiro) {
+        o->dev[0] = nc_chihiro_board_qc();
+        o->dev[1] = nc_chihiro_board_sc();
+    }
     g_front_hub = front_hub;
     soft_reset(o);
     o->ctl = 0;
@@ -880,6 +891,23 @@ void nc_dev_xbox_usb_init(NcVm *vm)
     nc_log("xbased-native-usb", "ohci: %u controller(s) (players %s%s%s%s)%s", players, mask & 1 ? "1" : "",
            mask & 2 ? "2" : "", mask & 4 ? "3" : "", mask & 8 ? "4" : "",
            front_hub ? " behind the front panel hub" : "");
+}
+
+void nc_dev_ohci_flush_cabinet(void)
+{
+    if (nc_chihiro_board_active()) {
+        pthread_mutex_lock(&g_ohci.lock);
+        nc_chihiro_board_flush();
+        pthread_mutex_unlock(&g_ohci.lock);
+    }
+}
+
+bool nc_dev_ohci_cabinet_force(NcChihiroForce *force)
+{
+    pthread_mutex_lock(&g_ohci.lock);
+    const bool powered = nc_chihiro_board_force(force);
+    pthread_mutex_unlock(&g_ohci.lock);
+    return powered;
 }
 
 /* A controller plugged in or pulled out, as on the console: its root port
@@ -898,7 +926,7 @@ void nc_dev_ohci_set_pads(unsigned mask)
         pthread_mutex_unlock(&o->lock);
         return;
     }
-    if (g_front_hub) {
+    if (g_front_hub || nc_chihiro_board_active()) {
         pthread_mutex_unlock(&o->lock);
         return;
     }

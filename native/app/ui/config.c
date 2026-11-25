@@ -101,6 +101,18 @@ void cfg_load(Config *c, const char *path)
     fclose(f);
 }
 
+void cfg_load_game(Config *c, const char *path, bool chihiro)
+{
+    if (chihiro && !SDL_GetPathInfo(path, NULL)) {
+        char legacy[1024];
+        snprintf(legacy, sizeof(legacy), "%sgames/00000000.0.ini", cfg_data_dir());
+        cfg_load(c, legacy);
+        snprintf(c->path, sizeof(c->path), "%s", path);
+    } else {
+        cfg_load(c, path);
+    }
+}
+
 bool cfg_save(const Config *c)
 {
     char tmp[1100];

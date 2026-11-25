@@ -98,14 +98,9 @@ static void map_key(int player, int input, char *out, size_t n)
     snprintf(out, n, "map.p%d.%s", player + 1, k_name[input]);
 }
 
-/* "<key name>|<pad element>" -> its parts, the defaults where absent */
-static void parse(const Config *c, int player, int input, SDL_Keycode *key, int *pad)
+/* "<key name>|<pad element>" overrides both assignments. */
+static void parse_value(const char *v, SDL_Keycode *key, int *pad)
 {
-    char k[48];
-    map_key(player, input, k, sizeof(k));
-    const char *v = cfg_get(c, k);
-    *key = player == 0 ? k_kb_def[input] : SDLK_UNKNOWN;
-    *pad = k_pad_def[input];
     if (!v) {
         return;
     }
@@ -124,17 +119,32 @@ static void parse(const Config *c, int player, int input, SDL_Keycode *key, int 
     }
 }
 
-static void store(Config *c, int player, int input, SDL_Keycode key, int pad)
+static void parse(const Config *c, int player, int input, SDL_Keycode *key, int *pad)
 {
-    char k[48], v[96], pe[16] = "";
+    char k[48];
     map_key(player, input, k, sizeof(k));
+    *key = player == 0 ? k_kb_def[input] : SDLK_UNKNOWN;
+    *pad = k_pad_def[input];
+    parse_value(cfg_get(c, k), key, pad);
+}
+
+static void store_value(Config *c, const char *name, SDL_Keycode key, int pad)
+{
+    char v[96], pe[16] = "";
     if (pad >= 1000) {
         snprintf(pe, sizeof(pe), "a%d%c", (pad - 1000) / 2, (pad & 1) ? '-' : '+');
     } else if (pad > 0) {
         snprintf(pe, sizeof(pe), "b%d", pad - 1);
     }
     snprintf(v, sizeof(v), "%s|%s", key ? key_name(key) : "", pe);
-    cfg_set(c, k, v);
+    cfg_set(c, name, v);
+}
+
+static void store(Config *c, int player, int input, SDL_Keycode key, int pad)
+{
+    char k[48];
+    map_key(player, input, k, sizeof(k));
+    store_value(c, k, key, pad);
 }
 
 /* a pad's input as its face says it: A, LB, RT, Left stick X+, D-pad up */
@@ -156,14 +166,19 @@ static void pad_name(int pad, char *out, size_t n)
     }
 }
 
+static void binding_name(SDL_Keycode key, int pad, char *out, size_t n)
+{
+    char pn[48];
+    pad_name(pad, pn, sizeof(pn));
+    snprintf(out, n, "%s  /  %s", key ? key_name(key) : "-", pn);
+}
+
 void im_binding_name(const Config *c, int player, int input, char *out, size_t n)
 {
-    SDL_Keycode k;
-    int p;
-    parse(c, player, input, &k, &p);
-    char pn[48];
-    pad_name(p, pn, sizeof(pn));
-    snprintf(out, n, "%s  /  %s", k ? key_name(k) : "-", pn);
+    SDL_Keycode key;
+    int pad;
+    parse(c, player, input, &key, &pad);
+    binding_name(key, pad, out, n);
 }
 
 void im_bind_key(Config *c, int player, int input, SDL_Keycode key)
@@ -213,6 +228,151 @@ void im_copy_map(Config *to, const Config *from, int player)
         parse(from, player, i, &k, &p);
         store(to, player, i, k, p);
     }
+}
+
+/* KittenTools WMMT3/3DX/3DX+ controller layout and R3 wheel assignments.
+ * Operator keyboard defaults use the xbased cabinet keys. */
+const ImCabinetControl im_cabinet_controls[IM_CAB_INPUTS] = {
+    [IM_CAB_LEFT]       = {S_CH_STEER_LEFT,   "chihiro.bind.steer.left", IM_LLEFT},
+    [IM_CAB_RIGHT]      = {S_CH_STEER_RIGHT,  "chihiro.bind.steer.right", IM_LRIGHT},
+    [IM_CAB_ACCEL]      = {S_CH_ACCEL,        "chihiro.bind.accel", IM_RT},
+    [IM_CAB_BRAKE]      = {S_CH_BRAKE,        "chihiro.bind.brake", IM_LT},
+    [IM_CAB_SHIFT_UP]   = {S_CH_SHIFT_UP,     "chihiro.bind.shift.up", IM_BLACK, 0, "chihiro.wheel.up", 14},
+    [IM_CAB_SHIFT_DOWN] = {S_CH_SHIFT_DOWN,   "chihiro.bind.shift.down", IM_WHITE, 0, "chihiro.wheel.down", 13},
+    [IM_CAB_START]      = {S_CH_START,        "chihiro.bind.start", IM_START, 0, "chihiro.wheel.start", 0},
+    [IM_CAB_VIEW]       = {S_CH_VIEW,         "chihiro.bind.view", IM_B, 0, "chihiro.wheel.view", 23},
+    [IM_CAB_INTRUDE]    = {S_CH_INTRUDE,      "chihiro.bind.intrude", IM_X, SDLK_F10, "chihiro.wheel.intrude", 36},
+    [IM_CAB_COIN]       = {S_CH_COIN,         "chihiro.bind.coin", IM_Y, SDLK_F9, "chihiro.wheel.coin", 22},
+    [IM_CAB_CARD]       = {S_CH_CARD,         "chihiro.bind.card", IM_A, SDLK_F4, "chihiro.wheel.card", 35},
+    [IM_CAB_TEST]       = {S_CH_TEST,         "chihiro.bind.test", IM_LS, SDLK_F6, "chihiro.wheel.test", 25},
+    [IM_CAB_SERVICE]    = {S_CH_SERVICE,      "chihiro.bind.service", IM_RS, SDLK_F7, "chihiro.wheel.service", 38},
+};
+
+const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES] = {
+    [IM_CAB_WHEEL_STEER] = {S_CH_STEER, "chihiro.wheel.steer", 0},
+    [IM_CAB_WHEEL_ACCEL] = {S_CH_ACCEL, "chihiro.wheel.gas", 2, "chihiro.wheel.gas.invert", S_CH_ACCEL_INVERT},
+    [IM_CAB_WHEEL_BRAKE] = {S_CH_BRAKE, "chihiro.wheel.brake", 5, "chihiro.wheel.brake.invert", S_CH_BRAKE_INVERT},
+};
+
+SDL_Joystick *im_cabinet_open_wheel(const char *name)
+{
+    if (name && !strcmp(name, "off")) {
+        return NULL;
+    }
+    const bool automatic = !name || !strcmp(name, "auto");
+    SDL_Joystick *wheel = NULL;
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+    for (int pass = 0; ids && !wheel && pass < (automatic ? 3 : 2); pass++) {
+        for (int i = 0; i < count && !wheel; i++) {
+            const char *device = SDL_GetJoystickNameForID(ids[i]);
+            if (!device) {
+                continue;
+            }
+            bool match;
+            if (automatic) {
+                match = pass == 0 ? strstr(device, "R3") != NULL
+                      : pass == 1 ? SDL_GetJoystickTypeForID(ids[i]) == SDL_JOYSTICK_TYPE_WHEEL
+                                  : strstr(device, "Wheel") != NULL;
+            } else {
+                match = pass == 0 ? !strcmp(device, name) : strstr(device, name) != NULL;
+            }
+            if (match) {
+                wheel = SDL_OpenJoystick(ids[i]);
+            }
+        }
+    }
+    SDL_free(ids);
+    return wheel;
+}
+
+ImPedalDirection im_cabinet_pedal_direction(const char *value)
+{
+    if (value && !strcmp(value, "0")) {
+        return IM_PEDAL_NORMAL;
+    }
+    return value && !strcmp(value, "1") ? IM_PEDAL_REVERSE : IM_PEDAL_AUTO;
+}
+
+uint16_t im_cabinet_pedal_value(int value, int rest, ImPedalDirection direction)
+{
+    if (direction == IM_PEDAL_NORMAL) {
+        return (uint16_t)(value - INT16_MIN);
+    }
+    if (direction == IM_PEDAL_REVERSE) {
+        return (uint16_t)(INT16_MAX - value);
+    }
+    /* In automatic mode the hardware position at startup is the released end. */
+    const int full = rest < 0 ? INT16_MAX : INT16_MIN;
+    const double travel = (double)(value - rest) / (full - rest);
+    return (uint16_t)(travel <= 0 ? 0 : travel >= 1 ? UINT16_MAX : travel * UINT16_MAX);
+}
+
+static void cabinet_binding(const Config *global, const Config *game, int input, SDL_Keycode *key, int *pad)
+{
+    const ImCabinetControl *control = &im_cabinet_controls[input];
+    const Config *legacy = cfg_bool(game, "map.custom", false) ? game : global;
+    if (input == IM_CAB_CARD) {
+        *key = control->key;
+        *pad = 0;                  /* the Xbox A slot previously had no cabinet function */
+    } else {
+        parse(legacy, 0, control->slot, key, pad);
+        char name[48];
+        map_key(0, control->slot, name, sizeof(name));
+        if (control->key && !cfg_get(legacy, name)) {
+            *key = control->key;
+        }
+    }
+    parse_value(cfg_get(game, control->binding), key, pad);
+}
+
+void im_cabinet_binding_name(const Config *global, const Config *game, int input, char *out, size_t n)
+{
+    SDL_Keycode key;
+    int pad;
+    cabinet_binding(global, game, input, &key, &pad);
+    binding_name(key, pad, out, n);
+}
+
+void im_cabinet_bind(Config *game, const Config *global, int input, SDL_Keycode key, int button, int signed_axis)
+{
+    SDL_Keycode current_key;
+    int current_pad;
+    cabinet_binding(global, game, input, &current_key, &current_pad);
+    if (key) {
+        current_key = key;
+    } else if (button >= 0) {
+        current_pad = B(button);
+    } else if (signed_axis) {
+        current_pad = AX(abs(signed_axis) - 1, signed_axis < 0);
+    } else {
+        current_key = SDLK_UNKNOWN;
+        current_pad = 0;
+    }
+    store_value(game, im_cabinet_controls[input].binding, current_key, current_pad);
+}
+
+void im_cabinet_reset(Config *game)
+{
+    for (int i = 0; i < IM_CAB_INPUTS; i++) {
+        cfg_unset(game, im_cabinet_controls[i].binding);
+    }
+}
+
+void im_resolve_cabinet(ImMap *m, const Config *global, const Config *game)
+{
+    im_resolve(m, global, game);
+    for (int i = 0; i < IM_CAB_INPUTS; i++) {
+        const int slot = im_cabinet_controls[i].slot;
+        cabinet_binding(global, game, i, &m->key[0][slot], &m->pad[0][slot]);
+    }
+    /* Steering is a single horizontal axis. */
+    for (int slot = IM_LUP; slot <= IM_LDOWN; slot++) {
+        m->key[0][slot] = SDLK_UNKNOWN;
+        m->pad[0][slot] = 0;
+    }
+    const Config *invert = cfg_get(game, "chihiro.steer.invert") ? game : global;
+    m->linvert = cfg_bool(invert, "chihiro.steer.invert", (m->linvert & 1) != 0) ? 1 : 0;
 }
 
 static int device_of(const Config *c, int player)

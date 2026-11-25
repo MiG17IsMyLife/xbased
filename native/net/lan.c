@@ -21,6 +21,7 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -41,12 +42,89 @@ typedef struct Station {
 static struct {
     int fd;
     struct sockaddr_in bcast;
+    struct sockaddr_in discovery_bcast;
     uint8_t own[6];                     /* the console's MAC (its frames' source) */
     bool own_known;
+    bool multicast;
     Station st[MACS];
     time_t hello;                       /* the last hello sent */
     uint64_t flooded, unicast, dropped_own;
 } g_lan = { .fd = -1 };
+
+static bool discovery_interface(const NcNetConfig *c, struct in_addr *local, uint32_t *broadcast)
+{
+    struct in_addr target;
+    uint32_t mask = UINT32_MAX;
+    if (c->lan_ip[0]) {
+        if (inet_pton(AF_INET, c->lan_ip, &target) != 1) {
+            return false;
+        }
+    } else {
+        char subnet[sizeof(c->lan_subnet)];
+        memcpy(subnet, c->lan_subnet, sizeof(subnet));
+        char *slash = strchr(subnet, '/');
+        if (!slash) {
+            return false;
+        }
+        *slash++ = '\0';
+        char *end;
+        long prefix = strtol(slash, &end, 10);
+        if (end == slash || *end || prefix < 1 || prefix > 32 ||
+            inet_pton(AF_INET, subnet, &target) != 1) {
+            return false;
+        }
+        mask = htonl(UINT32_MAX << (32 - prefix));
+    }
+
+    struct ifaddrs *list;
+    if (getifaddrs(&list) != 0) {
+        return false;
+    }
+    local->s_addr = 0;
+    for (const struct ifaddrs *i = list; i; i = i->ifa_next) {
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET) {
+            const struct sockaddr_in *addr = (const struct sockaddr_in *)i->ifa_addr;
+            if ((addr->sin_addr.s_addr & mask) == (target.s_addr & mask)) {
+                *local = addr->sin_addr;
+                const uint32_t adapter_mask = i->ifa_netmask && i->ifa_netmask->sa_family == AF_INET
+                    ? ((const struct sockaddr_in *)i->ifa_netmask)->sin_addr.s_addr : 0;
+                const uint32_t link_mask = c->lan_ip[0] ? adapter_mask : mask;
+                *broadcast = link_mask && link_mask != UINT32_MAX
+                    ? local->s_addr | ~link_mask : 0;
+                break;
+            }
+        }
+    }
+    freeifaddrs(list);
+    return local->s_addr != 0;
+}
+
+static bool lan_join_discovery(const NcNetConfig *c)
+{
+    struct ip_mreq membership;
+    uint32_t broadcast = 0;
+    inet_pton(AF_INET, "225.0.0.1", &membership.imr_multiaddr);
+    if (!discovery_interface(c, &membership.imr_interface, &broadcast)) {
+        nc_log("xbased-native-net", "lan: no IPv4 interface for link subnet '%s', local IP '%s'",
+               c->lan_subnet, c->lan_ip);
+        return false;
+    }
+    if (setsockopt(g_lan.fd, IPPROTO_IP, IP_MULTICAST_IF,
+                   (const void *)&membership.imr_interface, sizeof(membership.imr_interface)) != 0 ||
+        setsockopt(g_lan.fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   (const void *)&membership, sizeof(membership)) != 0) {
+        nc_log("xbased-native-net", "lan: multicast setup: %s", strerror(nc_net_errno()));
+        return false;
+    }
+    g_lan.bcast.sin_addr = membership.imr_multiaddr;
+    g_lan.discovery_bcast = g_lan.bcast;
+    g_lan.discovery_bcast.sin_addr.s_addr = broadcast;
+    g_lan.multicast = true;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &membership.imr_interface, ip, sizeof(ip));
+    nc_log("xbased-native-net", "lan: multicast 225.0.0.1:%u via %s", c->lan_port, ip);
+    return true;
+}
 
 static bool lan_init(void)
 {
@@ -71,6 +149,14 @@ static bool lan_init(void)
     }
     g_lan.bcast = (struct sockaddr_in){ .sin_family = AF_INET, .sin_port = htons(c->lan_port),
                                         .sin_addr.s_addr = c->lan_bcast ? c->lan_bcast : INADDR_BROADCAST };
+    if (c->lan_subnet[0] || c->lan_ip[0]) {
+        if (!lan_join_discovery(c)) {
+            nc_net_close(g_lan.fd);
+            g_lan.fd = -1;
+            return false;
+        }
+        return true;
+    }
     char b[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &g_lan.bcast.sin_addr, b, sizeof(b));
     nc_log("xbased-native-net", "lan: UDP port %u, broadcast to %s (/%d), %u peers named", c->lan_port, b,
@@ -112,12 +198,14 @@ static void to_peers(const uint8_t *frame, size_t len)
 
 static void flood(const uint8_t *frame, size_t len)
 {
-    send_to(&g_lan.bcast, frame, len);
+    if (!g_lan.multicast) {
+        send_to(&g_lan.bcast, frame, len);
+    }
     to_peers(frame, len);
     const time_t now = time(NULL);
     for (unsigned i = 0; i < MACS; i++) {
         const Station *s = &g_lan.st[i];
-        if (s->remote && s->seen && now - s->seen < MAC_TTL_S && !named(&s->at)) {
+        if ((g_lan.multicast || s->remote) && s->seen && now - s->seen < MAC_TTL_S && !named(&s->at)) {
             send_to(&s->at, frame, len);
         }
     }
@@ -131,6 +219,12 @@ static void hello(void)
     f[12] = HELLO_TYPE >> 8;
     f[13] = HELLO_TYPE & 0xff;
     memcpy(f + 14, "xbased hello", 12);
+    if (g_lan.multicast) {
+        send_to(&g_lan.bcast, f, sizeof(f));
+        if (g_lan.discovery_bcast.sin_addr.s_addr) {
+            send_to(&g_lan.discovery_bcast, f, sizeof(f));
+        }
+    }
     to_peers(f, sizeof(f));
     g_lan.hello = time(NULL);
 }
@@ -271,7 +365,8 @@ static void twin(const struct sockaddr_in *from)
 
 static void lan_poll(struct pollfd *fds, int n)
 {
-    if (nc_net_config()->npeers && time(NULL) - g_lan.hello >= HELLO_S && own(NULL)) {
+    const time_t interval = g_lan.multicast ? 1 : HELLO_S;
+    if ((g_lan.multicast || nc_net_config()->npeers) && time(NULL) - g_lan.hello >= interval && own(NULL)) {
         hello();
     }
     if (!(fds[0].revents & POLLIN)) {

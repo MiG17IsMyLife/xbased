@@ -9,6 +9,7 @@
  *           vblank (the other bits as an unclaimed port's)
  */
 #include "native/dev/dev.h"
+#include "native/dev/chihiro_board.h"
 
 #include <time.h>
 
@@ -21,6 +22,21 @@
 #define MCPX_GPIO_FIELD 0x80C0u
 #define FIELD_BIT       0x20u
 #define LOGGED_PORTS  64
+
+static bool g_chihiro;
+
+static bool chihiro_port(uint16_t port)
+{
+    return g_chihiro && port >= 0x4000 && port <= 0x40FF;
+}
+
+void nc_ports_set_chihiro(bool enabled)
+{
+    g_chihiro = enabled;
+    if (enabled) {
+        nc_chihiro_lpc_reset(2);    /* 512 MB DIMM */
+    }
+}
 
 static struct {
     uint16_t port;
@@ -59,6 +75,10 @@ static uint32_t acpi_timer(void)
 uint32_t nc_port_in(uint16_t port, unsigned bytes)
 {
     uint32_t v;
+    if (chihiro_port(port) && nc_chihiro_lpc_in(port, bytes, &v)) {
+        note(port, false, bytes, v);
+        return v;
+    }
     switch (port) {
     case ACPI_PM_TIMER:
         return acpi_timer();
@@ -76,4 +96,7 @@ uint32_t nc_port_in(uint16_t port, unsigned bytes)
 void nc_port_out(uint16_t port, unsigned bytes, uint32_t value)
 {
     note(port, true, bytes, value);
+    if (chihiro_port(port)) {
+        nc_chihiro_lpc_out(port, bytes, value);
+    }
 }

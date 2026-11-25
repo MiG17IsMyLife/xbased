@@ -575,6 +575,10 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
     next->fresh = false;
     pcr_enter(k, next);
     k->current = next;
+    if (next->wait_irql_set) {     /* ke.c wait_irql_save */
+        next->wait_irql_set = false;
+        *(uint8_t *)nc_vm_host(k->vm, k->kpcr_va + 0x24) = next->wait_irql;
+    }
     next->state = NC_T_RUNNING;
     next->run_seq = next->ready_seq;    /* its place, kept if it is switched out */
     next->ready_seq = 0;

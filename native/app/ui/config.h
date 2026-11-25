@@ -21,6 +21,8 @@ typedef struct Config {
 } Config;
 
 void cfg_load(Config *c, const char *path);
+/* Chihiro games inherit the old shared INI until they have their own. */
+void cfg_load_game(Config *c, const char *path, bool chihiro);
 bool cfg_save(const Config *c);
 /* The file written by something else (a text editor, a game) since this
  * process last read or wrote it. */

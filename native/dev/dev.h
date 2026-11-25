@@ -82,6 +82,7 @@ uint32_t nc_dev_nvnet_link_state(void);
 /* x86 I/O ports (IN/OUT); bytes is 1, 2 or 4. */
 uint32_t nc_port_in(uint16_t port, unsigned bytes);
 void nc_port_out(uint16_t port, unsigned bytes, uint32_t value);
+void nc_ports_set_chihiro(bool enabled);
 
 #ifdef __cplusplus
 }

@@ -41,6 +41,7 @@ static struct {
     bool running;
     pthread_mutex_t lock;               /* both rings */
     pthread_cond_t rx_cond;
+    void (*rx_notify)(void);
     Ring tx, rx;
     int wake_fd;                        /* eventfd: frames to send */
     uint8_t mac[6];                     /* the NIC's station address, 0: none yet */
@@ -139,6 +140,10 @@ bool nc_net_option(const char *arg)
             }
         }
         parse_ip(buf, &g_net.cfg.lan_bcast);
+    } else if (!strncmp(arg, "lansubnet=", 10)) {
+        snprintf(g_net.cfg.lan_subnet, sizeof(g_net.cfg.lan_subnet), "%s", arg + 10);
+    } else if (!strncmp(arg, "lanip=", 6)) {
+        snprintf(g_net.cfg.lan_ip, sizeof(g_net.cfg.lan_ip), "%s", arg + 6);
     } else if (!strncmp(arg, "lanpeers=", 9)) {
         parse_peers(arg + 9);
     } else if (!strncmp(arg, "kai=", 4)) {
@@ -264,12 +269,24 @@ bool nc_net_take_twin(char *addr, size_t len)
 
 void nc_net_deliver(const uint8_t *frame, size_t len)
 {
+    void (*notify)(void) = NULL;
     pthread_mutex_lock(&g_net.lock);
     pcap_frame(frame, len);
     if (ring_put(&g_net.rx, frame, len)) {
         g_net.received++;
         pthread_cond_signal(&g_net.rx_cond);
+        notify = g_net.rx_notify;
     }
+    pthread_mutex_unlock(&g_net.lock);
+    if (notify) {
+        notify();
+    }
+}
+
+void nc_net_set_rx_notify(void (*notify)(void))
+{
+    pthread_mutex_lock(&g_net.lock);
+    g_net.rx_notify = notify;
     pthread_mutex_unlock(&g_net.lock);
 }
 
@@ -367,7 +384,7 @@ static void *net_thread(void *arg)
     return NULL;
 }
 
-void nc_net_start(void)
+void nc_net_start(bool enabled)
 {
     /* nc_net_wait_rx's deadline is CLOCK_MONOTONIC's: the condition's clock too
      * (with CLOCK_REALTIME's it was long past, and the NIC's thread spun) */
@@ -377,13 +394,16 @@ void nc_net_start(void)
     pthread_cond_init(&g_net.rx_cond, &attr);
     pthread_condattr_destroy(&attr);
     /* debug: NC_NET="option option ..." over the app's (via debug.xbased.env) */
-    const char *env = getenv("NC_NET");
+    const char *env = enabled ? getenv("NC_NET") : NULL;
     if (env) {
         char buf[256];
         snprintf(buf, sizeof(buf), "%s", env);
         for (char *save = NULL, *t = strtok_r(buf, " ", &save); t; t = strtok_r(NULL, " ", &save)) {
             nc_net_option(t);
         }
+    }
+    if (!enabled) {
+        g_net.mode = NC_NET_OFF;
     }
     const NcNetBackend *be = g_net.mode == NC_NET_NAT   ? &nc_net_nat
                              : g_net.mode == NC_NET_LAN ? &nc_net_lan

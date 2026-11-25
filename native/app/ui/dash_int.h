@@ -26,7 +26,7 @@ typedef struct In {
     int pad_button;         /* the gamepad button pressed, -1 none */
     int mouse_button;       /* the mouse button pressed (SDL_BUTTON_*), 0 none (remapping) */
     int pad_axis;           /* an axis pushed past half: 1 + axis, negated for negative; 0 none */
-    const char *text;       /* text typed (text fields) */
+    char text[512];         /* text typed during this frame */
     bool repeat;            /* up/down/left/right came from a held key or stick repeating */
     bool menu;              /* in a game: the menu's own shortcut (Guide, F1), which closes it (#404) */
 } In;
@@ -34,7 +34,7 @@ typedef struct In {
 enum Screen {
     SCR_MAIN, SCR_GAMES, SCR_GAME, SCR_GAME_SETTINGS, SCR_MODS, SCR_STATES, SCR_SETTINGS, SCR_CONTROLS,
     SCR_REMAP, SCR_MEMORY, SCR_MEMORY_TITLE, SCR_ONLINE, SCR_ABOUT, SCR_INGAME, SCR_INGAME_SLOTS, SCR_STICKS,
-    SCR_TRIGGERS, SCR_BROWSE, SCR_FIND, SCR_COVER, SCR_COUNT
+    SCR_TRIGGERS, SCR_BROWSE, SCR_FIND, SCR_COVER, SCR_CABINET_WHEEL, SCR_CABINET_TUNING, SCR_COUNT
 };
 
 typedef struct Dash {
@@ -112,6 +112,8 @@ void list_begin(List *l, float x, float y, float w, float h, float row_h);
 /* A row: its label and value; true when chosen (A, Enter, a click). delta:
  * left/right on it (-1, +1), may be NULL. */
 bool list_row(List *l, const char *label, const char *value, int *delta);
+/* a greyed row whose value can't be changed; help shown when selected */
+void list_row_fixed(List *l, const char *label, const char *value, const char *help);
 /* a section's title over the rows after it, a row the selection steps over */
 void list_heading(List *l, const char *title);
 bool list_row_icon(List *l, UiTex *icon, const char *label, const char *sub, const char *value, int *delta);
@@ -126,6 +128,7 @@ bool list_selected(const List *l);   /* the last row is the selected one */
 enum { HELP_NOW, HELP_NEXT_START, HELP_ON_RESUME };
 void dash_help(const char *text, int when);
 void dash_help_draw(void);
+bool dash_chihiro_firmware(char *dir, size_t capacity);
 float dash_help_top(void);
 float dash_list_h(float y, float row_h);
 
@@ -149,6 +152,9 @@ float ease(float t);
 /* the screens */
 void scr_settings(void);
 void scr_controls(void);
+void scr_cabinet_wheel(void);
+void dash_wheel_capture_close(void);
+void scr_cabinet_tuning(void);
 void scr_remap(void);
 void scr_sticks(void);
 void scr_triggers(void);

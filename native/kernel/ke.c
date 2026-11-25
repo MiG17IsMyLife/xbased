@@ -479,8 +479,7 @@ static void boost(NcThread *t, int inc)
  * kept it: AMF Bowling 2004 suspends its cache copier while it waits on the
  * game's file lock, the copier got the lock as the main thread let it go,
  * and the main thread waited on it for ever at its first load. */
-/* Frame latency: flips so far (any thread), and a hold asked for (the
- * flips then, plus one; 0: none) */
+/* Flip count (any thread), and the vCPU's pending hold (flip count + 1). */
 static volatile uint32_t g_frame_flips, g_frame_req;
 #define FRAME_HOLD_MAX_NS 50000000ull
 
@@ -493,26 +492,26 @@ static uint64_t check_waits(NcKernel *k, int inc)
         if (t->state != NC_T_WAITING || t->suspend) {
             continue;
         }
-        int idx = satisfied(k, t, &t->wait);
+        const NcWait *wait = &t->wait;
+        const int idx = satisfied(k, t, wait);
         if (idx >= 0) {
-            take(k, t, &t->wait, idx);
+            take(k, t, wait, idx);
             nc_context_set_gpr(&t->ctx, NC_EAX, (uint32_t)idx);
             t->state = NC_T_READY;
             boost(t, inc);
-        } else if (t->wait.hold) {
-            /* a frame latency hold: until a flip, or its deadline; the
-             * thread was between two instructions, its registers stay */
-            if (__atomic_load_n(&g_frame_flips, __ATOMIC_ACQUIRE) != t->wait.flip_seq || now >= t->wait.deadline_ns) {
+        } else if (wait->hold) {
+            const bool flipped =
+                __atomic_load_n(&g_frame_flips, __ATOMIC_ACQUIRE) != wait->flip_seq;
+            if (flipped || now >= wait->deadline_ns) {
                 t->state = NC_T_READY;
-            } else if (!earliest || t->wait.deadline_ns < earliest) {
-                earliest = t->wait.deadline_ns;
             }
-        } else if (t->wait.deadline_ns && now >= t->wait.deadline_ns) {
+        } else if (wait->deadline_ns && now >= wait->deadline_ns) {
             /* A delay ends successfully; a wait times out. */
-            nc_context_set_gpr(&t->ctx, NC_EAX, t->wait.count ? NC_STATUS_TIMEOUT : NC_STATUS_SUCCESS);
+            nc_context_set_gpr(&t->ctx, NC_EAX, wait->count ? NC_STATUS_TIMEOUT : NC_STATUS_SUCCESS);
             t->state = NC_T_READY;
-        } else if (t->wait.deadline_ns && (!earliest || t->wait.deadline_ns < earliest)) {
-            earliest = t->wait.deadline_ns;
+        }
+        if (t->state == NC_T_WAITING && wait->deadline_ns && (!earliest || wait->deadline_ns < earliest)) {
+            earliest = wait->deadline_ns;
         }
     }
     k->wait_due_ns = earliest;
@@ -539,10 +538,7 @@ void nc_ke_frame_wait_request(NcKernel *k)
 
 static uint8_t *irql(NcKernel *k);
 
-/* The hold asked for: the running thread waits, if it is a thread's own
- * code at passive or APC level (not an ISR's or a DPC's, nor a thread that
- * holds a spin lock: the flip it waits for comes by the vblank's ISR and
- * DPC) and the flip hasn't come meanwhile. */
+/* A frame hold only blocks guest thread code at passive or APC level. */
 void nc_ke_frame_take(NcKernel *k)
 {
     const uint32_t req = __atomic_exchange_n(&g_frame_req, 0u, __ATOMIC_ACQ_REL);
@@ -617,10 +613,23 @@ static void poll_spin(NcKernel *k)
     s_last_ns = nc_ke_now_ns();
 }
 
+/* A thread may block at DISPATCH_LEVEL (its WaitIrql); the IRQL goes with
+ * it so other threads and DPCs run meanwhile (ps.c gives it back). The
+ * Chihiro's XPP waits this way for its USB transfer's DPC. */
+static void wait_irql_save(NcKernel *k, NcThread *t)
+{
+    if (t && t != k->isr_thread && t != k->dpc_thread && *irql(k) >= 2) {
+        t->wait_irql = *irql(k);
+        t->wait_irql_set = true;
+        *irql(k) = 0;
+    }
+}
+
 /* Waits on objects with an NT timeout (PLARGE_INTEGER in 100 ns: NULL forever,
  * negative relative, positive absolute system time, zero a poll). An
  * alertable wait runs the thread's queued APCs instead and returns
  * STATUS_USER_APC (apc.c). */
+
 static uint32_t wait(NcKernel *k, const uint32_t *objs, unsigned count, bool wait_all, uint32_t timeout_va,
                      uint32_t cs, bool alertable)
 {
@@ -649,6 +658,7 @@ static uint32_t wait(NcKernel *k, const uint32_t *objs, unsigned count, bool wai
         if (!count) {
             t->wait = w;
             t->state = NC_T_WAITING;
+            wait_irql_save(k, t);
             k->resched = true;
             return NC_STATUS_SUCCESS;
         }
@@ -670,6 +680,7 @@ static uint32_t wait(NcKernel *k, const uint32_t *objs, unsigned count, bool wai
     }
     t->wait = w;
     t->state = NC_T_WAITING;
+    wait_irql_save(k, t);
     k->resched = true;
     return NC_STATUS_TIMEOUT; /* replaced when the wait ends */
 }

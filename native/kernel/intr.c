@@ -26,6 +26,8 @@
 #define KI_LEVEL     0x08
 #define KI_IRQL      0x0C
 #define KI_CONNECTED 0x10
+#define KI_MODE      0x12      /* KINTERRUPT_MODE: 0 LevelSensitive, 1 Latched */
+#define KI_LATCHED   1
 
 #define PCR_IRQL      0x24
 #define ISR_STACK     0x4000u
@@ -56,7 +58,7 @@ static uint64_t KeInitializeInterrupt(NcKernel *k, NcFrame *f, const uint32_t *a
     uint8_t *i = nc_vm_host(k->vm, a[0]);
     i[KI_CONNECTED] = 0;
     i[0x11] = (uint8_t)a[6];
-    i[0x12] = (uint8_t)a[5];
+    i[KI_MODE] = (uint8_t)a[5];
     return 0;
 }
 
@@ -71,8 +73,9 @@ static uint64_t KeConnectInterrupt(NcKernel *k, NcFrame *f, const uint32_t *a)
     i[KI_CONNECTED] = 1;
     k->irq_obj[level] = a[0];
     nc_irq_enable(level, true);
-    nc_log("xbased-native", "ke: interrupt connected: level %u, irql %u, routine %08x", level,
-           nc_vm_rd32(k->vm, a[0] + KI_IRQL), nc_vm_rd32(k->vm, a[0] + KI_ROUTINE));
+    nc_log("xbased-native", "ke: interrupt connected: level %u, irql %u, routine %08x%s", level,
+           nc_vm_rd32(k->vm, a[0] + KI_IRQL), nc_vm_rd32(k->vm, a[0] + KI_ROUTINE),
+           i[KI_MODE] == KI_LATCHED ? ", latched" : "");
     return 1;
 }
 
@@ -202,10 +205,22 @@ bool nc_intr_dispatch(NcKernel *k, bool cpu_enabled)
         if (!obj) {
             continue; /* nothing connected: the line stays asserted, unserved */
         }
+        /* A latched interrupt fires once per rise of its line, a level one
+         * while the line is up (the Chihiro's IRQ 10 stays up until the
+         * game's DPC runs). */
+        static uint64_t served_rise[NC_IRQ_LINES];
+        const bool latched = ((const uint8_t *)nc_vm_host(k->vm, obj))[KI_MODE] == KI_LATCHED;
+        const uint64_t rise = nc_irq_rise_ns(level);
+        if (latched && rise == served_rise[level]) {
+            continue;
+        }
         const uint8_t level_irql = (uint8_t)nc_vm_rd32(k->vm, obj + KI_IRQL);
         if (level_irql <= *irql(k)) {
             hold_note(k, 1u << level, HOLD_IRQL);
             continue;
+        }
+        if (latched) {
+            served_rise[level] = rise;
         }
         hold_report(level);
         g_isr_line = (uint8_t)level;

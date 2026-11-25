@@ -13,6 +13,8 @@
  * caller's thread, a completion port's packet to its port.
  */
 #include "native/kernel/kernel.h"
+#include "native/core/chihiro_boot.h"
+#include "native/dev/chihiro_board.h"
 #include "native/core/irq.h"
 #include "native/core/xdvdfs.h"
 
@@ -389,12 +391,35 @@ typedef struct IoDevicePath {
     const char *relative;  /* inside the device, empty for its root */
 } IoDevicePath;
 
+static bool g_chihiro_media;
+
+/* Chihiro mbcom:, opened raw: 0x8000 sectors kept in <hdd>/chihiro-mbcom.bin,
+ * then the network board's 1 MB window. */
+#define IO_MBCOM_PART  9
+#define IO_MBCOM_BYTES (0x8000u * 512u)
+#define IO_MBCOM_NET   (0x8000ull * 512u)   /* the network board's window */
+static const char k_mbcom_dev[] = "\\Device\\MediaBoard\\Partition1";
+
+/* path past prefix when it names that device or a file in it, else NULL */
+static const char *under(const char *path, const char *prefix, size_t len)
+{
+    return prefix_ci(path, prefix) && (!path[len] || path[len] == '\\') ? path + len : NULL;
+}
+
 static IoDevicePath device_path(const char *path)
 {
     static const char cd[] = "\\Device\\CdRom0";
+    static const char mbfs[] = NC_CHIHIRO_MBFS;
     static const char hd[] = "\\Device\\Harddisk0\\Partition";
     if (prefix_ci(path, cd) && (!path[sizeof(cd) - 1] || path[sizeof(cd) - 1] == '\\')) {
         return (IoDevicePath){.kind = IO_DEVICE_DISC, .relative = path + sizeof(cd) - 1};
+    }
+    const char *rel;
+    if (g_chihiro_media && (rel = under(path, mbfs, sizeof(mbfs) - 1))) {
+        return (IoDevicePath){.kind = IO_DEVICE_DISC, .relative = rel};
+    }
+    if (g_chihiro_media && (rel = under(path, k_mbcom_dev, sizeof(k_mbcom_dev) - 1))) {
+        return (IoDevicePath){.kind = IO_DEVICE_RAW_DISK, .partition = IO_MBCOM_PART, .relative = rel};
     }
     if (prefix_ci(path, hd) && isdigit((unsigned char)path[sizeof(hd) - 1])) {
         const char *digit = path + sizeof(hd) - 1;
@@ -426,6 +451,32 @@ bool nc_io_host_file(const char *xbox_path, char *out, size_t n)
 void nc_io_set_launch_dir(const char *dir)
 {
     link_set("\\??\\D:", dir);
+}
+
+static char g_chihiro_boot[128], g_chihiro_test[128];
+
+void nc_io_mount_chihiro_media(const char *executable, const char *test_executable)
+{
+    g_chihiro_media = true;
+    snprintf(g_chihiro_boot, sizeof(g_chihiro_boot), "%s\\%s", NC_CHIHIRO_MBFS, executable);
+    g_chihiro_test[0] = 0;
+    if (test_executable && *test_executable) {
+        snprintf(g_chihiro_test, sizeof(g_chihiro_test), "%s\\%s", NC_CHIHIRO_MBFS, test_executable);
+    }
+    link_set("\\??\\mbfs:", NC_CHIHIRO_MBFS);
+    link_set("\\??\\mbcom:", k_mbcom_dev);
+    link_set("\\??\\D:", NC_CHIHIRO_MBFS);
+}
+
+const char *nc_io_chihiro_boot(bool test)
+{
+    return !g_chihiro_media ? NULL : test && g_chihiro_test[0] ? g_chihiro_test : g_chihiro_boot;
+}
+
+const char *nc_io_disc_relative(const char *path)
+{
+    const IoDevicePath dev = device_path(path);
+    return dev.kind == IO_DEVICE_DISC ? dev.relative : NULL;
 }
 
 static bool mkdirs(const char *path)
@@ -1042,6 +1093,10 @@ void nc_io_title_device_time(uint32_t title_id, const char *name)
  * divided by its voice count, the emulator gone at the first logo). */
 static uint32_t device_us(const NcFile *nf, uint32_t n)
 {
+    /* Chihiro media is already in DIMM RAM */
+    if (nf->kind == F_DISC && g_chihiro_media) {
+        return 0;
+    }
     const struct DevRate *r = nf->kind == F_DISC ? &g_dev_disc : &g_dev_hdd;
     return r->req_us + (r->kbps ? (uint32_t)((uint64_t)n * 1000 / r->kbps) : 0);
 }
@@ -1647,6 +1702,33 @@ typedef struct FileOpenOptions {
     uint32_t flags;
 } FileOpenOptions;
 
+/* True the first time a missing disc path is seen. Maximum Tune 2 probes
+ * ~1000 missing textures at once while streaming; logging each froze it. */
+static bool first_miss(const char *path)
+{
+    enum { MISS_SLOTS = 8192 };
+    static uint64_t seen[MISS_SLOTS];
+    static unsigned nseen;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *c = path; *c; c++) {
+        h = (h ^ (uint8_t)tolower((unsigned char)*c)) * 1099511628211ull;
+    }
+    h |= 1;                                     /* 0 marks an empty slot */
+    if (nseen >= MISS_SLOTS / 2) {
+        return false;
+    }
+    for (unsigned i = (unsigned)(h % MISS_SLOTS);; i = (i + 1) % MISS_SLOTS) {
+        if (seen[i] == h) {
+            return false;
+        }
+        if (!seen[i]) {
+            seen[i] = h;
+            nseen++;
+            return true;
+        }
+    }
+}
+
 static uint32_t open_disc_file(NcKernel *k, const char *path, const char *rel,
                                const FileOpenOptions *request, NcFile **file)
 {
@@ -1660,7 +1742,10 @@ static uint32_t open_disc_file(NcKernel *k, const char *path, const char *rel,
     char alt[512];
     if (!nc_disc_find(k->disc, rel, &df)) {
         if (!lang_fallback(k->disc, rel, alt, sizeof(alt), &df)) {
-            nc_log("xbased-native-io", "open %s: not on the disc", path);
+            if (g_trace_io || first_miss(path)) {
+                nc_log("xbased-native-io", "open %s: not on the disc%s", path,
+                       g_trace_io ? "" : " (once: again not logged)");
+            }
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
         nc_log("xbased-native-io", "open %s: not on the disc, its English one instead (%s)", path, alt);
@@ -1838,7 +1923,7 @@ static uint32_t do_open(NcKernel *k, uint32_t attrs, const FileOpenOptions *requ
             return NC_STATUS_INSUFFICIENT_RESOURCES;
         }
         nf->kind = F_VOLUME;
-        nf->partition = 0;
+        nf->partition = dev.partition;      /* 0, or IO_MBCOM_PART */
         *info = 1;
     } else {
         status = open_host_file(dev.partition, path, dev.relative, request, &nf, info);
@@ -1920,7 +2005,16 @@ static uint64_t file_size(const NcFile *nf)
 
 static void raw_io(int part, uint64_t off, uint8_t *buf, uint32_t len, bool write)
 {
-    const uint32_t n = off < RAW_KEEP ? (uint32_t)(RAW_KEEP - off < len ? RAW_KEEP - off : len) : 0;
+    if (part == IO_MBCOM_PART && off >= IO_MBCOM_NET && off - IO_MBCOM_NET < 0x100000u &&
+        nc_chihiro_net_window((uint32_t)(off - IO_MBCOM_NET), buf, len, write)) {
+        return;
+    }
+    const uint64_t keep = part == IO_MBCOM_PART ? IO_MBCOM_BYTES : RAW_KEEP;
+    const uint32_t n = off < keep ? (uint32_t)(keep - off < len ? keep - off : len) : 0;
+    if (part == IO_MBCOM_PART && g_trace_io) {
+        nc_log("xbased-native-io", "mbcom %s +%llx (sector %llx) %u", write ? "write" : "read",
+               (unsigned long long)off, (unsigned long long)(off / 512), len);
+    }
     if (!write) {
         memset(buf, 0, len);
     }
@@ -1928,7 +2022,11 @@ static void raw_io(int part, uint64_t off, uint8_t *buf, uint32_t len, bool writ
         return;
     }
     char p[320];
-    snprintf(p, sizeof(p), "%s/raw-partition%d.bin", g_hdd_root, part);
+    if (part == IO_MBCOM_PART) {
+        snprintf(p, sizeof(p), "%s/chihiro-mbcom.bin", g_hdd_root);
+    } else {
+        snprintf(p, sizeof(p), "%s/raw-partition%d.bin", g_hdd_root, part);
+    }
     const int fd = open(p, write ? O_RDWR | O_CREAT | O_CLOEXEC : O_RDONLY | O_CLOEXEC, 0664);
     if (fd < 0) {
         return;
@@ -2146,7 +2244,7 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         return NC_STATUS_INVALID_HANDLE;
     }
     const uint32_t va0 = nrun ? run[0].va : 0;
-    const int raw = nf->kind == F_VOLUME && nf->partition == 0 ? 0
+    const int raw = nf->kind == F_VOLUME && (nf->partition == 0 || nf->partition == IO_MBCOM_PART) ? nf->partition
                   : nf->kind == F_HOST && nf->is_dir ? partition_root(nf) : -1;
     if (raw == 0 || raw >= 3) {
         /* The raw disk's config sectors, or a cache partition read raw. */
@@ -2376,9 +2474,9 @@ static uint64_t write_data(NcKernel *k, const uint32_t *a, const uint8_t *src, u
         return NC_STATUS_INVALID_HANDLE;
     }
     if (nf->kind == F_VOLUME) {
-        if (nf->partition == 0) {
+        if (nf->partition == 0 || nf->partition == IO_MBCOM_PART) {
             const uint64_t off = io_offset(k, nf, a[7]);
-            raw_io(0, off, (uint8_t *)src, len, true);
+            raw_io(nf->partition, off, (uint8_t *)src, len, true);
             io_moved(k, nf, a[7], off + len);
             if (g_trace_io) {
                 nc_log("xbased-native-io", "write %s raw +%llx %u", nf->path, (unsigned long long)off, len);
@@ -3615,6 +3713,7 @@ static uint64_t ObReferenceObjectByName(NcKernel *k, NcFrame *f, const uint32_t 
 void nc_io_register(NcKernel *k)
 {
     g_trace_io = getenv("NC_TRACE_IO") != NULL;
+    g_chihiro_media = false;
     link_set("\\??\\D:", "\\Device\\CdRom0");
     link_set("\\??\\CdRom0:", "\\Device\\CdRom0");     /* the kernel's own, as on the Xbox (the dashboard's) */
     nc_kernel_impl(k, "ExReadWriteRefurbInfo", ExReadWriteRefurbInfo);

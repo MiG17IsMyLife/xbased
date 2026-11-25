@@ -9,8 +9,10 @@
 #include "native/app/ui/input_map.h"
 #include "native/app/mod_fit.h"
 #include "native/app/mod_jmp.h"
+#include "native/app/wheel_ffb.h"
 #include "native/app/win_mods.h"
 #include "native/core/xcheat.h"
+#include "native/dev/chihiro_board.h"
 /* (a state's JPEG thumbnail, load_thumb) */
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
@@ -235,8 +237,142 @@ static const char *video_mode_name(void)
 }
 
 
-/* the sticks' inverted axes (#324): a camera on the right stick that turns
- * the other way than the player is used to; the game's own or the global */
+static bool cur_chihiro(void)
+{
+    return D.cur && D.cur->g.chihiro;
+}
+
+static void fixed_row(List *l, enum UiStr label, enum UiStr value)
+{
+    list_row_fixed(l, T(label), T(value), T(S_H_CH_FIXED));
+}
+
+static void text_field(List *l, enum UiStr label, const char *key, const char *def);
+
+bool dash_chihiro_firmware(char *dir, size_t capacity)
+{
+    const char *data = getenv("NC_CHIHIRO_DIR");
+    if (!data) {
+        data = cfg_get(&D.game, "chihiro.data");
+        if (!data) data = cfg_get(&D.global, "chihiro.data");
+        if (!data) data = cfg_get(&D.game, "chihiro.bios");
+        if (!data) data = cfg_get(&D.global, "chihiro.bios");
+    }
+    char fallback[1100];
+    if (!data) {
+        snprintf(fallback, sizeof(fallback), "%schihiro", cfg_data_dir());
+        data = fallback;
+    } else if (!*data) {
+        data = "chihiro";
+    }
+    if (dir) {
+        snprintf(dir, capacity, "%s", data);
+    }
+    char firmware[1200];
+    return nc_chihiro_link_firmware(data, firmware, sizeof(firmware));
+}
+
+static void link_rows(List *l)
+{
+    list_heading(l, T(S_CH_LINK));
+    char dir[1100];
+    static char help[1600];
+    const bool firmware_available = dash_chihiro_firmware(dir, sizeof(dir));
+    snprintf(help, sizeof(help), T(S_H_CH_FIRMWARE), dir);
+    list_row_fixed(l, T(S_CH_FIRMWARE), T(firmware_available ? S_CH_FOUND : S_CH_MISSING), help);
+    if (!firmware_available) {
+        return;
+    }
+    static const char *const lv[] = {"off", "1", "2", "3", "4"};
+    const char *ln[] = {T(S_OFF), "1", "2", "3", "4"};
+    opt_choice(l, S_CH_CABINET, "chihiro.link", lv, ln, 5, "off");
+    const char *link = cfg_get(&D.game, "chihiro.link");
+    if (!link) {
+        link = cfg_get(&D.global, "chihiro.link");
+    }
+    if (!link || !strcmp(link, "off")) {
+        return;
+    }
+    text_field(l, S_CH_LINK_SUBNET, "chihiro.link_subnet", "");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_LINK_SUBNET), HELP_NEXT_START);
+    }
+    text_field(l, S_CH_LINK_IP, "chihiro.link_ip", "");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_LINK_IP), HELP_NEXT_START);
+    }
+    text_field(l, S_CH_PEERS, "chihiro.peers", "");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_PEERS), HELP_NEXT_START);
+    }
+}
+
+/* Chihiro: the region the baseboard's EEPROM holds (1 Japan, 2 USA, 3 Export) */
+static void region_row(List *l)
+{
+    static const char *const rv[] = {"1", "2", "3"};
+    const char *rn[] = {T(S_CH_JAPAN), T(S_CH_USA), T(S_CH_EXPORT)};
+    opt_choice(l, S_CH_REGION, "chihiro.region", rv, rn, 3, "1");
+}
+
+static void segaboot_choice(List *l, enum UiStr label, const char *key,
+                            const char *const *values, const char *const *names, int count)
+{
+    opt_choice(l, label, key, values, names, count, "0");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_COIN_SETTING), HELP_NEXT_START);
+    }
+}
+
+static void segaboot_rows(List *l)
+{
+    list_heading(l, T(S_CH_SEGABOOT));
+    region_row(l);
+    static const char *const values[] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
+    const char *const rates[] = {
+        T(S_CH_BOARD_VALUE), "1 : 1", "2 : 1", "3 : 1", "4 : 1", "5 : 1",
+        "1 : 2", "1 : 3", "1 : 4", "1 : 5", T(S_CH_FREE_PLAY),
+    };
+    segaboot_choice(l, S_CH_COIN_RATE, "chihiro.coin_rate", values, rates, SDL_arraysize(rates));
+
+    const char *const costs[] = {T(S_CH_BOARD_VALUE), "1", "2", "3", "4", "5", "6", "7", "8", "9"};
+    static const struct {
+        enum UiStr label;
+        const char *key;
+    } rows[] = {
+        {S_CH_COST_START, "chihiro.cost.start"},
+        {S_CH_COST_CONTINUE, "chihiro.cost.continue"},
+        {S_CH_COST_NEW_CARD, "chihiro.cost.new_card"},
+        {S_CH_COST_RENEW_CARD, "chihiro.cost.renew_card"},
+        {S_CH_COST_TRANSFER_CARD, "chihiro.cost.transfer_card"},
+        {S_CH_COST_FULL_COURSE, "chihiro.cost.full_course"},
+    };
+    for (unsigned i = 0; i < SDL_arraysize(rows); i++) {
+        segaboot_choice(l, rows[i].label, rows[i].key, values, costs, SDL_arraysize(costs));
+    }
+}
+
+static void card_row(List *l)
+{
+    int slot = nc_chihiro_card_selected();
+    char filename[24];
+    snprintf(filename, sizeof(filename), "card%03d.bin", slot);
+    int delta = 0;
+    if (list_row(l, T(S_CH_CARD_SELECT), slot ? filename : T(S_CH_CARD_LATEST), &delta)) {
+        delta = 1;
+    }
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_CARD), HELP_NOW);
+    }
+    if (delta) {
+        slot = nc_chihiro_card_step(slot, delta);
+        char value[8];
+        snprintf(value, sizeof(value), "%d", slot);
+        cfg_set(&D.game, "chihiro.card", value);
+        nc_chihiro_card_select(slot);
+    }
+}
+
 static void invert_rows(List *l)
 {
     static const char *const iv[] = {"off", "y", "x", "xy"};
@@ -584,6 +720,20 @@ void scr_game_settings(void)
     List l;
     list_begin(&l, 74, 150, W - 148, dash_list_h(150, 58), 58);    /* above the help (dash_help) */
     (void)H;
+    const bool chihiro = cur_chihiro();
+    if (chihiro) {
+        if (nc_chihiro_board_active()) {
+            card_row(&l);
+        }
+        link_rows(&l);
+        segaboot_rows(&l);
+#if defined(__x86_64__)
+        opt_bool(&l, S_CH_REAL_HW_SPEED, "chihiro.real_hw_speed", false, false);
+        if (list_selected(&l)) {
+            dash_help(T(S_H_CH_REAL_HW_SPEED), HELP_NEXT_START);
+        }
+#endif
+    }
     list_heading(&l, T(S_VIDEO));
     rows_video(&l);
     opt_bool(&l, S_SHOW_FPS, "showfps", false, false);
@@ -598,7 +748,9 @@ void scr_game_settings(void)
     /* the sound: a game mixed louder or quieter than the others has its own
      * volume (#336) */
     list_heading(&l, T(S_AUDIO));
-    {
+    if (chihiro) {
+        fixed_row(&l, S_AUDIO_OUTPUT, S_CH_STEREO);
+    } else {
         static const char *av[] = {"stereo", "5.1"};
         const char *an[] = {T(S_STEREO), T(S_SURROUND51)};
         opt_choice(&l, S_AUDIO_OUTPUT, "audio", av, an, 2, "stereo");
@@ -607,11 +759,19 @@ void scr_game_settings(void)
     opt_bool(&l, S_HRTF, "hrtf", true, false);
     opt_bool(&l, S_MUTE_BG, "mutebg", true, false);
     list_heading(&l, T(S_SYSTEM));
-    rows_language(&l);
-    opt_videoflag(&l, S_WIDESCREEN, 0x10000);
-    rows_pal(&l);
-    rows_ram(&l);
-    if (!nc_io_title_device_mode(D.cur->g.title_id, D.cur->g.title)) {
+    if (chihiro) {
+        fixed_row(&l, S_CONSOLE_LANG, S_CH_LANG);
+        fixed_row(&l, S_WIDESCREEN, S_CH_WIDE);
+        list_row_fixed(&l, T(S_PAL_GAMES), "60 Hz", T(S_H_CH_FIXED));
+        fixed_row(&l, S_RAM_SIZE, S_CH_RAM);
+        fixed_row(&l, S_DISC_SPEED, S_CH_DISC);
+    } else {
+        rows_language(&l);
+        opt_videoflag(&l, S_WIDESCREEN, 0x10000);
+        rows_pal(&l);
+        rows_ram(&l);
+    }
+    if (!chihiro && !nc_io_title_device_mode(D.cur->g.title_id, D.cur->g.title)) {
         /* the disc's speed (devtime=): the console drive's, or as fast as
          * the PC reads; a title that needs the drive's own always has it,
          * and no choice (native/kernel/io.c) */
@@ -624,7 +784,11 @@ void scr_game_settings(void)
         const char *sn[] = {T(S_SHADERS_HYBRID), T(S_SHADERS_ASYNC), T(S_SHADERS_SYNC)};
         opt_choice(&l, S_SHADERS_MODE, "shaders", sv, sn, 3, "hybrid");
     }
-    cache_rows(&l);
+    if (chihiro) {
+        fixed_row(&l, S_CACHE_CLEAR, S_CH_NONE);
+    } else {
+        cache_rows(&l);
+    }
     if (list_row(&l, T(S_RESET_GAME), NULL, NULL)) {
         dash_ask(T(S_RESET_GAME), reset_game);
     }
@@ -1319,8 +1483,250 @@ void scr_states(void)
 
 /* ------------------------------------------------------------ controls */
 
+static void cabinet_controls(void)
+{
+    draw_header(T(S_CH_CONTROLS), D.cur->g.title);
+    List l;
+    list_begin(&l, 74, 150, ui_w() - 148, ui_h() - 244, 52);
+    if (list_row(&l, T(S_CH_WHEEL), NULL, NULL)) {
+        dash_push(SCR_CABINET_WHEEL);
+    }
+    if (list_row(&l, T(S_CH_TUNING), NULL, NULL)) {
+        dash_push(SCR_CABINET_TUNING);
+    }
+    for (int input = 0; input < IM_CAB_INPUTS; input++) {
+        char value[96];
+        im_cabinet_binding_name(&D.global, &D.game, input, value, sizeof(value));
+        if (list_row(&l, T(im_cabinet_controls[input].label), value, NULL)) {
+            D.remap_target = input;
+            D.remap_since = ui_time();
+            dash_push(SCR_REMAP);
+        }
+        if (list_selected(&l) && D.in.x) {
+            im_cabinet_bind(&D.game, &D.global, input, SDLK_UNKNOWN, -1, 0);
+        }
+    }
+    if (list_row(&l, T(S_RESET_DEFAULTS), NULL, NULL)) {
+        im_cabinet_reset(&D.game);
+    }
+    list_end(&l);
+    if (D.in.back) {
+        dash_pop();
+    }
+    draw_hints(T(S_REMAP), T(S_BACK), T(S_DELETE), NULL);
+}
+
+void scr_cabinet_tuning(void)
+{
+    draw_header(T(S_CH_TUNING), D.cur->g.title);
+    List l;
+    list_begin(&l, 74, 150, ui_w() - 148, ui_h() - 244, 52);
+    opt_int(&l, S_CH_STEER_DZ, "deadzone", 0, 50, 5, 10, "%");
+    opt_int(&l, S_CH_STEER_ANTIDZ, "stick.antidz", 0, 50, 5, 0, "%");
+    opt_int(&l, S_CH_STEER_RANGE, "stick.range", 50, 150, 5, 100, "%");
+    const char *invert = cfg_get(&D.game, "stick.linvert");
+    if (!invert) {
+        invert = cfg_get(&D.global, "stick.linvert");
+    }
+    opt_bool(&l, S_CH_STEER_INVERT, "chihiro.steer.invert", invert && strchr(invert, 'x'), false);
+    opt_int(&l, S_CH_PEDAL_DZ, "trigger.deadzone", 0, 50, 2, 10, "%");
+    opt_int(&l, S_CH_PEDAL_FULL, "trigger.full", 50, 100, 5, 100, "%");
+    list_end(&l);
+    if (D.in.back) {
+        dash_save_cfg();
+        dash_pop();
+    }
+    draw_hints(T(S_CHANGE), T(S_BACK), NULL, NULL);
+}
+
+static struct {
+    SDL_Joystick *wheel;
+    char option[48], label[96];
+    bool axis, ready;
+    int axes, buttons;
+    int16_t rest[IM_CAB_WHEEL_MAX_AXES];
+    bool down[IM_CAB_WHEEL_MAX_BUTTONS];
+} g_wheel_capture;
+
+void dash_wheel_capture_close(void)
+{
+    if (g_wheel_capture.wheel) {
+        SDL_CloseJoystick(g_wheel_capture.wheel);
+    }
+    g_wheel_capture.wheel = NULL;
+    g_wheel_capture.option[0] = 0;
+}
+
+static void wheel_capture_begin(const char *option, const char *label, bool axis)
+{
+    const char *device = cfg_get(&D.game, "chihiro.wheel");
+    if (!device) {
+        device = cfg_get(&D.global, "chihiro.wheel");
+    }
+    if (!strncmp(option, "chihiro.wheel.gear", sizeof("chihiro.wheel.gear") - 1)) {
+        const char *shifter = cfg_get(&D.game, "chihiro.shifter");
+        if (!shifter) {
+            shifter = cfg_get(&D.global, "chihiro.shifter");
+        }
+        if (shifter && *shifter) {
+            device = shifter;
+        }
+    }
+    g_wheel_capture.axis = axis;
+    g_wheel_capture.ready = false;
+    snprintf(g_wheel_capture.option, sizeof(g_wheel_capture.option), "%s", option);
+    snprintf(g_wheel_capture.label, sizeof(g_wheel_capture.label), "%s", label);
+    SDL_Joystick *wheel = g_wheel_capture.wheel = im_cabinet_open_wheel(device);
+    if (wheel) {
+        g_wheel_capture.axes = SDL_min(SDL_GetNumJoystickAxes(wheel), IM_CAB_WHEEL_MAX_AXES);
+        g_wheel_capture.buttons = SDL_min(SDL_GetNumJoystickButtons(wheel), IM_CAB_WHEEL_MAX_BUTTONS);
+    }
+    D.remap_since = ui_time();
+    dash_push(SCR_REMAP);
+}
+
+static bool wheel_capture_input(void)
+{
+    SDL_Joystick *wheel = g_wheel_capture.wheel;
+    if (!wheel || !SDL_JoystickConnected(wheel)) {
+        return false;
+    }
+    if (!g_wheel_capture.ready) {
+        /* Discard input from the press that opened this screen. */
+        for (int i = 0; i < g_wheel_capture.axes; i++) {
+            g_wheel_capture.rest[i] = SDL_GetJoystickAxis(wheel, i);
+        }
+        for (int i = 0; i < g_wheel_capture.buttons; i++) {
+            g_wheel_capture.down[i] = SDL_GetJoystickButton(wheel, i);
+        }
+        g_wheel_capture.ready = true;
+        return false;
+    }
+    if (g_wheel_capture.axis) {
+        int axis = -1, largest = 11999;
+        for (int i = 0; i < g_wheel_capture.axes; i++) {
+            const int distance = abs(SDL_GetJoystickAxis(wheel, i) - g_wheel_capture.rest[i]);
+            if (distance > largest) {
+                largest = distance;
+                axis = i;
+            }
+        }
+        if (axis >= 0) {
+            cfg_set_int(&D.game, g_wheel_capture.option, axis);
+            return true;
+        }
+    } else {
+        for (int i = 0; i < g_wheel_capture.buttons; i++) {
+            const bool was_down = g_wheel_capture.down[i];
+            g_wheel_capture.down[i] = SDL_GetJoystickButton(wheel, i);
+            if (!was_down && g_wheel_capture.down[i]) {
+                cfg_set_int(&D.game, g_wheel_capture.option, i + 1);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void wheel_binding_row(List *l, const char *label, const char *option, int def, bool axis)
+{
+    const int binding = cfg_int(&D.game, option, cfg_int(&D.global, option, def));
+    char value[64];
+    snprintf(value, sizeof(value), T(axis ? S_CH_AXIS_NUMBER : S_CH_BUTTON_NUMBER), binding);
+    if (list_row(l, label, binding < (axis ? 0 : 1) ? T(S_NONE) : value, NULL)) {
+        wheel_capture_begin(option, label, axis);
+    }
+    if (list_selected(l) && D.in.x) {
+        cfg_set_int(&D.game, option, axis ? -1 : 0);
+    }
+}
+
+static void wheel_device_row(List *l, bool shifter)
+{
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+    const char *values[34] = {shifter ? "" : "auto", "off"};
+    const char *labels[34] = {T(shifter ? S_CH_WHEEL : S_AUTO), T(S_OFF)};
+    int n = shifter ? 1 : 2;
+    for (int i = 0; ids && i < count && n < (int)SDL_arraysize(values); i++) {
+        const char *name = SDL_GetJoystickNameForID(ids[i]);
+        if (name && *name) {
+            values[n] = labels[n] = name;
+            n++;
+        }
+    }
+    opt_choice(l, shifter ? S_CH_SHIFTER_DEVICE : S_DEVICE,
+               shifter ? "chihiro.shifter" : "chihiro.wheel", values, labels, n, values[0]);
+    SDL_free(ids);
+}
+
+void scr_cabinet_wheel(void)
+{
+    draw_header(T(S_CH_WHEEL), D.cur->g.title);
+    List l;
+    list_begin(&l, 74, 150, ui_w() - 148, ui_h() - 244, 52);
+    wheel_device_row(&l, false);
+    opt_bool(&l, S_CH_FFB, "chihiro.ffb", false, false);
+    if (list_selected(&l)) {
+        dash_help(T(S_H_CH_FFB), HELP_NEXT_START);
+    }
+    opt_int(&l, S_CH_FFB_STRENGTH, "chihiro.ffb.strength", 0, 100, 5, NC_WHEEL_FFB_STRENGTH_DEFAULT, "%");
+    bool slider = list_selected(&l);
+    opt_int(&l, S_CH_FFB_DEADBAND, "chihiro.ffb.deadband", 0, 100, 1, NC_WHEEL_FFB_DEADBAND_DEFAULT, "%");
+    slider |= list_selected(&l);
+    opt_bool(&l, S_CH_FFB_INVERT, "chihiro.ffb.invert", false, false);
+    bool binding = false;
+    list_heading(&l, T(S_CH_WHEEL_AXES));
+    for (int i = 0; i < IM_CAB_WHEEL_AXES; i++) {
+        const ImCabinetAxis *axis = &im_cabinet_axes[i];
+        wheel_binding_row(&l, T(axis->label), axis->option, axis->default_axis, true);
+        binding |= list_selected(&l);
+        if (axis->invert_option) {
+            static const char *const modes[] = {"auto", "0", "1"};
+            const char *labels[] = {T(S_AUTO), T(S_OFF), T(S_ON)};
+            opt_choice(&l, axis->invert_label, axis->invert_option, modes, labels, 3, "auto");
+            if (list_selected(&l)) {
+                dash_help(T(S_H_CH_PEDAL_INVERT), HELP_NEXT_START);
+            }
+        }
+    }
+    list_heading(&l, T(S_CH_WHEEL_BUTTONS));
+    for (int i = 0; i < IM_CAB_INPUTS; i++) {
+        const ImCabinetControl *control = &im_cabinet_controls[i];
+        if (control->wheel_button) {
+            wheel_binding_row(&l, T(control->label), control->wheel_button, control->wheel_default, false);
+            binding |= list_selected(&l);
+        }
+    }
+    list_heading(&l, T(S_CH_GEARS));
+    wheel_device_row(&l, true);
+    if (list_selected(&l)) {
+        dash_help(T(S_H_CH_SHIFTER_DEVICE), HELP_NEXT_START);
+    }
+    for (int gear = 1; gear <= 6; gear++) {
+        char label[48], key[32];
+        snprintf(label, sizeof(label), T(S_CH_GEAR), gear);
+        snprintf(key, sizeof(key), "chihiro.wheel.gear%d", gear);
+        wheel_binding_row(&l, label, key, 0, false);
+        if (list_selected(&l)) {
+            binding = true;
+            dash_help(T(S_H_CH_GEAR), HELP_NEXT_START);
+        }
+    }
+    list_end(&l);
+    if (D.in.back) {
+        dash_save_cfg();
+        dash_pop();
+    }
+    draw_hints(slider ? NULL : T(binding ? S_REMAP : S_CHANGE), T(S_BACK), binding ? T(S_DELETE) : NULL, NULL);
+}
+
 void scr_controls(void)
 {
+    if (D.editing_game && cur_chihiro()) {
+        cabinet_controls();
+        return;
+    }
     const float W = ui_w(), H = ui_h();
     char title[96];
     snprintf(title, sizeof(title), "%s — %s %d", T(D.editing_game ? S_GAME_CONTROLS : S_CONTROLS), T(S_PLAYER),
@@ -1353,7 +1759,6 @@ void scr_controls(void)
             const char *mn[] = {T(S_OFF), T(S_IN_RSTICK), T(S_IN_LSTICK)};
             opt_choice(&l, S_MOUSE_STICK, "mouse.stick", mv, mn, 3, "off");
             opt_int(&l, S_MOUSE_SENS, "mouse.sens", 10, 400, 10, 100, "%");
-            /* the Communicator in player 1's controller (#254: voice=, the core's) */
             opt_bool(&l, S_COMMUNICATOR, "voice", false, false);
         }
 
@@ -1734,11 +2139,19 @@ void scr_remap(void)
 {
     const float W = ui_w(), H = ui_h();
     Config *c = D.editing_game ? &D.game : &D.global;
+    const bool wheel = g_wheel_capture.option[0] != 0;
     const bool hotkey = D.remap_target >= 1000;
-    const char *what = hotkey ? T(im_hotkey_label(D.remap_target - 1000)) : im_input_label(D.remap_target);
+    const bool cabinet = D.editing_game && cur_chihiro() && !hotkey;
+    const char *what = wheel ? g_wheel_capture.label : hotkey ? T(im_hotkey_label(D.remap_target - 1000))
+                             : cabinet ? T(im_cabinet_controls[D.remap_target].label) : im_input_label(D.remap_target);
+    const char *prompt = T(S_PRESS_INPUT);
+    if (wheel) {
+        prompt = T(!g_wheel_capture.wheel || !SDL_JoystickConnected(g_wheel_capture.wheel) ? S_CH_NO_WHEEL
+                   : g_wheel_capture.axis ? S_CH_MOVE_WHEEL_AXIS : S_CH_PRESS_WHEEL_BUTTON);
+    }
     ui_rect(0, 0, W, H, (UiColor){0, 0, 0, 150});
     ui_orb(W / 2, H * 0.36f, 50, 0.5f);
-    ui_text(W / 2, H * 0.55f, T(S_PRESS_INPUT), 28, UI_FONT_REGULAR, UI_WHITE, UI_ALIGN_CENTER);
+    ui_text(W / 2, H * 0.55f, prompt, 28, UI_FONT_REGULAR, UI_WHITE, UI_ALIGN_CENTER);
     ui_text(W / 2, H * 0.62f, what, 40, UI_FONT_BOLD, UI_GREEN_HI, UI_ALIGN_CENTER);
     const float left = 6 - (float)(ui_time() - D.remap_since);
     char t[32];
@@ -1753,6 +2166,15 @@ void scr_remap(void)
                           k == SDLK_LSHIFT || k == SDLK_RSHIFT || k == SDLK_LGUI || k == SDLK_RGUI;
     if (D.in.key == SDLK_ESCAPE) {
         done = true;
+    } else if (wheel) {
+        done = done || D.in.rclick || wheel_capture_input();
+    } else if (cabinet) {
+        const bool mouse = D.in.mouse_button >= SDL_BUTTON_LEFT && D.in.mouse_button <= SDL_BUTTON_X2;
+        const SDL_Keycode key = k ? k : mouse ? (SDL_Keycode)(IM_KEY_MOUSE | (unsigned)D.in.mouse_button) : SDLK_UNKNOWN;
+        if (key || D.in.pad_button >= 0 || D.in.pad_axis) {
+            im_cabinet_bind(c, &D.global, D.remap_target, key, D.in.pad_button, D.in.pad_axis);
+            done = true;
+        }
     } else if (hotkey && modifier) {
         /* Ctrl, Alt or Shift: the key that goes with them still to come */
     } else if (D.in.key) {
@@ -1774,6 +2196,9 @@ void scr_remap(void)
         done = true;
     }
     if (done) {
+        if (wheel) {
+            dash_wheel_capture_close();
+        }
         dash_save_cfg();
         D.sp--;     /* back without the back press reaching the list */
     }
@@ -1783,38 +2208,49 @@ void scr_remap(void)
 
 static void text_field(List *l, enum UiStr label, const char *key, const char *def)
 {
-    const char *v = cfg_get(&D.global, key);
+    Config *c = D.editing_game ? &D.game : &D.global;
+    const char *v = cfg_get(c, key);
     const bool editing = D.edit_key == key;
+    if (editing) {
+        dash_text_type(D.edit_tmp, sizeof(D.edit_tmp), D.in.text);
+        if (D.in.key == SDLK_V && (D.in.mod & SDL_KMOD_CTRL)) {
+            char *text = SDL_GetClipboardText();
+            if (text) {
+                text[strcspn(text, "\r\n")] = 0;
+                dash_text_type(D.edit_tmp, sizeof(D.edit_tmp), text);
+                SDL_free(text);
+            }
+        }
+        if (D.in.key == SDLK_BACKSPACE) {
+            dash_text_rub_out(D.edit_tmp);
+            D.in.back = false;
+        }
+    }
     char shown[300];
     snprintf(shown, sizeof(shown), "%s%s", editing ? D.edit_tmp : v ? v : def,
              editing && (int)(ui_time() * 2) % 2 ? "_" : "");
-    if (list_row(l, T(label), shown, NULL)) {
-        if (editing) {
-            cfg_set(&D.global, key, D.edit_tmp);
-            D.edit_key = NULL;
-            SDL_StopTextInput(SDL_GetKeyboardFocus());
-        } else {
-            D.edit_key = key;
-            snprintf(D.edit_tmp, sizeof(D.edit_tmp), "%s", v ? v : def);
-            SDL_StartTextInput(SDL_GetKeyboardFocus());
-        }
-    }
+    const bool accept = list_row(l, T(label), shown, NULL);
     if (editing) {
-        if (D.in.text && strlen(D.edit_tmp) + strlen(D.in.text) < sizeof(D.edit_tmp)) {
-            strcat(D.edit_tmp, D.in.text);
+        const bool left = !list_selected(l);
+        if ((accept || left) && !D.in.back) {
+            if (D.edit_tmp[0]) {
+                cfg_set(c, key, D.edit_tmp);
+            } else {
+                cfg_unset(c, key);
+            }
+            dash_save_cfg();
         }
-        if (D.in.key == SDLK_BACKSPACE && D.edit_tmp[0]) {
-            D.edit_tmp[strlen(D.edit_tmp) - 1] = 0;
-            D.in.back = false;
-        }
-        if (D.in.key == SDLK_ESCAPE) {
+        if (accept || D.in.back || left) {
             D.edit_key = NULL;
+            D.typing = false;
             SDL_StopTextInput(SDL_GetKeyboardFocus());
             D.in.back = false;
         }
-        if (!list_selected(l)) {
-            /* moved off: keep what was typed */
-        }
+    } else if (accept && !D.edit_key) {
+        D.edit_key = key;
+        D.typing = true;
+        snprintf(D.edit_tmp, sizeof(D.edit_tmp), "%s", v ? v : def);
+        SDL_StartTextInput(SDL_GetKeyboardFocus());
     }
 }
 

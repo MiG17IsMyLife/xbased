@@ -117,6 +117,7 @@ typedef struct NcCpuConfig {
     uint16_t idt_limit;
     uint32_t gdt_base; /* what SGDT reports */
     uint16_t gdt_limit;
+    bool real_hw_speed;
 } NcCpuConfig;
 
 /* Creates the JIT and its one host thread state: flat segments, FS at

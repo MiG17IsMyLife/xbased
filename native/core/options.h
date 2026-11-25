@@ -9,6 +9,8 @@
  *   xcheat=FILE|ON  a cheat file (.etm, .xbtf: core/xcheat.h) run before the
  *                    title, its options on as the 1s and 0s say
  *   relaunch         a title's reboot into another of its XBEs
+ *   chihiro.real_hw_speed=0|1  pace Chihiro CPU/GPU at boot (off by default)
+ *   chihirotest      start the test executable named in a WMMT boot.id
  *   loadstate=FILE   boot into a savestate (native/state)
  *   mods=FILE        the run's mods and cheats (native/core/mods.h)
  *   version=NAME     the core's version, recorded in savestates
@@ -42,6 +44,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "native/dev/chihiro_board.h"
+
 /* How a draw whose shaders are new is drawn (shaders=): by the interpreter
  * shaders while its own are built (hle/vk/draw.c, where the device links
  * pipeline libraries; else as NC_SHADERS_SYNC), skipped until they are, or
@@ -51,6 +55,9 @@ typedef enum { NC_SHADERS_HYBRID, NC_SHADERS_ASYNC, NC_SHADERS_SYNC } NcShaderMo
 typedef struct NcBootOptions {
     bool dashboard;             /* select the Xbox dashboard as the default XBE */
     bool relaunch;              /* use the title's saved launch data page */
+    bool chihiro_real_hw_speed;
+    bool chihiro_test;          /* select the cabinet's test executable */
+    NcChihiroCoinSettings chihiro_coins;
     char loadstate[512];        /* use the XBE recorded in this savestate */
 } NcBootOptions;
 

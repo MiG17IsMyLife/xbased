@@ -171,6 +171,8 @@ typedef struct NcThread {
     NcSeh seh[NC_SEH_STORED];             /* seh.c level(): the first ones */
     NcSeh seh_more[NC_MAX_SEH - NC_SEH_STORED]; /* ... and the deeper ones */
     unsigned nseh;
+    uint8_t wait_irql;       /* the IRQL it blocked at, restored when it runs */
+    bool wait_irql_set;
     bool fresh;              /* ctx was just set up (an ISR or DPC entry): the
                                 running frame must not be saved over it */
     /* Scheduling (ps.c): threads of one priority run in the order they
@@ -418,6 +420,7 @@ static inline uint32_t nc_ps_frame_top(const NcThread *t)
 void nc_mm_register(NcKernel *k);
 void nc_mm_note_image(uint32_t base, uint32_t size);
 void nc_ex_register(NcKernel *k);
+void nc_ex_console_serial(NcKernel *k, char serial[12]);
 void nc_rtl_register(NcKernel *k);
 /* Room for len bytes of guest code in the kernel area (stubs), or 0. */
 uint32_t nc_kernel_code_alloc(NcKernel *k, uint32_t len);
@@ -430,6 +433,7 @@ uint32_t nc_kernel_xbdm_stub(NcKernel *k, unsigned ordinal, const char **name);
  * hardware is pointed at the kernel (DirectSound's GP mailbox wait). */
 struct HleXbeInfo;
 void nc_kernel_title_fixups(NcKernel *k, const struct HleXbeInfo *xbe);
+void nc_kernel_wmmt2_link_fixup(NcKernel *k);
 /* ... and the library code a section holds (XMV's stream wait), at boot and
  * as XeLoadSection loads one */
 void nc_kernel_section_fixups(NcKernel *k, uint32_t va, uint32_t len, const char *name);
@@ -678,6 +682,13 @@ const char *nc_io_hdd_root(void);
 bool nc_io_host_file(const char *xbox_path, char *out, size_t n);
 /* \??\D:, the directory the title was launched from (its XBE's). */
 void nc_io_set_launch_dir(const char *dir);
+/* Chihiro: the media board as the disc; executables relative to its root */
+void nc_io_mount_chihiro_media(const char *executable, const char *test_executable);
+/* Chihiro: the full path of the game's XBE or, for test, the test XBE
+ * (the game's if boot.id names none); NULL on an Xbox */
+const char *nc_io_chihiro_boot(bool test);
+/* The path within the currently mounted media device, if this names one. */
+const char *nc_io_disc_relative(const char *path);
 /* Whether the disc has language folders, English's among them, and none for
  * XC_LANGUAGE lang next to it (Fable's Data\lang\English without Spanish). */
 bool nc_io_disc_lacks_language(const struct NcDisc *disc, int lang);

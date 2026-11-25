@@ -6,6 +6,7 @@
 #include "native/core/chd_image.h"
 #include "native/core/nbd_image.h"
 #include "native/core/fold_image.h"
+#include "native/core/chihiro_boot.h"
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -252,6 +253,42 @@ static int year_of(uint32_t t)
     return y >= 2000 && y <= 2010 ? y : 0;
 }
 
+enum { CHIHIRO_JPN = 1, CHIHIRO_EXP = 2 };
+
+static SDL_EnumerationResult SDLCALL chihiro_language(void *userdata, const char *dir, const char *name)
+{
+    unsigned *regions = userdata;
+    if (!SDL_strcasecmp(name, "2D_Japan")) {
+        *regions |= CHIHIRO_JPN;
+    } else if (!SDL_strcasecmp(name, "2D_Usa") || !SDL_strcasecmp(name, "2D_Export")) {
+        *regions |= CHIHIRO_EXP;
+    }
+    return SDL_ENUM_CONTINUE;
+}
+
+static SDL_EnumerationResult SDLCALL chihiro_data(void *userdata, const char *dir, const char *name)
+{
+    if (SDL_strcasecmp(name, "Data")) {
+        return SDL_ENUM_CONTINUE;
+    }
+    char path[1100];
+    const int len = snprintf(path, sizeof(path), "%s%s", dir, name);
+    if (len > 0 && (size_t)len < sizeof(path)) {
+        SDL_EnumerateDirectory(path, chihiro_language, userdata);
+    }
+    return SDL_ENUM_SUCCESS;
+}
+
+static void chihiro_title(const char *root, const char *game_id, char *out, size_t size)
+{
+    /* The language assets distinguish releases whose boot.id and XBE
+     * certificate region mask are identical. */
+    unsigned regions = 0;
+    SDL_EnumerateDirectory(root, chihiro_data, &regions);
+    snprintf(out, size, "Wangan Midnight Maximum Tune%s%s", !strcmp(game_id, "SBKD") ? " 2" : "",
+             regions == CHIHIRO_JPN ? " (JPN)" : regions == CHIHIRO_EXP ? " (EXP)" : "");
+}
+
 bool xd_read_game(const char *path, XdGame *g)
 {
     memset(g, 0, sizeof(*g));
@@ -259,9 +296,13 @@ bool xd_read_game(const char *path, XdGame *g)
     xd_clean_name(path, g->title, sizeof(g->title));
     /* an extracted game (its folder, or its default.xbe): the XBE read as
      * it is, the folder's name its title until the certificate's */
-    char xbe[1024];
-    const bool folder = nc_fold_xbe_path(path, xbe, sizeof(xbe));
-    if (folder) {
+    char xbe[1024], chihiro_root[1024], game_id[5];
+    const bool chihiro = nc_chihiro_xbe_path(path, xbe, sizeof(xbe), chihiro_root, sizeof(chihiro_root), game_id);
+    g->chihiro = chihiro;
+    const bool folder = chihiro || nc_fold_xbe_path(path, xbe, sizeof(xbe));
+    if (chihiro) {
+        chihiro_title(chihiro_root, game_id, g->title, sizeof(g->title));
+    } else if (folder) {
         char dir[1024];
         snprintf(dir, sizeof(dir), "%s", xbe);
         char *e = strrchr(dir, '/'), *e2 = strrchr(dir, '\\');
@@ -333,7 +374,7 @@ bool xd_read_game(const char *path, XdGame *g)
                 uint16_t u16[40];
                 memcpy(u16, x + cert + 0x0C, sizeof(u16));
                 xd_utf16_to_utf8(u16, 40, name, sizeof(name));
-                if (name[0]) {
+                if (name[0] && !chihiro) {
                     snprintf(g->title, sizeof(g->title), "%s", name);
                 }
                 ok = true;
@@ -366,7 +407,11 @@ bool xd_read_game(const char *path, XdGame *g)
     } else {
         fclose(d.f);
     }
-    snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
+    if (chihiro) {
+        snprintf(g->key, sizeof(g->key), "CH-%s-%08X", game_id, g->disc_sig);
+    } else {
+        snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
+    }
     return ok;
 }
 

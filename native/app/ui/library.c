@@ -11,6 +11,7 @@
 #include "native/app/ui/config.h"
 #include "native/app/ui/ui.h"
 #include "native/core/fold_image.h"
+#include "native/core/chihiro_boot.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -83,7 +84,7 @@ static bool is_game_folder(const char *dir)
     SDL_PathInfo pi;
     const size_t n = strlen(dir);
     snprintf(p, sizeof(p), "%s%sdefault.xbe", dir, n && (dir[n - 1] == '/' || dir[n - 1] == '\\') ? "" : "/");
-    return SDL_GetPathInfo(p, &pi) && pi.type == SDL_PATHTYPE_FILE;
+    return (SDL_GetPathInfo(p, &pi) && pi.type == SDL_PATHTYPE_FILE) || nc_chihiro_boot_path(dir, p, sizeof(p), NULL);
 }
 
 static void icon_path(const XdGame *g, char *out, size_t n)
@@ -499,9 +500,9 @@ static void cache_load(const ScanArgs *a, const bool *there)
     }
     char line[1600];
     while (L.n < MAX_GAMES && fgets(line, sizeof(line), f)) {
-        char *fld[9];
+        char *fld[10];
         int k = 0;
-        for (char *s = line, *t; k < 9 && (t = tok(&s, "\t")); k++) {
+        for (char *s = line, *t; k < 10 && (t = tok(&s, "\t")); k++) {
             fld[k] = t;
         }
         if (k < 7) {
@@ -522,17 +523,32 @@ static void cache_load(const ScanArgs *a, const bool *there)
         g->title_id = (uint32_t)strtoul(fld[3], NULL, 16);
         g->version = (uint32_t)strtoul(fld[4], NULL, 10);
         g->regions = (uint32_t)strtoul(fld[5], NULL, 10);
-        const char *title = fld[k - 1];
+        const char *title = fld[k == 10 ? 8 : k - 1];
         if (k >= 8) {
             g->year = atoi(fld[6]);
         }
-        if (k == 9) {
+        if (k >= 9) {
             g->disc_sig = (uint32_t)strtoul(fld[7], NULL, 16);
         } else {
             e->mtime = -1;      /* written before the year or the disc's signature were: read again */
         }
         snprintf(g->title, sizeof(g->title), "%.*s", (int)strcspn(title, "\r\n"), title);
-        snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
+        /* The Chihiro code is followed by the title format version.
+         * The settings key still uses the code and executable signature. */
+        const char *board = k == 10 ? fld[9] : "";
+        const size_t board_len = strcspn(board, "\r\n");
+        if (board_len >= 4 && (!strncmp(board, "SBHQ", 4) || !strncmp(board, "SBKD", 4))) {
+            g->chihiro = true;
+            snprintf(g->key, sizeof(g->key), "CH-%.4s-%08X", board, g->disc_sig);
+            if (board_len != 6 || memcmp(board + 4, ":1", 2)) {
+                e->mtime = -1;    /* refresh names inherited from the folder */
+            }
+        } else {
+            snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
+            if (k < 10 && !g->title_id) {
+                e->mtime = -1;    /* identify Chihiro games from older caches */
+            }
+        }
         e->gone = !there[in];   /* its disk is away */
         custom_apply(e);
         insert(e);
@@ -565,9 +581,9 @@ static void cache_save(const ScanArgs *a)
                 continue;
             }
         }
-        fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%d\t%08X\t%s\n", g->g.path, (long long)g->g.size,
+        fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%d\t%08X\t%s\t%.4s%s\n", g->g.path, (long long)g->g.size,
                 (long long)g->mtime, g->g.title_id, g->g.version, g->g.regions, g->g.year, g->g.disc_sig,
-                g->orig[0] ? g->orig : g->g.title);
+                g->orig[0] ? g->orig : g->g.title, g->g.chihiro ? g->g.key + 3 : "-", g->g.chihiro ? ":1" : "");
     }
     SDL_UnlockMutex(L.mu);
     const bool ok = fclose(f) == 0;

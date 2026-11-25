@@ -1,8 +1,7 @@
 /*
- * xbased native core — a game folder as a disc (fold_image.c): an extracted
- * game (its default.xbe and the files beside it) read as the XDVDFS image
- * they would make, its directory tables built in memory and each file's
- * sectors read from the file itself.
+ * xbased native core — an extracted Xbox or Chihiro game folder presented
+ * as an XDVDFS image, with directory tables built in memory and sectors
+ * read from the files themselves.
  */
 #ifndef NATIVE_CORE_FOLD_IMAGE_H
 #define NATIVE_CORE_FOLD_IMAGE_H
@@ -15,10 +14,8 @@
 extern "C" {
 #endif
 
-/* An open descriptor of a game folder's default.xbe: the folder as a disc,
- * registered by the descriptor, so the disc's reads (nc_fold_read on it) go
- * through it. False: not an XBE (a disc image), or a folder that can't be
- * read. */
+/* Present a folder as a disc using its open default.xbe or Chihiro boot.id.
+ * The descriptor identifies the folder in subsequent nc_fold_read calls. */
 bool nc_fold_attach(int fd);
 void nc_fold_detach(int fd);
 /* fd registered as a folder */

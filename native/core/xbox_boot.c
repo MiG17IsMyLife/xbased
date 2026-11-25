@@ -118,7 +118,7 @@ uint32_t nc_xbox_boot_ram(int disc_fd, const NcBootOptions *boot)
     return ram;
 }
 
-bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot)
+bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot, const NcChihiroBoot *chihiro)
 {
     /* The dashboard boots with no disc (the tray empty); a title from the
      * disc, or the dashboard relaunched from one, has it. */
@@ -126,7 +126,8 @@ bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot)
         if (!nc_disc_open(&c->disc, disc_fd)) {
             close(disc_fd);
             c->disc.fd = -1;
-            nc_hle_set_fatal(NC_FATAL_BOOT, "The game's file isn't an Xbox disc image.");
+            nc_hle_set_fatal(NC_FATAL_BOOT, chihiro ? "The Chihiro game folder couldn't be read."
+                                                 : "The game's file isn't an Xbox disc image.");
             return false;
         }
         nc_mods_install(&c->disc);      /* the mods' files and XBE patches, the cheats */
@@ -138,23 +139,27 @@ bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot)
      * the XBE the saved launch data page names, and the page for the title. */
     uint8_t page[NC_LAUNCH_PAGE];
     bool have_page = false;
-    char xbe_path[NC_LAUNCH_PAGE] = "\\default.xbe";
-    if (boot->dashboard) {
-        snprintf(xbe_path, sizeof(xbe_path), "%s", NC_DASHBOARD_PATH);
-        snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", NC_DASHBOARD_PATH);
+    char default_xbe[NC_LAUNCH_PAGE];
+    if (chihiro) {
+        snprintf(default_xbe, sizeof(default_xbe), NC_CHIHIRO_MBFS "\\%s", chihiro->executable);
+    } else {
+        snprintf(default_xbe, sizeof(default_xbe), "%s", boot->dashboard ? NC_DASHBOARD_PATH : "\\default.xbe");
     }
+    const char *image_path = chihiro || boot->dashboard ? default_xbe : "";
+    char xbe_path[NC_LAUNCH_PAGE];
+    snprintf(xbe_path, sizeof(xbe_path), "%s", default_xbe);
+    snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", image_path);
     if (boot->loadstate[0]) {
         /* a savestate: the XBE it was running (a relaunched title's own, the
          * dashboard's) */
         NcStateInfo info;
-        static const char cd[] = "\\Device\\CdRom0";
         static const char hd[] = "\\Device\\Harddisk0\\";
         if (!nc_state_read_info(boot->loadstate, &info)) {
             nc_hle_set_fatal(NC_FATAL_STATE, "the savestate can't be read");
             return false;
         }
-        if ((!strncasecmp(info.xbe_path, cd, sizeof(cd) - 1) && info.xbe_path[sizeof(cd) - 1] == '\\') ||
-            !strncasecmp(info.xbe_path, hd, sizeof(hd) - 1)) {
+        const char *relative = nc_io_disc_relative(info.xbe_path);
+        if ((relative && *relative == '\\') || !strncasecmp(info.xbe_path, hd, sizeof(hd) - 1)) {
             snprintf(xbe_path, sizeof(xbe_path), "%s", info.xbe_path);
             snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", info.xbe_path);
         }
@@ -174,15 +179,15 @@ bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot)
                    nc_rd32(page));
         } else {
             have_page = false;
-            snprintf(xbe_path, sizeof(xbe_path), "%s", boot->dashboard ? NC_DASHBOARD_PATH : "\\default.xbe");
-            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", boot->dashboard ? NC_DASHBOARD_PATH : "");
+            snprintf(xbe_path, sizeof(xbe_path), "%s", default_xbe);
+            snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", image_path);
             nc_log("xbased-native-frontier", "relaunch: no launch data page, booting %s", xbe_path);
         }
     }
     /* a disc XBE with a title update installed: the update (a savestate's
      * memory is the XBE it ran, booted as it was) */
     char update[NC_LAUNCH_PAGE];
-    if (!boot->loadstate[0] && disc_fd >= 0 && title_update(&c->disc, xbe_path, update, sizeof(update))) {
+    if (!chihiro && !boot->loadstate[0] && disc_fd >= 0 && title_update(&c->disc, xbe_path, update, sizeof(update))) {
         snprintf(xbe_path, sizeof(xbe_path), "%s", update);
         snprintf(c->kernel.image_path, sizeof(c->kernel.image_path), "%s", update);
     }

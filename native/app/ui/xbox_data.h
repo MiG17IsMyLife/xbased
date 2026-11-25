@@ -15,7 +15,8 @@ typedef struct XdGame {
     char title[128];        /* the certificate's name (UTF-8), else the file's */
     uint32_t title_id, version, regions;
     int year;               /* the certificate's date's (the release's, near enough), 0 unknown */
-    char key[24];           /* "%08X.%u": its settings', mods', states' folder */
+    char key[24];           /* the game's settings, mods and states */
+    bool chihiro;
     uint8_t *icon;          /* RGBA, icon_w x icon_h, or NULL */
     int icon_w, icon_h;
     int64_t size;

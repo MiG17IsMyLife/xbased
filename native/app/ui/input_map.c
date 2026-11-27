@@ -254,13 +254,13 @@ const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES] = {
     [IM_CAB_WHEEL_BRAKE] = {S_CH_BRAKE, "chihiro.wheel.brake", 5, "chihiro.wheel.brake.invert", S_CH_BRAKE_INVERT},
 };
 
-SDL_Joystick *im_cabinet_open_wheel(const char *name)
+SDL_JoystickID im_cabinet_find_wheel(const char *name)
 {
     if (name && !strcmp(name, "off")) {
-        return NULL;
+        return 0;
     }
     const bool automatic = !name || !strcmp(name, "auto");
-    SDL_Joystick *wheel = NULL;
+    SDL_JoystickID wheel = 0;
     int count = 0;
     SDL_JoystickID *ids = SDL_GetJoysticks(&count);
     for (int pass = 0; ids && !wheel && pass < (automatic ? 3 : 2); pass++) {
@@ -278,12 +278,18 @@ SDL_Joystick *im_cabinet_open_wheel(const char *name)
                 match = pass == 0 ? !strcmp(device, name) : strstr(device, name) != NULL;
             }
             if (match) {
-                wheel = SDL_OpenJoystick(ids[i]);
+                wheel = ids[i];
             }
         }
     }
     SDL_free(ids);
     return wheel;
+}
+
+SDL_Joystick *im_cabinet_open_wheel(const char *name)
+{
+    const SDL_JoystickID id = im_cabinet_find_wheel(name);
+    return id ? SDL_OpenJoystick(id) : NULL;
 }
 
 ImPedalDirection im_cabinet_pedal_direction(const char *value)

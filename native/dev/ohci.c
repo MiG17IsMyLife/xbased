@@ -348,6 +348,12 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
         ed[2] |= ED_H;
         return false;
     }
+    if (!phys(o, td[2] & PTR_MASK, 16)) {
+        /* NextTD off RAM: a TD the driver has freed (XPP marks it
+         * ffffffff) under a head it hasn't moved yet. Not run: retired, its
+         * NextTD in HeadP would send the driver's walk off RAM. */
+        return false;
+    }
     int pid;
     switch (ED_D(ed[0])) {
     case 1:
@@ -434,14 +440,16 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
     td[0] = (td[0] & ~(TD_EC_MASK | (0xfu << TD_CC_SHIFT))) | (cc << TD_CC_SHIFT);
 
     /* Retire: off the ED, onto the done queue, unless the driver paused the
-     * ED or moved its queue meanwhile (this thread ran late: a host under
+     * ED, moved its queue or freed the TD meanwhile (this thread ran late: a host under
      * load). The driver cancelled the TD then and may have freed it; put
      * back, its old address in HeadP sent XPP through freed memory. */
     ed[2] = (td[2] & PTR_MASK) | (ed[2] & (ED_H | ED_C));
     uint32_t *head = (uint32_t *)phys(o, ed_pa + 8, 4);
     const uint32_t *flags = (const uint32_t *)phys(o, ed_pa, 4);
+    const uint32_t *next = (const uint32_t *)phys(o, td_pa + 8, 4);
     uint32_t expected = head_was;
-    if (!head || !flags || (__atomic_load_n(flags, __ATOMIC_ACQUIRE) & ED_K) ||
+    if (!head || !flags || !next || __atomic_load_n(next, __ATOMIC_ACQUIRE) != td[2] ||
+        (__atomic_load_n(flags, __ATOMIC_ACQUIRE) & ED_K) ||
         !__atomic_compare_exchange_n(head, &expected, ed[2], false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         static unsigned s_logged;
         if (s_logged++ < 8) {

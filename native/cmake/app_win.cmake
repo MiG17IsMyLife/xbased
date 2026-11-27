@@ -4,6 +4,7 @@
 set(NC_APP_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/app/win_main.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/wheel_ffb.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/chihiro_wheel.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/win_mods.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/mod_fit.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/mod_jmp.c"

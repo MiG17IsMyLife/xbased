@@ -1,12 +1,18 @@
 /*
- * xbased native core — the CRP-1231 card reader-printer (crp1231.h).
+ * Chihiro card reader: Sanwa CRP-1231 (crp1231.h).
  * Adapted from Tovarichtch/xemu's chihiro-cardreader-crp1231.c (98fbd75).
  * Copyright (c) 2026 Réda Chérif-Touil. SPDX-License-Identifier: LGPL-2.0-or-later
  *
- * Commands and response digits follow Sanwa's CRW/CRWL driver manual
- * (tables 3-1 to 3-4). Frame: STX, LEN, command, 3 bytes, parameters, ETX,
- * sum (LEN xor command..ETX). The host gets ACK/NAK at once and the answer,
- * STX 06 cmd r1 r2 r3 ETX sum, on each ENQ.
+ * Protocol (Sanwa's CRW/CRWL driver manual, tables 3-1 to 3-4):
+ *
+ *   game -> reader  STX, LEN, command, 3 bytes, parameters, ETX, sum
+ *                   (sum = LEN xor every byte from command to ETX)
+ *   reader -> game  ACK (frame good) or NAK (bad) right away
+ *   game -> reader  ENQ: "what's the result?"
+ *   reader -> game  STX 06 command r1 r2 r3 ETX sum
+ *
+ * r1-r3 are ASCII status digits: r1 where the card is, r2 the stripe
+ * (read/write errors), r3 the command's own status (busy, can't do it).
  */
 #include "crp1231.h"
 
@@ -17,15 +23,15 @@ uint64_t nc_ke_now_ns(void);
 
 enum { STX = 0x02, ETX = 0x03, ENQ = 0x05, ACK = 0x06, NAK = 0x15 };
 enum { WRITE_DATA_OFFSET = 9, FRAME_TRAILER_BYTES = 2 };
-enum { NOWHERE, INSIDE, HANDED_BACK, IN_SLOT };    /* where the card is */
+enum { NOWHERE, INSIDE, HANDED_BACK, IN_SLOT };    /* NcCardReader.where */
 enum {
-    CMD_TAKE = 0x33,
-    CMD_CANCEL = 0x40,
-    CMD_WRITE = 0x53,
-    CMD_PRINT = 0x7C,
-    CMD_RETURN = 0x80,
-    CMD_CLEAN = 0xA0,
-    CMD_DISPENSE = 0xB0,
+    CMD_TAKE = 0x33,            /* draw in a card (and read it, parameter '0') */
+    CMD_CANCEL = 0x40,          /* stop waiting or cleaning */
+    CMD_WRITE = 0x53,           /* write the stripe */
+    CMD_PRINT = 0x7C,           /* print on the card's face (nothing to do here) */
+    CMD_RETURN = 0x80,          /* hand the card back to the player */
+    CMD_CLEAN = 0xA0,           /* run a cleaning card through */
+    CMD_DISPENSE = 0xB0,        /* take a new blank card from the stack */
 };
 
 void nc_card_reader_init(NcCardReader *r)
@@ -37,6 +43,7 @@ void nc_card_reader_init(NcCardReader *r)
     r->note = note;
 }
 
+/* The checksum of frame f (len bytes): LEN xor ... xor ETX. */
 static uint8_t sum(const uint8_t *f, int len)
 {
     uint8_t s = f[1];
@@ -46,6 +53,7 @@ static uint8_t sum(const uint8_t *f, int len)
     return s;
 }
 
+/* Queues bytes for the game. */
 static void emit(NcCardReader *r, const uint8_t *b, int n)
 {
     if (r->out_len + n <= (int)sizeof(r->out)) {
@@ -54,12 +62,14 @@ static void emit(NcCardReader *r, const uint8_t *b, int n)
     }
 }
 
+/* Stores the answer the next ENQ sends. */
 static void keep(NcCardReader *r, const uint8_t *f, int n)
 {
     memcpy(r->last, f, (size_t)n);
     r->last_len = n;
 }
 
+/* The card has left the reader. */
 static void gone(NcCardReader *r)
 {
     r->where = NOWHERE;
@@ -75,7 +85,8 @@ static void note(NcCardReader *r, const char *what)
     }
 }
 
-/* A card file is either empty (blank) or has a 69-byte stripe. */
+/* Reads a card file: empty (a blank card) or a 69-byte stripe. "" or
+ * NULL is a blank card with no file yet. */
 static bool load(NcCardReader *r, const char *path)
 {
     gone(r);
@@ -94,7 +105,7 @@ static bool load(NcCardReader *r, const char *path)
         if (n) {
             memcpy(r->card, b, NC_CARD_BYTES);
             for (int i = 0; i < NC_CARD_BYTES && !r->written; i++) {
-                r->written = r->card[i] != 0;   /* zeros read as a blank stripe */
+                r->written = r->card[i] != 0;   /* all zeros counts as blank */
             }
         }
     } else {
@@ -104,7 +115,8 @@ static bool load(NcCardReader *r, const char *path)
     return true;
 }
 
-/* Cleaning: 1 s taking the card in, 3 s cleaning, 1 s at the slot. */
+/* A cleaning cycle's status digits over time: 1 s drawing the cleaning
+ * card in, 3 s cleaning, 1 s pushing it out to the slot. */
 static void cleaning(NcCardReader *r, uint8_t *s3, uint8_t *s5)
 {
     const uint64_t ms = (nc_ke_now_ns() - r->clean_start_ns) / 1000000u;
@@ -119,6 +131,8 @@ static void cleaning(NcCardReader *r, uint8_t *s3, uint8_t *s5)
     }
 }
 
+/* Carries out a command and sets the status digits r1-r3 (s3, s4, s5 are
+ * their places in the answer frame). '0' everywhere means "done". */
 static void act(NcCardReader *r, uint8_t cmd, uint8_t param, uint8_t *s3, uint8_t *s4, uint8_t *s5)
 {
     const bool in = r->where == INSIDE;
@@ -129,7 +143,7 @@ static void act(NcCardReader *r, uint8_t cmd, uint8_t param, uint8_t *s3, uint8_
         } else if (r->waiting) {
             *s5 = '4';
         } else if (param == '0' && !r->written) {
-            *s4 = '1';                          /* nothing on the stripe */
+            *s4 = '1';                          /* read error: the stripe is blank */
         }
         break;
     case CMD_CANCEL:
@@ -147,14 +161,14 @@ static void act(NcCardReader *r, uint8_t cmd, uint8_t param, uint8_t *s3, uint8_
         break;
     case CMD_DISPENSE:
         if (in) {
-            *s5 = '2';                          /* one is inside already */
+            *s5 = '2';                          /* can't: a card is inside already */
             break;
         }
         if (r->where == IN_SLOT) {
-            note(r, "card out");                /* back to the player's hand */
+            note(r, "card out");                /* the player's card goes back to them */
         }
         gone(r);
-        r->where = INSIDE;                      /* a blank from the stacker */
+        r->where = INSIDE;                      /* now a blank card is inside */
         break;
     case CMD_RETURN:
         if (r->where != NOWHERE) {
@@ -176,9 +190,12 @@ static void act(NcCardReader *r, uint8_t cmd, uint8_t param, uint8_t *s3, uint8_
     }
 }
 
+/* Works out the answer to a command and stores it for the next ENQ.
+ * write_data: the stripe to write (CMD_WRITE), or NULL. */
 static void respond(NcCardReader *r, uint8_t cmd, uint8_t param, const uint8_t *write_data)
 {
-    if (r->where == HANDED_BACK) {              /* taken by the next question */
+    /* A handed-back card counts as taken once the next command comes. */
+    if (r->where == HANDED_BACK) {
         gone(r);
         note(r, "card out");
     }
@@ -186,12 +203,13 @@ static void respond(NcCardReader *r, uint8_t cmd, uint8_t param, const uint8_t *
     r->last_param = param;
     if (cmd == CMD_TAKE && (param == '0' || param == '2')) {
         if (r->where == IN_SLOT) {
-            r->where = INSIDE;                  /* drawn in */
+            r->where = INSIDE;                  /* the card in the slot is drawn in */
         }
         r->waiting = r->where == NOWHERE;
     } else if (cmd != CMD_CANCEL) {
         r->waiting = false;
     }
+    /* Reading a written card: the answer carries the 69-byte stripe. */
     if (cmd == CMD_TAKE && param == '0' && r->where == INSIDE && r->written) {
         uint8_t f[77] = {STX, 0x4B, CMD_TAKE, '1', '0', '0'};
         memcpy(f + 6, r->card, NC_CARD_BYTES);
@@ -204,9 +222,9 @@ static void respond(NcCardReader *r, uint8_t cmd, uint8_t param, const uint8_t *
     act(r, cmd, param, &f[3], &f[4], &f[5]);
     if (cmd == CMD_WRITE && f[5] == '0') {
         if (!write_data) {
-            f[5] = '2';                  /* command cannot be executed */
+            f[5] = '2';                  /* can't: no data came with it */
         } else if (!r->save_card || !r->save_card(r->path, sizeof(r->path), write_data)) {
-            f[4] = '2';                  /* write error, Sanwa table 3-3 */
+            f[4] = '2';                  /* write error (Sanwa table 3-3) */
         } else {
             memcpy(r->card, write_data, sizeof(r->card));
             r->written = true;
@@ -228,7 +246,7 @@ bool nc_card_reader_offer(NcCardReader *r, const char *path)
     }
     r->where = IN_SLOT;
     if (r->waiting) {
-        respond(r, r->last_cmd, r->last_param, NULL);  /* drawn in at once */
+        respond(r, r->last_cmd, r->last_param, NULL);  /* the game was waiting: draw it in now */
     }
     return true;
 }
@@ -244,12 +262,15 @@ bool nc_card_reader_take_back(NcCardReader *r)
 
 void nc_card_reader_rx(NcCardReader *r, uint8_t byte)
 {
+    /* Between frames: ENQ (or NAK, "send again") asks for the answer;
+     * STX starts a new frame; anything else is ignored. */
     if (!r->in_len) {
         if (byte == ENQ || byte == NAK) {
             if (!r->last_len || r->out_pos < r->out_len) {
-                return;                         /* nothing yet, or still sending */
+                return;                         /* no answer yet, or still sending one */
             }
-            /* a card handed back, or a clean, is worked out again */
+            /* Asked again while a card is handed back or a cleaning runs:
+             * work the answer out again, since it changes over time. */
             if (!r->fresh && (r->where == HANDED_BACK || r->cleaning)) {
                 respond(r, r->last_cmd, r->last_param, NULL);
             }
@@ -268,6 +289,7 @@ void nc_card_reader_rx(NcCardReader *r, uint8_t byte)
     }
     r->in[r->in_len++] = byte;
     if (r->in_len == 2) {
+        /* The frame's full length: STX and LEN, plus the LEN bytes after them. */
         r->in_want = byte + 2;
         if (r->in_want < 4 || r->in_want > (int)sizeof(r->in)) {
             r->in_len = r->in_want = 0;

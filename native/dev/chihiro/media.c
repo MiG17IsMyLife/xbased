@@ -1,12 +1,20 @@
 /*
- * xbased native core — Chihiro Type-3 DIMM and its Net DIMM command protocol.
- * The game starts with its filesystem already mounted in DIMM memory. The
- * LPC side delivers replies and interrupts on the emulated clock.
+ * Chihiro media board, built-in model (media.h).
+ *
+ * The real Type-3 media board keeps the game in DIMM memory. Here the
+ * game's files are already mounted when it starts (direct boot), so the
+ * model just answers status queries as a board that has finished loading.
+ *
+ * A command is 8 words. command[0]'s upper 16 bits are the operation;
+ * the reply echoes command[0] with bit 31 set, and the answer follows in
+ * reply[1..].
  */
-#include "native/dev/chihiro_board.h"
+#include "native/dev/chihiro/media.h"
 
 #include <string.h>
 
+/* Operations. 0x00xx-0x01xx are DIMM queries both sides answer; the rest
+ * are Net DIMM (network) operations. */
 enum {
     DIMM_CONNECT = 0x0001,
     DIMM_STATUS = 0x0100,
@@ -22,8 +30,8 @@ enum {
     NET_PING = 0x0608,
 };
 
-#define DIMM_FIRMWARE 0x0115u
-#define NET_FIRMWARE 0x1305u
+#define DIMM_FIRMWARE 0x0115u       /* media board firmware version */
+#define NET_FIRMWARE 0x1305u        /* network board firmware version (ver1305.bin) */
 #define NET_PACKET_LIMIT 1024u
 
 static char g_serial[16];
@@ -33,15 +41,16 @@ void nc_chihiro_media_init(const char serial[16])
     memcpy(g_serial, serial, sizeof(g_serial));
 }
 
+/* The DIMM queries. network: asked through the Net DIMM side. */
 static bool dimm_query(bool network, unsigned dimm_factor, uint16_t operation, uint32_t reply[8])
 {
     switch (operation) {
     case DIMM_CONNECT:
-        reply[1] = 0x08000000u << dimm_factor;
+        reply[1] = 0x08000000u << dimm_factor;  /* memory size: 128 MB << factor */
         return true;
     case DIMM_STATUS:
-        reply[1] = 5;       /* the direct boot has already loaded the game */
-        reply[2] = 100;
+        reply[1] = 5;               /* 5 = game loaded (direct boot already did it) */
+        reply[2] = 100;             /* 100% */
         return true;
     case DIMM_VERSION:
         reply[1] = network ? 0x00010000u | NET_FIRMWARE : 0x00020000u | DIMM_FIRMWARE;
@@ -50,8 +59,8 @@ static bool dimm_query(bool network, unsigned dimm_factor, uint16_t operation, u
         if (network) {
             return false;
         }
-        /* the media board's firmware answers 203h; bit 16 would be a
-         * development board (SEGABOOT's "Develop mode") */
+        /* The real firmware answers 0x203. Bit 16 would mark a development
+         * board (SEGABOOT's "Develop mode"). */
         reply[1] = 0x0203u;
         return true;
     case DIMM_SERIAL:
@@ -77,7 +86,7 @@ bool nc_chihiro_net_exchange(unsigned dimm_factor, const uint32_t command[8], ui
 {
     const uint16_t operation = (uint16_t)(command[0] >> 16);
     if (!command[0] || (operation & 0x8000u)) {
-        return false;
+        return false;               /* empty, or already a reply */
     }
     memset(reply, 0, 8 * sizeof(*reply));
     *delay_ms = 1;
@@ -86,18 +95,22 @@ bool nc_chihiro_net_exchange(unsigned dimm_factor, const uint32_t command[8], ui
         case NET_CAPACITY:
             reply[1] = NET_PACKET_LIMIT;
             break;
-        case NET_INTERFACE:     /* no link partner on a standalone cabinet */
+        case NET_INTERFACE:
+            /* A cabinet playing alone has no link partner: the request
+             * is echoed back after 1 s. */
             reply[2] = command[2];
             *delay_ms = 1000;
             break;
         case NET_LINK_STATE:
         case NET_PEER_COUNT:
         case NET_KEEPALIVE:
-            break;
+            break;                  /* all zero: no link, no peers */
         case NET_POLL:
             reply[2] = command[2];
             break;
         case NET_PING:
+            /* No one to answer: all ones, sent after the wait the ping
+             * asks for (low 16 bits of command[2], in ms). */
             reply[1] = UINT32_MAX;
             reply[2] = command[2];
             *delay_ms = command[2] & 0xffffu;

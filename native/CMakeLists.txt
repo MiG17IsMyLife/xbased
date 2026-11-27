@@ -84,19 +84,33 @@ if(NC_LINUX_X64)
   target_compile_options(nc_slirp PRIVATE "SHELL:-include signal.h")   # misc.c's (Android's headers bring it)
 endif()
 
-# Chihiro USB, DIMM and cabinet peripherals.
+# Sega Chihiro arcade hardware (dev/chihiro): the baseboard and cabinet
+# devices, the media board and the network board. asic/ and net/ are
+# ported from Tovarichtch/xemu and kept close to it.
 add_library(nc_chihiro STATIC
-  dev/chihiro/chihiro_board.c
-  dev/chihiro/chihiro_usb.c
-  dev/chihiro/chihiro_media.c
+  dev/chihiro/board.c
+  dev/chihiro/board_setup.c
+  dev/chihiro/backup.c
+  dev/chihiro/cards.c
+  dev/chihiro/cabinet_input.c
+  dev/chihiro/file_util.c
+  dev/chihiro/trace.c
+  dev/chihiro/baseboard_usb.c
+  dev/chihiro/baseboard_qc.c
+  dev/chihiro/baseboard_sc.c
+  dev/chihiro/coin_settings.c
+  dev/chihiro/jvs.c
+  dev/chihiro/crp1231.c
+  dev/chihiro/drive.c
+  dev/chihiro/v257.c
+  dev/chihiro/media.c
+  dev/chihiro/lpc.c
+  dev/chihiro/lpc_net.c
   dev/chihiro/asic/chihiro-asic.c
   dev/chihiro/asic/chihiro-v850.c
   dev/chihiro/asic/chihiro-spd.c
   dev/chihiro/asic/chihiro-pic.c
   dev/chihiro/asic/chihiro-des.c
-  dev/chihiro/jvs.c
-  dev/chihiro/v257.c
-  dev/chihiro/crp1231.c
   dev/chihiro/net/chihiro-mips.c
   dev/chihiro/net/chihiro-netboard.c)
 target_include_directories(nc_chihiro PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/dev/chihiro" "${NC_REPO}")
@@ -134,7 +148,6 @@ add_library(xbased_native STATIC
   core/irq.c
   dev/nv2a.c
   dev/ports.c
-  dev/chihiro_lpc.c
   dev/usb.c
   dev/usb_hub.c
   dev/xid.c

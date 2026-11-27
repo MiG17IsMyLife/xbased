@@ -27,6 +27,10 @@ bool xb_quote_arg(char *cmd, size_t capacity, const char *arg);
  * Windows doesn't take it. */
 bool xb_spawn(const char *exe, char *cmd, const char *dir, PROCESS_INFORMATION *pi);
 
+/* xb_spawn, the new process a child of parent_window's process (NULL: of
+ * this one); where that process can't be its parent, this one's child. */
+bool xb_spawn_under(const char *exe, char *cmd, const char *dir, void *parent_window, PROCESS_INFORMATION *pi);
+
 /* At main's start: the low 4 GiB taken by the host and this process without
  * bottom-up ASLR, it runs itself again (xb_spawn), waits and ends with that
  * run's exit code. Otherwise it returns. */

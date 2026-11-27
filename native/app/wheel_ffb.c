@@ -1,6 +1,7 @@
-/* Map the V257's centering, viscosity and signed push to native wheel effects.
- * The three effect types follow KittenTools' WMMT3 STR PCB adapter. The
- * Chihiro board has already interpreted the serial frame and motor relay. */
+/* Map the cabinet's force (NcChihiroForce: centering, viscosity and a signed
+ * push) to native wheel effects. The three effect types follow KittenTools'
+ * WMMT3 STR PCB adapter. The game's drive board (dev/chihiro/drive.h) has
+ * already turned its own protocol into these terms. */
 #include "native/app/wheel_ffb.h"
 #include "native/core/nc.h"
 #include "native/dev/chihiro_board.h"

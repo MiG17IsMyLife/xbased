@@ -56,37 +56,71 @@ bool xb_quote_arg(char *cmd, size_t capacity, const char *arg)
     return true;
 }
 
-bool xb_spawn(const char *exe, char *cmd, const char *dir, PROCESS_INFORMATION *pi)
+bool xb_spawn_under(const char *exe, char *cmd, const char *dir, void *parent_window, PROCESS_INFORMATION *pi)
 {
     STARTUPINFOEXA si;
     ZeroMemory(&si, sizeof(si));
     si.StartupInfo.cb = sizeof(si);
-    char buf[256];
+    /* the window's process as the new one's parent: its process tree (what
+     * OBS's game capture records the sound of, the window's process and its
+     * children's) has the new one in it */
+    HANDLE parent = NULL;
+    DWORD parent_pid = 0;
+    if (parent_window && GetWindowThreadProcessId((HWND)parent_window, &parent_pid) && parent_pid) {
+        parent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, parent_pid);
+    }
+    char buf[512];
     SIZE_T size = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+    const DWORD attrs = parent ? 2 : 1;
+    InitializeProcThreadAttributeList(NULL, attrs, 0, &size);
     LPPROC_THREAD_ATTRIBUTE_LIST list = size <= sizeof(buf) ? (LPPROC_THREAD_ATTRIBUTE_LIST)buf : NULL;
     DWORD64 policy = PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON |
                      PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON;
-    if (list && InitializeProcThreadAttributeList(list, 1, 0, &size)) {
+    bool with_parent = false;
+    if (list && InitializeProcThreadAttributeList(list, attrs, 0, &size)) {
         if (UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &policy, sizeof(policy),
                                       NULL, NULL)) {
             si.lpAttributeList = list;
         }
+        if (parent && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &parent,
+                                                sizeof(parent), NULL, NULL)) {
+            si.lpAttributeList = list;
+            with_parent = true;
+        }
     }
     bool ok = false;
+    char cwd[MAX_PATH];
     if (si.lpAttributeList) {
-        ok = CreateProcessA(exe, cmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT, NULL, dir, &si.StartupInfo,
-                            pi);
+        /* this process's environment and folder, given: not the parent's */
+        LPWCH env = with_parent ? GetEnvironmentStringsW() : NULL;
+        if (with_parent && !dir && GetCurrentDirectoryA(sizeof(cwd), cwd) - 1u < sizeof(cwd) - 1u) {
+            dir = cwd;
+        }
+        ok = CreateProcessA(exe, cmd, NULL, NULL, FALSE,
+                            EXTENDED_STARTUPINFO_PRESENT | (env ? CREATE_UNICODE_ENVIRONMENT : 0), env, dir,
+                            &si.StartupInfo, pi);
+        if (env) {
+            FreeEnvironmentStringsW(env);
+        }
+        DeleteProcThreadAttributeList(list);
+    }
+    if (parent) {
+        CloseHandle(parent);
+    }
+    if (!ok && with_parent) {
+        return xb_spawn(exe, cmd, dir, pi);   /* the parent refused it: this process's child, as before */
     }
     if (!ok) {
         /* a Windows that doesn't take the attribute: as before */
         si.StartupInfo.cb = sizeof(STARTUPINFOA);
         ok = CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si.StartupInfo, pi);
     }
-    if (si.lpAttributeList) {
-        DeleteProcThreadAttributeList(list);
-    }
     return ok;
+}
+
+bool xb_spawn(const char *exe, char *cmd, const char *dir, PROCESS_INFORMATION *pi)
+{
+    return xb_spawn_under(exe, cmd, dir, NULL, pi);
 }
 
 bool xb_aslr_low_taken(void)

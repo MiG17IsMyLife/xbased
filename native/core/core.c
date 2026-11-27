@@ -194,7 +194,8 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
         if (nc_chihiro_flash_path(chihiro_dir, flash, sizeof(flash))) {
             memset(&coins, 0, sizeof(coins));
         }
-        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &coins, cabinet);
+        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &coins, cabinet,
+                              chihiro.game_id);
     }
     init_xbox_devices(&c->vm, !chihiro.title || cabinet != 0);
     if (chihiro.title && !boot->chihiro_test) {

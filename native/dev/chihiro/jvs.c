@@ -1,5 +1,9 @@
 /*
- * xbased native core — the JVS I/O board (jvs.h).
+ * Chihiro JVS I/O board (jvs.h).
+ *
+ * A host frame's data is a list of commands, each a command byte and its
+ * parameters. The reply is a status byte and then one report per command
+ * (REPORT_OK and its data), in the same order.
  */
 #include "jvs.h"
 
@@ -15,7 +19,8 @@ enum {
 
 static const char k_id[] = "SEGA ENTERPRISES,LTD.;I/O BD JVS;837-13551 ;Ver1.00;98/10";
 
-/* 2 players x 13 switches, 2 coin slots, 8 x 16-bit analog, 6 output banks, backup */
+/* The board's feature list (command 14): 2 players x 13 switches, 2 coin
+ * slots, 8 16-bit analog channels, 6 output banks, backup memory. */
 static const uint8_t k_features[] = {
     0x01, 2, 13, 0,
     0x02, 2, 0, 0,
@@ -38,6 +43,7 @@ void nc_jvs_init(NcJvs *j)
     }
 }
 
+/* The reply being built. b NULL: count only, write nothing. */
 typedef struct Out {
     uint8_t *b;
     int n, cap;
@@ -80,10 +86,11 @@ static void set_outputs(NcJvs *j, const uint8_t *banks, int count)
     }
 }
 
-/* Runs the command at c; returns the bytes it used, 0 to stop parsing. */
+/* Runs the command at c (left bytes remain in the frame). Returns how
+ * many bytes it used, or 0 to stop reading the frame. */
 static int command(NcJvs *j, const uint8_t *c, int left, Out *o)
 {
-    /* commands that take a parameter byte need it */
+    /* These commands have at least one parameter byte; stop if it's missing. */
     if (left < 2 && c[0] && strchr("\xF0\xF1\x20\x21\x22\x23\x26\x2E\x32\x33\x34", c[0])) {
         return 0;
     }
@@ -212,8 +219,9 @@ static int command(NcJvs *j, const uint8_t *c, int left, Out *o)
         put(o, REPORT_OK);
         return clip(3, left);
     default:
-        /* Unknown (Maximum Tune 2 sends Namco's 70h once): refuse that byte
-         * and keep parsing. Stopping here makes the game report Error 11. */
+        /* Unknown command (Maximum Tune 2 sends Namco's 70h once): report
+         * a parameter error for that byte and go on with the next one.
+         * Stopping here would make the game report Error 11. */
         put(o, REPORT_PARAM);
         return 1;
     }
@@ -230,7 +238,7 @@ int nc_jvs_frame(NcJvs *j, const uint8_t *in, int len, uint8_t *out, int cap)
     if (target != BROADCAST && j->device_id && target != j->device_id) {
         return 0;
     }
-    /* of the broadcasts, only an address assignment is answered */
+    /* Broadcasts get no reply, except an address assignment. */
     const bool answer = target != BROADCAST || (n >= 1 && data[0] == 0xF1);
     uint8_t report[256];
     Out o = {answer ? report : NULL, 0, (int)sizeof(report)};

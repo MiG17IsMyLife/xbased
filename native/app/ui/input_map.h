@@ -121,6 +121,9 @@ typedef struct ImCabinetAxis {
     enum UiStr invert_label;
 } ImCabinetAxis;
 extern const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES];
+/* The wheel (or shifter) chihiro.wheel names: its name, part of it, "auto"
+ * (NULL) or "off"; 0 when none is plugged in. */
+SDL_JoystickID im_cabinet_find_wheel(const char *name);
 SDL_Joystick *im_cabinet_open_wheel(const char *name);
 
 typedef enum ImPedalDirection { IM_PEDAL_AUTO, IM_PEDAL_NORMAL, IM_PEDAL_REVERSE } ImPedalDirection;

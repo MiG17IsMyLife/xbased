@@ -35,6 +35,7 @@
 #include "native/app/ui/pointer.h"
 #include "native/app/ui/ui.h"
 #include "native/app/wheel_ffb.h"
+#include "native/app/chihiro_wheel.h"
 #include "hw/xbox/hle/vk/swapchain.h"
 #include "hw/xbox/hle/vk/share.h"
 #include "native/app/ui/xbox_data.h"
@@ -94,13 +95,10 @@ bool hle_pb_active(void);
 static NcCore g_core;
 
 static void pause_core(bool on);
-static void chihiro_wheel_open(void);
-static void chihiro_wheel_close(void);
 #ifdef _WIN32
 static void pads_close(void);
 static void pads_resync(void);
 #endif
-static bool chihiro_wheel_is(SDL_JoystickID id);
 static bool chihiro_cabinet_is(SDL_JoystickID id);
 static int g_disc_fd = -1;
 static SDL_AtomicInt g_core_state; /* 0 booting, 1 running, -1 failed or stopped */
@@ -524,7 +522,8 @@ static void run_again(const char *extra, bool hold)
         SetEnvironmentVariableA("XBASED_FRAME_TOKEN", NULL);
     }
     PROCESS_INFORMATION pi;
-    if (xb_spawn(exe, cmd, g_exe_dir, &pi)) {
+    /* inside the frame: the next run its process's child (frame_parent) */
+    if (xb_spawn_under(exe, cmd, g_exe_dir, fresh_frame ? NULL : g_frame, &pi)) {
         CloseHandle(pi.hThread);
         wait_next_run(ev, pi.hProcess);
         CloseHandle(pi.hProcess);
@@ -787,25 +786,6 @@ static bool pad_in_shortcut(SDL_Gamepad *pad)
     return pad_guide_held(pad);
 }
 
-/* Chihiro: a host wheel (KittenTools' WMMT3 DirectInput layout).
- *   chihiro.wheel=NAME            joystick name to match (default "R3", then "Wheel")
- *   chihiro.wheel.steer/gas/brake axis: X 0, Y 1, Z 2, RX 3, RY 4, RZ 5; -1 none
- *   chihiro.wheel.<button>=N      1-based button, 0 none
- * NC_TRACE_WHEEL logs moving axes and pressed buttons. */
-static struct {
-    SDL_Joystick *js;
-    SDL_Joystick *shifter;
-    bool tried;
-    int axes[IM_CAB_WHEEL_AXES];
-    int btn[IM_CAB_INPUTS];
-    int gear[6];
-    unsigned ffb_attempts;
-    Uint64 ffb_retry_at, shifter_retry_at;
-    int16_t rest[IM_CAB_WHEEL_MAX_AXES];
-    ImPedalDirection direction[IM_CAB_WHEEL_AXES];
-    bool trace;
-} g_wheel;
-
 static int opt_int(const char *name, int dflt)
 {
     const char *v = opt_value(name);
@@ -837,214 +817,32 @@ static bool previous_run_alive(void)
 }
 #endif
 
-static void chihiro_wheel_open(void)
-{
-    if (g_wheel.js) {
-        return;
-    }
-#ifdef _WIN32
-    if (previous_run_alive()) {
-        return;     /* again from chihiro_wheel_poll, once it's gone */
-    }
-#endif
-    const bool first = !g_wheel.tried;
-    g_wheel.tried = true;
-    g_wheel.trace = getenv("NC_TRACE_WHEEL") != NULL;
-    for (int i = 0; i < (int)SDL_arraysize(g_wheel.gear); i++) {
-        char key[32];
-        snprintf(key, sizeof(key), "chihiro.wheel.gear%d", i + 1);
-        const int number = opt_int(key, 0);
-        g_wheel.gear[i] = number > 0 ? number - 1 : -1;
-    }
-    const char *want = opt_value("chihiro.wheel");
-    if (want && !strcmp(want, "off")) {
-        if (first) {
-            nc_log("xbased-app", "chihiro: wheel off; the controller drives");
-        }
-        return;
-    }
-    g_wheel.js = im_cabinet_open_wheel(want);
-    if (!g_wheel.js) {
-        if (first) {
-            nc_log("xbased-app", "chihiro: no wheel found%s%s; the controller drives", want ? " named " : "",
-                   want ? want : "");
-        }
-        return;
-    }
-    const int axes = SDL_GetNumJoystickAxes(g_wheel.js), buttons = SDL_GetNumJoystickButtons(g_wheel.js);
-    for (int i = 0; i < IM_CAB_WHEEL_AXES; i++) {
-        const ImCabinetAxis *axis = &im_cabinet_axes[i];
-        const int index = opt_int(axis->option, axis->default_axis);
-        g_wheel.axes[i] = index >= 0 && index < axes && index < (int)SDL_arraysize(g_wheel.rest) ? index : -1;
-        if (axis->invert_option) {
-            g_wheel.direction[i] = im_cabinet_pedal_direction(opt_value(axis->invert_option));
-        }
-    }
-    for (int i = 0; i < IM_CAB_INPUTS; i++) {
-        const ImCabinetControl *control = &im_cabinet_controls[i];
-        const int number = control->wheel_button ? opt_int(control->wheel_button, control->wheel_default) : 0;
-        g_wheel.btn[i] = number > 0 && number <= buttons ? number - 1 : -1;
-    }
-    for (int a = 0; a < axes && a < (int)SDL_arraysize(g_wheel.rest); a++) {
-        g_wheel.rest[a] = SDL_GetJoystickAxis(g_wheel.js, a);
-    }
-    nc_log("xbased-app", "chihiro: wheel \"%s\" (%d axes, %d buttons, %d hats): steering axis %d, gas %d, brake %d",
-           SDL_GetJoystickName(g_wheel.js), axes, buttons, SDL_GetNumJoystickHats(g_wheel.js),
-           g_wheel.axes[IM_CAB_WHEEL_STEER], g_wheel.axes[IM_CAB_WHEEL_ACCEL], g_wheel.axes[IM_CAB_WHEEL_BRAKE]);
-}
-
-static bool chihiro_wheel_is(SDL_JoystickID id)
-{
-    return g_wheel.js && SDL_GetJoystickID(g_wheel.js) == id;
-}
-
-/* The wheel, or the separate shifter (chihiro.shifter, open or not yet):
- * the cabinet's, never a player's controller */
+/* A device of the cabinet's (its wheel or shifter, chihiro_wheel.c), never
+ * a player's controller. */
 static bool chihiro_cabinet_is(SDL_JoystickID id)
 {
-    if (chihiro_wheel_is(id) || (g_wheel.shifter && SDL_GetJoystickID(g_wheel.shifter) == id)) {
-        return true;
-    }
-    const char *shifter = g_chihiro ? opt_value("chihiro.shifter") : NULL;
-    const char *device = shifter && *shifter ? SDL_GetJoystickNameForID(id) : NULL;
-    return device && strstr(device, shifter);   /* as im_cabinet_open_wheel matches it */
+    return chihiro_wheel_owns(id, g_chihiro);
 }
 
-static void chihiro_wheel_close(void)
+/* Whether the window counts as in front for the wheel. On Windows the
+ * session frame (win_frame.c) can lose activation without the child window
+ * getting a focus event, so ask the system directly. */
+static bool wheel_focused(bool focused)
 {
-    nc_wheel_ffb_close();
-    if (g_wheel.shifter) {
-        SDL_CloseJoystick(g_wheel.shifter);
-    }
-    if (g_wheel.js) {
-        SDL_CloseJoystick(g_wheel.js);
-    }
-    memset(&g_wheel, 0, sizeof(g_wheel));
-    nc_chihiro_board_wheel(false, &(NcChihiroInput){0});
-}
-
-static uint16_t wheel_pedal(int pedal)
-{
-    const int axis = g_wheel.axes[pedal];
-    if (axis < 0) {
-        return 0;
-    }
-    return im_cabinet_pedal_value(SDL_GetJoystickAxis(g_wheel.js, axis), g_wheel.rest[axis], g_wheel.direction[pedal]);
-}
-
-static void chihiro_shifter_poll(NcChihiroInput *in)
-{
-    const char *name = opt_value("chihiro.shifter");
-    SDL_Joystick *device = g_wheel.js;
-    if (name && *name) {
-        if (g_wheel.shifter && !SDL_JoystickConnected(g_wheel.shifter)) {
-            SDL_CloseJoystick(g_wheel.shifter);
-            g_wheel.shifter = NULL;
-        }
-        const Uint64 now = SDL_GetTicks();
-        if (!g_wheel.shifter && now >= g_wheel.shifter_retry_at) {
-            g_wheel.shifter = im_cabinet_open_wheel(name);
-            g_wheel.shifter_retry_at = now + 1000;
-        }
-        device = g_wheel.shifter;
-    }
-    if (!device) {
-        return;
-    }
-    const int buttons = SDL_GetNumJoystickButtons(device);
-    for (int i = 0; i < (int)SDL_arraysize(g_wheel.gear); i++) {
-        const int button = g_wheel.gear[i];
-        if (button >= 0 && button < buttons) {
-            in->h_shifter = true;
-            if (!in->gear && SDL_GetJoystickButton(device, button)) {
-                in->gear = i + 1;
-            }
-        }
-    }
-}
-
-static void chihiro_wheel_poll(bool focused)
-{
-    if (!nc_chihiro_board_active()) {
-        return;
-    }
-    if (!g_wheel.tried) {
-        chihiro_wheel_open();
-    }
-    if (g_wheel.js && !SDL_JoystickConnected(g_wheel.js)) {
-        chihiro_wheel_close();
-        return;
-    }
-    NcChihiroInput in = {0};
-    chihiro_shifter_poll(&in);
-    if (!g_wheel.js) {
-        nc_chihiro_board_wheel(false, &in);
-        return;
-    }
 #ifdef _WIN32
     if (g_frame) {
-        /* The session frame can lose activation without a child focus event. */
         HWND foreground = GetForegroundWindow();
         focused = foreground == (HWND)g_frame || IsChild((HWND)g_frame, foreground);
     }
 #endif
-    const bool running = focused && !g_paused_ms.on && SDL_GetAtomicInt(&g_core_state) == 1;
-    const Uint64 now = SDL_GetTicks();
-    if (running && g_wheel.ffb_attempts < 4 && now >= g_wheel.ffb_retry_at &&
-        g_wheel.axes[IM_CAB_WHEEL_STEER] >= 0 && opt_int("chihiro.ffb", 0)) {
-        const bool opened = nc_wheel_ffb_open(g_wheel.js,
-            opt_int("chihiro.ffb.strength", NC_WHEEL_FFB_STRENGTH_DEFAULT),
-            opt_int("chihiro.ffb.deadband", NC_WHEEL_FFB_DEADBAND_DEFAULT), opt_int("chihiro.ffb.invert", 0) != 0);
-        g_wheel.ffb_attempts = opened ? 4 : g_wheel.ffb_attempts + 1;
-        g_wheel.ffb_retry_at = now + 1000;
-    }
-    nc_wheel_ffb_poll(running);
-    if (!focused && opt_int("chihiro.focus_input", 0)) {
-        /* chihiro.focus_input=1: only the window in front reads the controls
-         * (two cabinets on one PC) */
-        nc_chihiro_board_wheel(true, &(NcChihiroInput){.steering = 0x8000});
-        return;
-    }
-    if (g_wheel.trace) {
-        static int16_t last[SDL_arraysize(g_wheel.rest)];
-        static bool down[IM_CAB_WHEEL_MAX_BUTTONS];
-        const int axes = SDL_GetNumJoystickAxes(g_wheel.js);
-        for (int a = 0; a < axes && a < (int)SDL_arraysize(last); a++) {
-            const int16_t v = SDL_GetJoystickAxis(g_wheel.js, a);
-            if (abs(v - last[a]) > 6000) {
-                nc_log("xbased-app", "chihiro wheel: axis %d = %d (rest %d)", a, v, g_wheel.rest[a]);
-                last[a] = v;
-            }
-        }
-        const int buttons = SDL_GetNumJoystickButtons(g_wheel.js);
-        for (int b = 0; b < buttons && b < (int)SDL_arraysize(down); b++) {
-            const bool d = SDL_GetJoystickButton(g_wheel.js, b);
-            if (d && !down[b]) {
-                nc_log("xbased-app", "chihiro wheel: button %d", b);
-            }
-            down[b] = d;
-        }
-    }
-    const int steer = g_wheel.axes[IM_CAB_WHEEL_STEER];
-    in.steering = steer >= 0 ? (uint16_t)(SDL_GetJoystickAxis(g_wheel.js, steer) + 0x8000) : 0x8000;
-    in.gas = wheel_pedal(IM_CAB_WHEEL_ACCEL);
-    in.brake = wheel_pedal(IM_CAB_WHEEL_BRAKE);
-    bool *const outs[IM_CAB_INPUTS] = {
-        [IM_CAB_START] = &in.start, [IM_CAB_COIN] = &in.coin, [IM_CAB_TEST] = &in.test, [IM_CAB_SERVICE] = &in.service,
-        [IM_CAB_VIEW] = &in.view, [IM_CAB_INTRUDE] = &in.perspective, [IM_CAB_SHIFT_UP] = &in.shift_up,
-        [IM_CAB_SHIFT_DOWN] = &in.shift_down, [IM_CAB_CARD] = &in.card,
-    };
-    for (int i = 0; i < IM_CAB_INPUTS; i++) {
-        if (outs[i] && g_wheel.btn[i] >= 0) {
-            *outs[i] = SDL_GetJoystickButton(g_wheel.js, g_wheel.btn[i]);
-        }
-    }
-    nc_chihiro_board_wheel(true, &in);
+    return focused;
 }
 
 static void update_pads(bool focused)
 {
-    chihiro_wheel_poll(focused);
+    if (nc_chihiro_board_active()) {
+        chihiro_wheel_poll(wheel_focused(focused), !g_paused_ms.on && SDL_GetAtomicInt(&g_core_state) == 1);
+    }
     const bool *keys = SDL_GetKeyboardState(NULL);
     static bool kept[SDL_SCANCODE_COUNT];
     if (g_hk_any_eaten) {
@@ -2641,8 +2439,55 @@ static void run_game_window(SDL_Window *win)
     }
 }
 
+#ifdef _WIN32
+/* A game's run that starts a session (no frame yet): the session's frame
+ * up first, this run again as its child, this process waiting for it and
+ * ending with its exit code (the dashboard follows that, a hand-off's
+ * included). The frame's window is the one the game's picture is in, and
+ * OBS's game capture records the sound of that window's process and its
+ * children (application audio, a process tree): the run's sound, made in
+ * the run's process, recorded with it. The runs started again inside the
+ * frame are its children too (run_again). frame=0, the dashboard, a disc
+ * to pick: as before. */
+static void frame_parent(const char *disc)
+{
+    const char *fv = opt_value("frame");
+    const bool game = (disc && strcmp(disc, "none")) || opt_flag("dash");
+    if (!game || opt_flag("pick") || (fv && !strcmp(fv, "0"))) {
+        return;
+    }
+    const char *had = getenv("XBASED_FRAME_HWND");
+    if (had && had[0] && IsWindow((HWND)(uintptr_t)strtoull(had, NULL, 16))) {
+        return;     /* the session's frame: this run started under it */
+    }
+    const char *fr = opt_value("fsrate");
+    void *frame = nc_frame_get("xbased", want_fullscreen(), fr && !strcmp(fr, "60"));
+    char exe[MAX_PATH];
+    if (!frame || !GetModuleFileNameA(NULL, exe, sizeof(exe))) {
+        return;     /* the run goes on here: inside the frame had (nc_frame_get finds it), or on its own */
+    }
+    static char cmd[32768];
+    snprintf(cmd, sizeof(cmd), "%s", GetCommandLineA());
+    PROCESS_INFORMATION pi;
+    if (!xb_spawn_under(exe, cmd, NULL, frame, &pi)) {
+        return;
+    }
+    AllowSetForegroundWindow(pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    TerminateProcess(GetCurrentProcess(), code);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    chihiro_wheel_setup(opt_value, previous_run_alive);
+#else
+    chihiro_wheel_setup(opt_value, NULL);
+#endif
     env_legacy();
 #ifdef _WIN32
     if (argc > 1 && !strcmp(argv[1], "frame")) {
@@ -2681,6 +2526,9 @@ int main(int argc, char *argv[])
             }
         }
     }
+#ifdef _WIN32
+    frame_parent(disc);     /* a session's first run: under its frame (OBS's game capture, the sound) */
+#endif
     if (disc && strcmp(disc, "none")) {
         nc_vm_reserve_early();      /* the guest's addresses before SDL and the window's hooks (#321) */
     }

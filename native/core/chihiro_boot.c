@@ -1,8 +1,13 @@
 /*
- * Chihiro direct boot from an extracted game folder.
+ * Chihiro game launch from an extracted game folder (chihiro_boot.h).
  *
- * boot.id layout reference: Tovarichtch/xemu, chihiro_bootid_executable
- * and chihiro_game_name_of in hw/xbox/chihiro/chihiro.c (98fbd75).
+ * boot.id layout (from Tovarichtch/xemu, chihiro_bootid_executable and
+ * chihiro_game_name_of in hw/xbox/chihiro/chihiro.c, 98fbd75):
+ *   0x00  "BTID"
+ *   0x20  media type, "XBAM"
+ *   0x30  game ID, 4 characters
+ *   0xA0  game XBE path, 32 bytes, zero-terminated
+ *   0xC0  test menu XBE path, 32 bytes, zero-terminated
  */
 #include "native/core/chihiro_boot.h"
 #include "native/core/fold_image.h"
@@ -21,7 +26,7 @@
 #define O_BINARY 0
 #endif
 
-/* boot.id directly in the folder dir */
+/* Looks for boot.id (any letter case) directly in folder path. */
 static bool boot_in_dir(const char *path, char *out, size_t cap)
 {
     DIR *dir = opendir(path);
@@ -57,7 +62,7 @@ static bool boot_in_dir(const char *path, char *out, size_t cap)
 
 static bool boot_executable(const char field[32], char out[32]);
 
-/* xbe's path below root, with backslashes; false if it isn't below it */
+/* xbe's path relative to root, with backslashes. False if xbe isn't inside root. */
 static bool relative_to(const char *xbe, const char *root, char *out, size_t cap)
 {
     const size_t n = strlen(root);
@@ -71,8 +76,8 @@ static bool relative_to(const char *xbe, const char *root, char *out, size_t cap
     return true;
 }
 
-/* An XBE inside an extracted game: the boot.id up to 3 folders above it
- * that names it as the game's or the test program's. */
+/* For an XBE inside a game folder: looks up to 3 folders above it for a
+ * boot.id that names it as the game's or the test menu's XBE. */
 static bool boot_of_xbe(const char *xbe, char *out, size_t cap, bool *test)
 {
     char root[1024];
@@ -209,6 +214,9 @@ bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, si
     return true;
 }
 
+/* Checks and copies an XBE path from boot.id: must end in .xbe, no ".."
+ * or empty parts, no characters Windows forbids. Slashes become
+ * backslashes. False if the path isn't safe to use. */
 static bool boot_executable(const char field[32], char out[32])
 {
     const char *end = memchr(field, 0, 32);

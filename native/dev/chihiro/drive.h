@@ -34,6 +34,9 @@ typedef struct NcChihiroDrive {
     bool (*tx)(uint8_t *byte);
     /* the motor's current command (board.h); false when the motor is off */
     bool (*force)(struct NcChihiroForce *force);
+    /* true while the board itself holds the wheel (a start-up check, hands
+     * off); steering gets the position it holds it at, as the JVS reads it */
+    bool (*holding)(uint16_t *steering);
 } NcChihiroDrive;
 
 /* The drive board for a game ID from boot.id ("SBKD"). NULL if xbased
@@ -42,5 +45,8 @@ const NcChihiroDrive *nc_chihiro_drive_for(const char *game_id);
 
 /* Maximum Tune 1 and 2: the Namco V257 STR PCB (v257.c) */
 extern const NcChihiroDrive nc_chihiro_drive_v257;
+
+/* OutRun 2: Sega's servo motor drive board (sega_servo.c) */
+extern const NcChihiroDrive nc_chihiro_drive_sega_servo;
 
 #endif

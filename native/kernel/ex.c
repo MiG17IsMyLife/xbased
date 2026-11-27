@@ -7,6 +7,7 @@
  * call into guest code).
  */
 #include "native/kernel/kernel.h"
+#include "hw/xbox/hle/host.h"
 #include "native/core/chihiro_boot.h"
 #include "native/dev/chihiro_board.h"
 #include "native/core/xbe_load.h"
@@ -998,6 +999,19 @@ void nc_kernel_av_title_scan(NcKernel *k, NcFrame *f)
 /* AvSetDisplayMode(RegisterBase, Step, Mode, Format, Pitch, FrameBuffer) */
 static uint64_t AvSetDisplayMode(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    /*
+     * The guest's time stands still while the host sets the mode up (past
+     * the hold's first 8 ms): the presenter's work and the scan below took
+     * 45-250 ms on a tester's slower PC, a mode change the console makes
+     * in about a frame.
+     *
+     * Why: the title then found its USB transfers 250 ms overdue and
+     * cancelled ones whose completions waited only for its interrupt.
+     * Maximum Tune 2's USB driver (V322.xbe 0x001ef23e) then cancels a
+     * transfer that is no longer queued, walks off RAM and faults: the
+     * game froze for good, mostly in link play.
+     */
+    hle_host_guest_hold(true);
     nc_log("xbased-native", "av: display mode %08x format %08x pitch %u fb %08x", a[2], a[3], a[4], a[5]);
     if (a[2]) {
         /* AV mode bit 30 alone: the 50 Hz modes (PAL 576-line timings, as
@@ -1009,6 +1023,7 @@ static uint64_t AvSetDisplayMode(NcKernel *k, NcFrame *f, const uint32_t *a)
         nc_dev_nv2a_display_mode(a[4], a[3], hz, a[5]);
         nc_kernel_av_title_scan(k, f);
     }
+    hle_host_guest_hold(false);
     return 0;
 }
 

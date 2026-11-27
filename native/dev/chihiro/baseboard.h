@@ -58,6 +58,11 @@ typedef struct ChihiroUart {
     uint8_t config[11];             /* values of requests 0x25-0x2f */
     uint64_t tx_until_ns;           /* when the bytes sent so far finish */
     uint64_t rx_next_ns;            /* when the next byte may come back */
+    /* Drive board only: its bytes on their way to the SC, each with the
+     * time it has fully arrived (a ring buffer). */
+    uint8_t line[64];
+    uint64_t line_due_ns[64];
+    unsigned line_head, line_tail;
 } ChihiroUart;
 
 /* One QC or SC device. Fields only one of them uses are marked. */

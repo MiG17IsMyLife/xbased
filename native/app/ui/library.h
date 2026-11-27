@@ -28,8 +28,16 @@ typedef struct LibGame {
     bool gone, dup;
     bool replaced;          /* its file changed: another entry has it now */
     bool fetch_tried;       /* box art looked for online this run */
+    /* Chihiro: boot.id's name for the game and the build's region, read
+     * the first time they are shown (lib_chihiro_label) */
+    bool board_read;
+    char board_name[33], board_region[4];
     unsigned seen;          /* the scan pass that found it last */
 } LibGame;
+
+/* A Chihiro game's name as boot.id gives it ("MAXIMUM TUNE 2 Ver.B") and
+ * its build's region ("JPN", "EXP", "" unknown); read once, UI thread. */
+void lib_chihiro_label(LibGame *g, const char **name, const char **region);
 
 /* Scans the folders (folders: n paths, folders or game files) on a thread:
  * the games the last run found show at once (the cache), each file found

@@ -285,7 +285,8 @@ static void chihiro_title(const char *root, const char *game_id, char *out, size
      * certificate region mask are identical. */
     unsigned regions = 0;
     SDL_EnumerateDirectory(root, chihiro_data, &regions);
-    snprintf(out, size, "Wangan Midnight Maximum Tune%s%s", !strcmp(game_id, "SBKD") ? " 2" : "",
+    const char *title = nc_chihiro_game_title(game_id);
+    snprintf(out, size, "%s%s", title ? title : game_id,
              regions == CHIHIRO_JPN ? " (JPN)" : regions == CHIHIRO_EXP ? " (EXP)" : "");
 }
 

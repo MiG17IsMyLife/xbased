@@ -16,6 +16,7 @@
 enum { FFB_MAX_ATTEMPTS = 4 };      /* tries to start force feedback, 1 s apart */
 
 static const char *(*g_option)(const char *name);
+static ImCabinet g_cabinet;
 static bool (*g_wait_for_previous)(void);
 
 static struct {
@@ -36,6 +37,11 @@ void chihiro_wheel_setup(const char *(*option)(const char *name), bool (*wait_fo
 {
     g_option = option;
     g_wait_for_previous = wait_for_previous;
+}
+
+void chihiro_wheel_set_game(const char *key)
+{
+    g_cabinet = im_cabinet_of(key);
 }
 
 static const char *opt_value(const char *name)
@@ -92,7 +98,9 @@ void chihiro_wheel_open(void)
     }
     for (int i = 0; i < IM_CAB_INPUTS; i++) {
         const ImCabinetControl *control = &im_cabinet_controls[i];
-        const int number = control->wheel_button ? opt_int(control->wheel_button, control->wheel_default) : 0;
+        const int number = control->wheel_button && im_cabinet_has(g_cabinet, i)
+                               ? opt_int(control->wheel_button, im_cabinet_wheel_default(g_cabinet, i))
+                               : 0;
         g_wheel.btn[i] = number > 0 && number <= buttons ? number - 1 : -1;
     }
     /* Each axis's resting value, for pedals that rest at a non-zero value. */

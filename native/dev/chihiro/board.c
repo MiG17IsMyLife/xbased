@@ -32,6 +32,7 @@ void nc_chihiro_board_init(const NcChihiroStorage *storage, const NcChihiroCoinS
                            unsigned cabinet, const char *game_id)
 {
     chihiro_cards_init(storage);
+    chihiro_input_init(game_id);
     nc_chihiro_drive = nc_chihiro_drive_for(game_id);
     if (nc_chihiro_drive) {
         nc_chihiro_drive->init();

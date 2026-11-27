@@ -339,14 +339,14 @@ static bool segaboot_present(void)
     return present;
 }
 
-static void segaboot_choice(List *l, enum UiStr label, const char *key,
+static void segaboot_choice(List *l, const char *label, const char *key,
                             const char *const *values, const char *const *names, int count)
 {
     if (segaboot_present()) {
-        list_row_fixed(l, T(label), T(S_CH_IN_TEST_MENU), T(S_H_CH_COIN_SEGABOOT));
+        list_row_fixed(l, label, T(S_CH_IN_TEST_MENU), T(S_H_CH_COIN_SEGABOOT));
         return;
     }
-    opt_choice(l, label, key, values, names, count, "0");
+    opt_choice_named(l, label, key, values, names, count, "0");
     if (list_selected(l)) {
         dash_help(T(S_H_CH_COIN_SETTING), HELP_NEXT_START);
     }
@@ -369,9 +369,10 @@ static void segaboot_rows(List *l)
         T(S_CH_BOARD_VALUE), "1 : 1", "2 : 1", "3 : 1", "4 : 1", "5 : 1",
         "1 : 2", "1 : 3", "1 : 4", "1 : 5", T(S_CH_FREE_PLAY),
     };
-    segaboot_choice(l, S_CH_COIN_RATE, "chihiro.coin_rate", values, rates, SDL_arraysize(rates));
+    segaboot_choice(l, T(S_CH_COIN_RATE), "chihiro.coin_rate", values, rates, SDL_arraysize(rates));
 
     const char *const costs[] = {T(S_CH_BOARD_VALUE), "1", "2", "3", "4", "5", "6", "7", "8", "9"};
+    /* Prices in board-record and boot.id order. */
     static const struct {
         enum UiStr label;
         const char *key;
@@ -379,12 +380,20 @@ static void segaboot_rows(List *l)
         {S_CH_COST_START, "chihiro.cost.start"},
         {S_CH_COST_CONTINUE, "chihiro.cost.continue"},
         {S_CH_COST_NEW_CARD, "chihiro.cost.new_card"},
+        {S_CH_COST_FULL_COURSE, "chihiro.cost.full_course"},
         {S_CH_COST_RENEW_CARD, "chihiro.cost.renew_card"},
         {S_CH_COST_TRANSFER_CARD, "chihiro.cost.transfer_card"},
-        {S_CH_COST_FULL_COURSE, "chihiro.cost.full_course"},
     };
-    for (unsigned i = 0; i < SDL_arraysize(rows); i++) {
-        segaboot_choice(l, rows[i].label, rows[i].key, values, costs, SDL_arraysize(costs));
+    const bool maximum_tune = im_cabinet_of(D.cur->g.key) == IM_CAB_MAXIMUM_TUNE;
+    /* With no readable boot.id, OutRun 2 only needs the start price. */
+    const unsigned count = D.chihiro_costs_known || maximum_tune ? SDL_arraysize(rows) : 1;
+    for (unsigned i = 0; i < count; i++) {
+        const char *name = D.chihiro_cost_names[i];
+        if (D.chihiro_costs_known && !name[0]) {
+            continue;
+        }
+        const char *label = maximum_tune || i < 2 ? T(rows[i].label) : name;
+        segaboot_choice(l, label, rows[i].key, values, costs, SDL_arraysize(costs));
     }
 }
 
@@ -757,10 +766,14 @@ void scr_game_settings(void)
     (void)H;
     const bool chihiro = cur_chihiro();
     if (chihiro) {
-        if (nc_chihiro_board_active()) {
+        const ImCabinet cabinet = im_cabinet_of(D.cur->g.key);
+        if (nc_chihiro_board_active() && im_cabinet_has(cabinet, IM_CAB_CARD)) {
             card_row(&l);
         }
-        link_rows(&l);
+        /* OutRun 2's link isn't emulated yet. */
+        if (cabinet == IM_CAB_MAXIMUM_TUNE) {
+            link_rows(&l);
+        }
         segaboot_rows(&l);
 #if defined(__x86_64__)
         opt_bool(&l, S_CH_REAL_HW_SPEED, "chihiro.real_hw_speed", false, false);
@@ -1529,7 +1542,11 @@ static void cabinet_controls(void)
     if (list_row(&l, T(S_CH_TUNING), NULL, NULL)) {
         dash_push(SCR_CABINET_TUNING);
     }
+    const ImCabinet cabinet = im_cabinet_of(D.cur->g.key);
     for (int input = 0; input < IM_CAB_INPUTS; input++) {
+        if (!im_cabinet_has(cabinet, input)) {
+            continue;
+        }
         char value[96];
         im_cabinet_binding_name(&D.global, &D.game, input, value, sizeof(value));
         if (list_row(&l, T(im_cabinet_controls[input].label), value, NULL)) {
@@ -1726,26 +1743,30 @@ void scr_cabinet_wheel(void)
         }
     }
     list_heading(&l, T(S_CH_WHEEL_BUTTONS));
+    const ImCabinet cabinet = im_cabinet_of(D.cur->g.key);
     for (int i = 0; i < IM_CAB_INPUTS; i++) {
         const ImCabinetControl *control = &im_cabinet_controls[i];
-        if (control->wheel_button) {
-            wheel_binding_row(&l, T(control->label), control->wheel_button, control->wheel_default, false);
+        if (control->wheel_button && im_cabinet_has(cabinet, i)) {
+            wheel_binding_row(&l, T(control->label), control->wheel_button, im_cabinet_wheel_default(cabinet, i),
+                              false);
             binding |= list_selected(&l);
         }
     }
-    list_heading(&l, T(S_CH_GEARS));
-    wheel_device_row(&l, true);
-    if (list_selected(&l)) {
-        dash_help(T(S_H_CH_SHIFTER_DEVICE), HELP_NEXT_START);
-    }
-    for (int gear = 1; gear <= 6; gear++) {
-        char label[48], key[32];
-        snprintf(label, sizeof(label), T(S_CH_GEAR), gear);
-        snprintf(key, sizeof(key), "chihiro.wheel.gear%d", gear);
-        wheel_binding_row(&l, label, key, 0, false);
+    if (im_cabinet_has_gears(cabinet)) {
+        list_heading(&l, T(S_CH_GEARS));
+        wheel_device_row(&l, true);
         if (list_selected(&l)) {
-            binding = true;
-            dash_help(T(S_H_CH_GEAR), HELP_NEXT_START);
+            dash_help(T(S_H_CH_SHIFTER_DEVICE), HELP_NEXT_START);
+        }
+        for (int gear = 1; gear <= 6; gear++) {
+            char label[48], key[32];
+            snprintf(label, sizeof(label), T(S_CH_GEAR), gear);
+            snprintf(key, sizeof(key), "chihiro.wheel.gear%d", gear);
+            wheel_binding_row(&l, label, key, 0, false);
+            if (list_selected(&l)) {
+                binding = true;
+                dash_help(T(S_H_CH_GEAR), HELP_NEXT_START);
+            }
         }
     }
     list_end(&l);

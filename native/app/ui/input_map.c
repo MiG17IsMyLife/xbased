@@ -248,6 +248,35 @@ const ImCabinetControl im_cabinet_controls[IM_CAB_INPUTS] = {
     [IM_CAB_SERVICE]    = {S_CH_SERVICE,      "chihiro.bind.service", IM_RS, SDLK_F7, "chihiro.wheel.service", 38},
 };
 
+ImCabinet im_cabinet_of(const char *key)
+{
+    if (key && !strncmp(key, "CH-", 3)) {
+        key += 3;
+    }
+    return key && !strncmp(key, "SGBZ", 4) ? IM_CAB_OUTRUN : IM_CAB_MAXIMUM_TUNE;
+}
+
+/* OutRun 2's cabinet: steering, pedals, a two-way shift lever, START,
+ * VIEW CHANGE, coin, TEST and SERVICE. */
+bool im_cabinet_has(ImCabinet cabinet, int input)
+{
+    return cabinet != IM_CAB_OUTRUN || (input != IM_CAB_INTRUDE && input != IM_CAB_CARD);
+}
+
+int im_cabinet_wheel_default(ImCabinet cabinet, int input)
+{
+    /* OutRun 2 has no intrude button; its START goes on that button. */
+    if (cabinet == IM_CAB_OUTRUN && input == IM_CAB_START) {
+        return im_cabinet_controls[IM_CAB_INTRUDE].wheel_default;
+    }
+    return im_cabinet_has(cabinet, input) ? im_cabinet_controls[input].wheel_default : 0;
+}
+
+bool im_cabinet_has_gears(ImCabinet cabinet)
+{
+    return cabinet != IM_CAB_OUTRUN;
+}
+
 const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES] = {
     [IM_CAB_WHEEL_STEER] = {S_CH_STEER, "chihiro.wheel.steer", 0},
     [IM_CAB_WHEEL_ACCEL] = {S_CH_ACCEL, "chihiro.wheel.gas", 2, "chihiro.wheel.gas.invert", S_CH_ACCEL_INVERT},

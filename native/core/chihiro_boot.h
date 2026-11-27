@@ -35,6 +35,24 @@ bool nc_chihiro_boot_path(const char *path, char *out, size_t cap, bool *test);
  * game ID. Opening the test XBE uses the game's settings, found this way. */
 bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, size_t root_cap, char game_id[5]);
 
+/* The name xbased shows for a game ID from boot.id ("SGBZ": "OutRun 2"),
+ * NULL for a game it doesn't run. */
+const char *nc_chihiro_game_title(const char *game_id);
+
+/* How boot.id names the game (32 bytes at 0x80, as "MAXIMUM TUNE 2 Ver.B";
+ * builds with the same game ID and region differ here) and the build's
+ * region (nc_chihiro_boot_region: "JPN", "EXP" or ""). False if path has
+ * no boot.id. */
+bool nc_chihiro_boot_label(const char *path, char name[33], char region[4]);
+
+/* The game's prices, as boot.id names them for SEGABOOT's test menu
+ * (8 names of 32 bytes at 0xE0): 0 is the price to start, 1 to continue,
+ * the others the game's own (Maximum Tune's cards and full course). A name
+ * whose first byte is 0 is a price the game doesn't have: names[i][0] is
+ * 0 for those. False if path has no boot.id. */
+#define NC_CHIHIRO_COSTS 8
+bool nc_chihiro_boot_costs(const char *path, char names[NC_CHIHIRO_COSTS][32]);
+
 /* A number that tells builds of a game apart (a hash of the game XBE's
  * first 4 KB). Two versions with the same game ID then keep separate board
  * memory. 0 if the XBE can't be read. */

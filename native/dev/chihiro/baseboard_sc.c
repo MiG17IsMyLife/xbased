@@ -27,6 +27,44 @@ static uint64_t uart_byte_ns(unsigned channel)
     return 10000000000ull / (channel ? 31250u : 38400u);
 }
 
+/*
+ * The drive board's line. Each byte the board sends gets the time it has
+ * fully arrived at the SC: one byte time after the previous one, and not
+ * before the game's frame it answers has gone out. Bytes already on their
+ * way are not held back by frames the game sends later.
+ *
+ * Why: OutRun 2 (outrun2.xbe at 0x0001d2c6) sends a frame and reads the
+ * answer straight away, every 16 ms; the answer it gets is the one to the
+ * previous frame, which a real board sent long before.
+ */
+static void drive_line_fill(ChihiroUart *uart, uint64_t from_ns)
+{
+    const unsigned cap = sizeof(uart->line);
+    uint8_t byte;
+    while ((uart->line_tail + 1) % cap != uart->line_head && nc_chihiro_drive && nc_chihiro_drive->tx &&
+           nc_chihiro_drive->tx(&byte)) {
+        uint64_t due = from_ns;
+        if (uart->line_head != uart->line_tail) {
+            const uint64_t last = uart->line_due_ns[(uart->line_tail + cap - 1) % cap];
+            due = last > due ? last : due;
+        }
+        uart->line[uart->line_tail] = byte;
+        uart->line_due_ns[uart->line_tail] = due + uart_byte_ns(1);
+        uart->line_tail = (uart->line_tail + 1) % cap;
+    }
+}
+
+static unsigned drive_line_take(ChihiroUart *uart, uint8_t *out, unsigned max, uint64_t now)
+{
+    drive_line_fill(uart, now);        /* what the board sent on its own */
+    unsigned n = 0;
+    for (; n < max && uart->line_head != uart->line_tail && uart->line_due_ns[uart->line_head] <= now; n++) {
+        out[n] = uart->line[uart->line_head];
+        uart->line_head = (uart->line_head + 1) % sizeof(uart->line);
+    }
+    return n;
+}
+
 /* Request 0x1a/0x1b: gathers the bytes the device on this channel has
  * ready, up to one packet, for the game to fetch on bulk IN. */
 static void uart_receive(ChihiroUsbBoard *b, unsigned channel, unsigned count, uint8_t reply[8])
@@ -42,7 +80,9 @@ static void uart_receive(ChihiroUsbBoard *b, unsigned channel, unsigned count, u
     }
     const uint64_t now = nc_ke_now_ns();
     unsigned n = 0;
-    if (now >= uart->tx_until_ns && (channel || now >= uart->rx_next_ns)) {
+    if (channel) {
+        n = drive_line_take(uart, b->rx[channel], MIN(count, CHIHIRO_USB_PACKET), now);
+    } else if (now >= uart->tx_until_ns && now >= uart->rx_next_ns) {
         /*
          * The card reader's answer is handed over whole (up to a packet),
          * not a byte at a time.
@@ -53,21 +93,13 @@ static void uart_receive(ChihiroUsbBoard *b, unsigned channel, unsigned count, u
          * never put back together. With byte-by-byte pacing an answer
          * could be split behind the tail of an earlier one, get lost, and
          * the game then decided the reader was unplugged (Error 51).
-         *
-         * The drive board's bytes are still paced one at a time.
          */
-        for (; n < MIN(count, CHIHIRO_USB_PACKET) && (!channel || now >= uart->rx_next_ns); n++) {
-            const bool got = channel ? nc_chihiro_drive && nc_chihiro_drive->tx &&
-                                           nc_chihiro_drive->tx(&b->rx[channel][n])
-                                     : nc_card_reader_tx(&nc_chihiro_card_reader, &b->rx[channel][n]);
-            if (!got) {
+        for (; n < MIN(count, CHIHIRO_USB_PACKET); n++) {
+            if (!nc_card_reader_tx(&nc_chihiro_card_reader, &b->rx[channel][n])) {
                 break;
             }
-            if (channel) {
-                uart->rx_next_ns += uart_byte_ns(channel);
-            }
         }
-        if (!channel && n) {
+        if (n) {
             /* The card reader's next answer waits until these bytes would
              * have finished arriving. */
             uart->rx_next_ns = now + uart_byte_ns(channel) * n;
@@ -79,7 +111,8 @@ static void uart_receive(ChihiroUsbBoard *b, unsigned channel, unsigned count, u
     if (n && !channel && chihiro_trace(&budget)) {
         char h[CHIHIRO_HEX_CAP];
         nc_log("xbased-chihiro", "card <-%s", chihiro_hex(b->rx[channel], n, h));
-    }}
+    }
+}
 
 /* Bulk OUT on a UART endpoint: hands the bytes to the device on that
  * channel and works out when they finish going out on the line. */
@@ -90,18 +123,20 @@ void chihiro_sc_send(ChihiroUsbBoard *b, unsigned channel, const uint8_t *bytes,
     if (uart->tx_until_ns < now) {
         uart->tx_until_ns = now;
     }
-    uart->tx_until_ns += uart_byte_ns(channel) * n;
-    /* Nothing comes back until one byte time after the send ends. */
-    uart->rx_next_ns = uart->tx_until_ns + uart_byte_ns(channel);
     for (unsigned i = 0; i < n; i++) {
+        uart->tx_until_ns += uart_byte_ns(channel);
         if (channel) {
             if (nc_chihiro_drive && nc_chihiro_drive->rx) {
                 nc_chihiro_drive->rx(bytes[i]);
             }
+            /* An answer starts once the byte that completed the frame is in. */
+            drive_line_fill(uart, uart->tx_until_ns);
         } else {
             nc_card_reader_rx(&nc_chihiro_card_reader, bytes[i]);
         }
     }
+    /* Nothing comes back until one byte time after the send ends. */
+    uart->rx_next_ns = uart->tx_until_ns + uart_byte_ns(channel);
     static unsigned budget = 300;
     if (!channel && chihiro_trace(&budget)) {
         char h[CHIHIRO_HEX_CAP];

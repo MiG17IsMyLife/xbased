@@ -111,6 +111,19 @@ typedef struct ImCabinetControl {
 } ImCabinetControl;
 extern const ImCabinetControl im_cabinet_controls[IM_CAB_INPUTS];
 
+/* Which cabinet a Chihiro game runs in: its controls differ. Found from
+ * the game's settings key ("CH-SGBZ-...") or its boot.id game ID ("SGBZ");
+ * anything else is Maximum Tune's. */
+typedef enum { IM_CAB_MAXIMUM_TUNE, IM_CAB_OUTRUN } ImCabinet;
+ImCabinet im_cabinet_of(const char *key_or_game_id);
+/* False for a control the cabinet doesn't have (OutRun 2: no card reader,
+ * no intrude button). */
+bool im_cabinet_has(ImCabinet cabinet, int input);
+/* The control's default wheel button, 1-based, 0 none. */
+int im_cabinet_wheel_default(ImCabinet cabinet, int input);
+/* True if the cabinet has an H-pattern gear lever (Maximum Tune). */
+bool im_cabinet_has_gears(ImCabinet cabinet);
+
 enum { IM_CAB_WHEEL_STEER, IM_CAB_WHEEL_ACCEL, IM_CAB_WHEEL_BRAKE, IM_CAB_WHEEL_AXES };
 enum { IM_CAB_WHEEL_MAX_AXES = 32, IM_CAB_WHEEL_MAX_BUTTONS = 128 };
 typedef struct ImCabinetAxis {

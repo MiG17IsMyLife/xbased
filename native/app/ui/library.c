@@ -537,7 +537,7 @@ static void cache_load(const ScanArgs *a, const bool *there)
          * The settings key still uses the code and executable signature. */
         const char *board = k == 10 ? fld[9] : "";
         const size_t board_len = strcspn(board, "\r\n");
-        if (board_len >= 4 && (!strncmp(board, "SBHQ", 4) || !strncmp(board, "SBKD", 4))) {
+        if (board_len >= 4 && nc_chihiro_game_title(board)) {
             g->chihiro = true;
             snprintf(g->key, sizeof(g->key), "CH-%.4s-%08X", board, g->disc_sig);
             if (board_len != 6 || memcmp(board + 4, ":1", 2)) {
@@ -909,6 +909,16 @@ static const struct {
     {"XK", "Xbox Korea"}, {"XM", "Evolved Games"}, {"XP", "XPEC"}, {"XR", "Panorama"}, {"YB", "YBM Sisa"},
     {"ZD", "Zushi Games"},
 };
+
+void lib_chihiro_label(LibGame *g, const char **name, const char **region)
+{
+    if (!g->board_read) {
+        g->board_read = true;
+        nc_chihiro_boot_label(g->g.path, g->board_name, g->board_region);
+    }
+    *name = g->board_name;
+    *region = g->board_region;
+}
 
 const char *lib_publisher(const LibGame *g)
 {
@@ -1921,7 +1931,7 @@ void lib_fetch_all_covers(void)
         char p[1200];
         cover_path(&L.games[i]->g, p, sizeof(p));
         LibGame *g = L.games[i];
-        if (!g->gone && !g->dup && !g->fetch_tried && !SDL_GetPathInfo(p, NULL) && L.nq < MAX_GAMES) {
+        if (!g->gone && !g->dup && !g->g.chihiro && !g->fetch_tried && !SDL_GetPathInfo(p, NULL) && L.nq < MAX_GAMES) {
             g->fetch_tried = true;      /* once a run (none online: not asked again each scan) */
             L.queue[L.nq++] = g;
         }

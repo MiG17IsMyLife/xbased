@@ -9,6 +9,7 @@
 #include "native/app/ui/i18n.h"
 #include "native/app/ui/library.h"
 #include "native/app/ui/ui.h"
+#include "native/core/chihiro_boot.h"
 
 #include <stdbool.h>
 
@@ -45,6 +46,8 @@ typedef struct Dash {
     float anim;                 /* the current screen's age, s */
     Config global, game;        /* xbased.ini, the selected game's */
     LibGame *cur;               /* the game the game screens are about */
+    char chihiro_cost_names[NC_CHIHIRO_COSTS][32];
+    bool chihiro_costs_known;
     int tab;                    /* the settings' tab */
     int player;                 /* the controls' player (0-3) */
     bool editing_game;          /* lists edit the game's file over the global one */
@@ -135,6 +138,9 @@ float dash_list_h(float y, float row_h);
 /* settings rows over D.global or (editing a game) D.game */
 void opt_choice(List *l, enum UiStr label, const char *key, const char *const *vals, const char *const *names, int n,
                 const char *def);
+/* opt_choice with a label of its own (not a translated string), no help */
+void opt_choice_named(List *l, const char *label, const char *key, const char *const *vals, const char *const *names,
+                      int n, const char *def);
 void opt_bool(List *l, enum UiStr label, const char *key, bool def, bool flag_style);
 void opt_int(List *l, enum UiStr label, const char *key, int lo, int hi, int step, int def, const char *unit);
 void opt_videoflag(List *l, enum UiStr label, unsigned bit);

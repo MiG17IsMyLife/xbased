@@ -115,6 +115,63 @@ static bool boot_of_xbe(const char *xbe, char *out, size_t cap, bool *test)
     return false;
 }
 
+/* The games xbased runs, by game ID. */
+static const struct {
+    char game_id[5];
+    const char *title;
+} k_games[] = {
+    {"SBHQ", "Wangan Midnight Maximum Tune"},
+    {"SBKD", "Wangan Midnight Maximum Tune 2"},
+    {"SGBZ", "OutRun 2"},
+};
+
+const char *nc_chihiro_game_title(const char *game_id)
+{
+    for (unsigned i = 0; game_id && i < sizeof(k_games) / sizeof(*k_games); i++) {
+        if (!strncmp(game_id, k_games[i].game_id, 4)) {
+            return k_games[i].title;
+        }
+    }
+    return NULL;
+}
+
+/* path's boot.id opened for reading, -1 if it has none. */
+static int open_boot(const char *path)
+{
+    char boot[1024];
+    return nc_chihiro_boot_path(path, boot, sizeof(boot), NULL) ? open(boot, O_RDONLY | O_CLOEXEC | O_BINARY) : -1;
+}
+
+bool nc_chihiro_boot_label(const char *path, char name[33], char region[4])
+{
+    name[0] = region[0] = 0;
+    const int fd = open_boot(path);
+    if (fd < 0) {
+        return false;
+    }
+    char raw[32];
+    if (pread(fd, raw, sizeof(raw), 0x80) == (ssize_t)sizeof(raw)) {
+        snprintf(name, 33, "%.32s", raw);
+    }
+    snprintf(region, 4, "%s", nc_chihiro_boot_region(fd));
+    close(fd);
+    return true;
+}
+
+bool nc_chihiro_boot_costs(const char *path, char names[NC_CHIHIRO_COSTS][32])
+{
+    const int fd = open_boot(path);
+    char raw[NC_CHIHIRO_COSTS][32];
+    const bool ok = fd >= 0 && pread(fd, raw, sizeof(raw), 0xE0) == (ssize_t)sizeof(raw);
+    if (fd >= 0) {
+        close(fd);
+    }
+    for (int i = 0; i < NC_CHIHIRO_COSTS; i++) {
+        snprintf(names[i], 32, "%.31s", ok ? raw[i] : "");
+    }
+    return ok;
+}
+
 unsigned nc_chihiro_boot_tag(int boot_fd, const NcChihiroBoot *game)
 {
     char dir[1024], xbe[1100];
@@ -315,12 +372,9 @@ const char *nc_chihiro_boot_probe(int fd, bool test, NcChihiroBoot *game)
     }
     memcpy(game->executable, test ? game->test_executable : game->game_executable, sizeof(game->executable));
     memcpy(game->game_id, data + GAME_ID, 4);
-    if (!memcmp(data + GAME_ID, "SBHQ", 4)) {
-        game->title = "Wangan Midnight Maximum Tune";
-    } else if (!memcmp(data + GAME_ID, "SBKD", 4)) {
-        game->title = "Wangan Midnight Maximum Tune 2";
-    } else {
-        return "This Chihiro title is outside the current Maximum Tune 1 and 2 support.";
+    game->title = nc_chihiro_game_title(game->game_id);
+    if (!game->title) {
+        return "This game is not supported yet.";
     }
     return NULL;
 }

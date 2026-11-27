@@ -1423,8 +1423,8 @@ static const char *choice_name(const char *v, void *p)
     return v ? v : "";
 }
 
-void opt_choice(List *l, enum UiStr label, const char *key, const char *const *vals, const char *const *names, int n,
-                const char *def)
+void opt_choice_named(List *l, const char *label, const char *key, const char *const *vals, const char *const *names,
+                      int n, const char *def)
 {
     Config *c = edited();
     const char *v = cfg_get(c, key), *gv = cfg_get(&D.global, key);
@@ -1432,8 +1432,7 @@ void opt_choice(List *l, enum UiStr label, const char *key, const char *const *v
     char text[256];
     value_text(D.editing_game ? v : (v ? v : def), gv ? gv : def, choice_name, &ctx, text, sizeof(text));
     int delta = 0;
-    const bool chosen = list_row(l, T(label), text, &delta);
-    opt_help(l, label);
+    const bool chosen = list_row(l, label, text, &delta);
     if (chosen) {
         delta = 1;
     }
@@ -1469,6 +1468,13 @@ void opt_choice(List *l, enum UiStr label, const char *key, const char *const *v
             dash_toast_row(T(S_ASYNC_WARN), key);   /* draws wait for no shader: they are skipped */
         }
     }
+}
+
+void opt_choice(List *l, enum UiStr label, const char *key, const char *const *vals, const char *const *names, int n,
+                const char *def)
+{
+    opt_choice_named(l, T(label), key, vals, names, n, def);
+    opt_help(l, label);
 }
 
 static const char *bool_name(const char *v, void *p)
@@ -2130,6 +2136,32 @@ static void file_label(const LibGame *g, char *info, size_t n)
     }
 }
 
+/* A Chihiro game's facts, sep between them. Its XBE certificate's title ID,
+ * region and version are the same blanks in every Chihiro game, so: with
+ * full, boot.id's game ID (the settings key carries it: "CH-SGBZ-..."); the
+ * build's name from boot.id ("MAXIMUM TUNE 2 Ver.B", which tells Ver.A and
+ * Ver.B apart); the year; with full, the build's region. */
+static void chihiro_info(LibGame *g, char *out, size_t n, const char *sep, bool full)
+{
+    const char *name, *region;
+    lib_chihiro_label(g, &name, &region);
+    char id[5] = "", year[8] = "";
+    if (full) {
+        snprintf(id, sizeof(id), "%.4s", g->g.key + 3);
+    }
+    if (g->g.year) {
+        snprintf(year, sizeof(year), "%d", g->g.year);
+    }
+    const char *const parts[] = {id, name, year, full ? region : ""};
+    out[0] = 0;
+    for (size_t i = 0; i < SDL_arraysize(parts); i++) {
+        const size_t used = strlen(out);
+        if (*parts[i] && used < n) {
+            snprintf(out + used, n - used, "%s%s", used ? sep : "", parts[i]);
+        }
+    }
+}
+
 /* the icons view's tile: the disc's icon, the title, the publisher and year under */
 static void draw_tile(LibGame *g, float x, float y, float w, float h, bool sel, float alpha)
 {
@@ -2154,8 +2186,10 @@ static void draw_tile(LibGame *g, float x, float y, float w, float h, bool sel, 
                 UI_ALIGN_LEFT, tw);
     char info[120];
     const char *pub = lib_publisher(g);
-    const int rep = title_repeats(g);
-    if (rep == 2) {
+    const int rep = g->g.chihiro ? 0 : title_repeats(g);
+    if (g->g.chihiro) {
+        chihiro_info(g, info, sizeof(info), " · ", false);
+    } else if (rep == 2) {
         file_label(g, info, sizeof(info));
     } else if (rep) {
         /* the same name twice: what tells them apart, region and version */
@@ -2173,9 +2207,15 @@ static void draw_tile(LibGame *g, float x, float y, float w, float h, bool sel, 
     ui_round_outline(x, y, w, h, 8, sel ? 2.5f : 1, ui_alpha(sel ? UI_GREEN_HI : UI_GREEN_DIM, alpha));
 }
 
-static void open_game(LibGame *g)
+static void set_current_game(LibGame *g)
 {
     D.cur = g;
+    D.chihiro_costs_known = g->g.chihiro && nc_chihiro_boot_costs(g->g.path, D.chihiro_cost_names);
+}
+
+static void open_game(LibGame *g)
+{
+    set_current_game(g);
     char p[1200];
     game_cfg_path(g, p, sizeof(p));
     cfg_load_game(&D.game, p, g->g.chihiro);
@@ -2443,23 +2483,27 @@ static void scr_games(void)
             draw_star(60 + tw + 22, H - 110, 10, 1);
         }
         char info[200];
-        const char *pub = lib_publisher(g);
-        char year[16] = "";
-        if (g->g.year) {
-            snprintf(year, sizeof(year), "%d  ", g->g.year);
+        if (g->g.chihiro) {
+            chihiro_info(g, info, sizeof(info), "  ", true);
+        } else {
+            const char *pub = lib_publisher(g);
+            char year[16] = "";
+            if (g->g.year) {
+                snprintf(year, sizeof(year), "%d  ", g->g.year);
+            }
+            char file[160] = "";
+            if (title_repeats(g) == 2) {
+                file_label(g, file, sizeof(file) - 2);
+                strcat(file, "  ");
+            }
+            /* a game folder's size isn't known (its files aren't added up) */
+            char gb[24] = "";
+            if (g->g.size > 0) {
+                snprintf(gb, sizeof(gb), "  %.1f GB", g->g.size / 1073741824.0);
+            }
+            snprintf(info, sizeof(info), "%s%s%s%s%s  v%u%s", file, pub, *pub ? "  " : "", year,
+                     region_text(g->g.regions), g->g.version, gb);
         }
-        char file[160] = "";
-        if (title_repeats(g) == 2) {
-            file_label(g, file, sizeof(file) - 2);
-            strcat(file, "  ");
-        }
-        /* a game folder's size isn't known (its files aren't added up) */
-        char gb[24] = "";
-        if (g->g.size > 0) {
-            snprintf(gb, sizeof(gb), "  %.1f GB", g->g.size / 1073741824.0);
-        }
-        snprintf(info, sizeof(info), "%s%s%s%s%s  v%u%s", file, pub, *pub ? "  " : "", year,
-                 region_text(g->g.regions), g->g.version, gb);
         ui_text_fit(W - 60, H - 120, info, 20, UI_FONT_REGULAR, UI_GREY, UI_ALIGN_RIGHT, 480);
         char played[256];
         played_text(g, played, sizeof(played));
@@ -2562,18 +2606,26 @@ static void scr_game(void)
     /* the facts under the cover, a line each, as wide as its column (one
      * line under the whole screen ran under the menu beside it) */
     char info[3][160];
-    const char *pub = lib_publisher(g);
-    snprintf(info[0], sizeof(info[0]), "%s %08X   v%u", T(S_TITLE_ID), g->g.title_id, g->g.version);
-    snprintf(info[1], sizeof(info[1]), "%s %s", T(S_REGION), region_text(g->g.regions));
-    char year[16] = "";
-    if (g->g.year) {
-        snprintf(year, sizeof(year), "%s%d", *pub ? "   " : "", g->g.year);
+    if (g->g.chihiro) {
+        const char *name, *region;
+        lib_chihiro_label(g, &name, &region);
+        snprintf(info[0], sizeof(info[0]), "%s %.4s", T(S_TITLE_ID), g->g.key + 3);
+        snprintf(info[1], sizeof(info[1]), "%s %s", T(S_REGION), *region ? region : "-");
+        chihiro_info(g, info[2], sizeof(info[2]), "   ", false);
+    } else {
+        const char *pub = lib_publisher(g);
+        snprintf(info[0], sizeof(info[0]), "%s %08X   v%u", T(S_TITLE_ID), g->g.title_id, g->g.version);
+        snprintf(info[1], sizeof(info[1]), "%s %s", T(S_REGION), region_text(g->g.regions));
+        char year[16] = "";
+        if (g->g.year) {
+            snprintf(year, sizeof(year), "%s%d", *pub ? "   " : "", g->g.year);
+        }
+        char gb[24] = "";
+        if (g->g.size > 0) {
+            snprintf(gb, sizeof(gb), "   %.1f GB", g->g.size / 1073741824.0);
+        }
+        snprintf(info[2], sizeof(info[2]), "%s%s%s", pub, year, gb);
     }
-    char gb[24] = "";
-    if (g->g.size > 0) {
-        snprintf(gb, sizeof(gb), "   %.1f GB", g->g.size / 1073741824.0);
-    }
-    snprintf(info[2], sizeof(info[2]), "%s%s%s", pub, year, gb);
     for (int i = 0; i < 3; i++) {
         ui_text_fit(70, 160 + ch + 26 * i, info[i], 18, UI_FONT_REGULAR, UI_GREY, UI_ALIGN_LEFT, cw + 20);
     }
@@ -2611,7 +2663,9 @@ static void scr_game(void)
         D.player = 0;
         dash_push(SCR_CONTROLS);
     }
-    if (list_row(&l, T(S_DOWNLOAD_COVER), NULL, NULL)) {
+    /* The cover list is the Xbox's: a Chihiro game's cover is chosen by hand
+     * (library.c lib_fetch_all_covers). */
+    if (!g->g.chihiro && list_row(&l, T(S_DOWNLOAD_COVER), NULL, NULL)) {
         lib_fetch_cover(g);
     }
     if (list_row(&l, T(S_CHOOSE_COVER), NULL, NULL)) {
@@ -3252,7 +3306,8 @@ void dash_ingame_notice(const char *msg)
     snprintf(g_ig_notice, sizeof(g_ig_notice), "%s", msg ? msg : "");
 }
 
-int dash_ingame(SDL_Window *win, const char *key, const char *title, bool chihiro, bool link, const char *frame_bmp, int *slot,
+int dash_ingame(SDL_Window *win, const char *key, const char *title, const char *path, bool chihiro, bool link,
+                const char *frame_bmp, int *slot,
                 void (*live)(const struct Config *global, const struct Config *game))
 {
     memset(&D, 0, sizeof(D));
@@ -3276,10 +3331,11 @@ int dash_ingame(SDL_Window *win, const char *key, const char *title, bool chihir
     snprintf(game.g.key, sizeof(game.g.key), "%s", key);
     if (chihiro) {
         snprintf(game.g.title, sizeof(game.g.title), "%s", title);
+        snprintf(game.g.path, sizeof(game.g.path), "%s", path);
     } else {
         xd_clean_name(title, game.g.title, sizeof(game.g.title));
     }
-    D.cur = &game;
+    set_current_game(&game);
     game_cfg_path(&game, p, sizeof(p));
     cfg_load_game(&D.game, p, chihiro);
     upscale_migrate(&D.game);

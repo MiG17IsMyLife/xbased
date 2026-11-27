@@ -262,6 +262,7 @@ static void game_options(const char *disc)
         nc_log("xbased-app", "%d options of the game's (%s)", c.n, path);
     }
     snprintf(g_key, sizeof(g_key), "%s", g.key);
+    chihiro_wheel_set_game(g_key);
     snprintf(g_game_title, sizeof(g_game_title), "%s", g.title);
     g_title_id = g.title_id;
     Config global;
@@ -1594,7 +1595,7 @@ static void ingame_menu(SDL_Window *win, bool paused, bool minimized)
     const char *base = strrchr(g_disc, '\\');
     const char *title = g_chihiro && g_game_title[0] ? g_game_title : base ? base + 1 : g_disc;
     int slot = 0;
-    const int act = dash_ingame(win, g_key, title, g_chihiro, chihiro_link_active(),
+    const int act = dash_ingame(win, g_key, title, g_disc, g_chihiro, chihiro_link_active(),
                                 overlay ? NULL : pic, &slot, overlay ? live_cfg : NULL);
     pads_resync();
     if (!overlay) {

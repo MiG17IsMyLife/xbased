@@ -30,6 +30,10 @@ void chihiro_backup_link(ChihiroUsbBoard *qc, unsigned cabinet);
 /* backup.c: saves the settings and SRAM if they changed. */
 void chihiro_backup_flush(ChihiroUsbBoard *qc);
 
+/* cabinet_input.c: picks how the cabinet wires its controls for a game
+ * ID from boot.id ("SGBZ"); Maximum Tune's when it doesn't know it. */
+void chihiro_input_init(const char *game_id);
+
 /* cabinet_input.c: puts the latest controls onto the JVS board. Returns
  * true on the frame the card button goes down. */
 bool chihiro_input_poll(NcJvs *jvs);

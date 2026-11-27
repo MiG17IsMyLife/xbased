@@ -33,6 +33,10 @@
  */
 void chihiro_wheel_setup(const char *(*option)(const char *name), bool (*wait_for_previous)(void));
 
+/* The game's settings key ("CH-SGBZ-..."): picks its cabinet's default
+ * wheel buttons (input_map.h im_cabinet_of). Call when a game is loaded. */
+void chihiro_wheel_set_game(const char *key);
+
 /* Opens the configured wheel if it isn't open yet. */
 void chihiro_wheel_open(void);
 

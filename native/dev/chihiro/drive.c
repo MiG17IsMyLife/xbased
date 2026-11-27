@@ -9,8 +9,9 @@ static const struct {
     char game_id[5];
     const NcChihiroDrive *drive;
 } k_games[] = {
-    {"SBHQ", &nc_chihiro_drive_v257},   /* Wangan Midnight Maximum Tune */
-    {"SBKD", &nc_chihiro_drive_v257},   /* Wangan Midnight Maximum Tune 2 */
+    {"SBHQ", &nc_chihiro_drive_v257},         /* Wangan Midnight Maximum Tune */
+    {"SBKD", &nc_chihiro_drive_v257},         /* Wangan Midnight Maximum Tune 2 */
+    {"SGBZ", &nc_chihiro_drive_sega_servo},   /* OutRun 2 */
 };
 
 const NcChihiroDrive *nc_chihiro_drive_for(const char *game_id)

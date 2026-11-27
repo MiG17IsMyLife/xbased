@@ -1,13 +1,23 @@
 /*
  * Chihiro cabinet controls (cabinet_input.h): merges the controller and
  * the wheel, then sets the JVS I/O board's switches and analog channels
- * the way Maximum Tune's cabinet wires them.
+ * the way the game's cabinet wires them.
  *
- * JVS layout used by Maximum Tune:
+ * Maximum Tune:
  *   system switches   0x80 TEST
  *   player 1 byte 0   0x80 START, 0x40 SERVICE
  *   player 1 byte 1   gear lever bits (k_gate), 0x02 VIEW, 0x01 PERSPECTIVE
  *   analog 0, 1, 2    steering, gas, brake
+ *   coin slot 0       counts coins
+ *
+ * OutRun 2 (its test menu's INPUT TEST, TestMode.xbe at 0x000154d0, and
+ * outrun2.xbe at 0x0005bf50 with a 837-13551 I/O board):
+ *   system switches   0x80 TEST
+ *   player 1 byte 0   0x80 START, 0x40 SERVICE, 0x10 VIEW CHANGE
+ *   player 2 byte 0   0x20 shift UP, 0x10 shift DOWN (a lever that springs
+ *                     back to N, so each is held only while pushed)
+ *   analog 0, 1, 2    steering, gas, brake; the game uses the top 8 bits
+ *                     and learns the pedals' range by itself
  *   coin slot 0       counts coins
  */
 #include "native/dev/chihiro/cabinet_input.h"
@@ -16,6 +26,7 @@
 #include "board_int.h"
 
 #include <pthread.h>
+#include <string.h>
 #include <time.h>
 
 /* The gear lever's four switches for each gear (0 neutral, 1-6):
@@ -28,6 +39,13 @@ static NcChihiroInput g_pad_in = {.steering = 0x8000}, g_wheel_in;
 static bool g_wheel;                /* the wheel's axes replace the pad's */
 
 static int64_t g_test_at_ns;        /* host time TEST was last seen held */
+
+static bool g_outrun;               /* OutRun 2's wiring, else Maximum Tune's */
+
+void chihiro_input_init(const char *game_id)
+{
+    g_outrun = game_id && !strncmp(game_id, "SGBZ", 4);
+}
 
 static int64_t host_ns(void)
 {
@@ -125,8 +143,12 @@ bool chihiro_input_poll(NcJvs *j)
     down_before = in->shift_down;
 
     j->analog[0] = in->steering;
-    j->analog[1] = wmmt_pedal(in->gas);
-    j->analog[2] = wmmt_pedal(in->brake);
+    uint16_t held;
+    if (nc_chihiro_drive && nc_chihiro_drive->holding && nc_chihiro_drive->holding(&held)) {
+        j->analog[0] = held;
+    }
+    j->analog[1] = g_outrun ? in->gas : wmmt_pedal(in->gas);
+    j->analog[2] = g_outrun ? in->brake : wmmt_pedal(in->brake);
     /* The drive board reports the wheel's position back to the game,
      * 10 bits: 0 left .. 0x3FF right. */
     if (nc_chihiro_drive && nc_chihiro_drive->wheel) {
@@ -134,8 +156,14 @@ bool chihiro_input_poll(NcJvs *j)
     }
     j->system_switches = in->test ? 0x80 : 0x00;
     j->player_switches[0][0] = (in->start ? 0x80 : 0) | (in->service ? 0x40 : 0);
-    const uint8_t gate = k_gate[in->h_shifter ? (in->gear <= 6 ? in->gear : 0) : gear];
-    j->player_switches[0][1] = gate | (in->view ? 0x02 : 0) | (in->perspective ? 0x01 : 0);
+    if (g_outrun) {
+        j->player_switches[0][0] |= in->view ? 0x10 : 0;
+        j->player_switches[0][1] = 0;
+        j->player_switches[1][0] = (in->shift_up ? 0x20 : 0) | (in->shift_down ? 0x10 : 0);
+    } else {
+        const uint8_t gate = k_gate[in->h_shifter ? (in->gear <= 6 ? in->gear : 0) : gear];
+        j->player_switches[0][1] = gate | (in->view ? 0x02 : 0) | (in->perspective ? 0x01 : 0);
+    }
     if (in->coin && !coin_before) {
         j->coin_count[0]++;
     }

@@ -104,6 +104,7 @@ add_library(nc_chihiro STATIC
   dev/chihiro/crp1231.c
   dev/chihiro/drive.c
   dev/chihiro/v257.c
+  dev/chihiro/sega_servo.c
   dev/chihiro/media.c
   dev/chihiro/lpc.c
   dev/chihiro/lpc_net.c

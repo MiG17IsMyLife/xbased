@@ -30,7 +30,8 @@ void dash_set_pointer_hook(bool (*where)(float *x, float *y));
 void dash_set_pump_hook(void (*pump)(void));
 /* A notice the in-game menu shows as it next opens (a controller gone). */
 void dash_ingame_notice(const char *msg);
-int dash_ingame(SDL_Window *win, const char *key, const char *title, bool chihiro, bool link, const char *frame_bmp, int *slot,
+int dash_ingame(SDL_Window *win, const char *key, const char *title, const char *path, bool chihiro, bool link,
+                const char *frame_bmp, int *slot,
                 void (*live)(const struct Config *global, const struct Config *game));
 
 #endif

@@ -11,9 +11,10 @@
 #define NATIVE_DEV_CHIHIRO_BOARD_INT_H
 
 #include "baseboard.h"
+#include "native/dev/chihiro/storage.h"
 
-/* cards.c: sets the card folder to dir/cards and resets the reader. */
-void chihiro_cards_init(const char *dir);
+/* cards.c: takes the game's card folders and resets the reader. */
+void chihiro_cards_init(const NcChihiroStorage *storage);
 
 /* cards.c: the player pressed the card button. Inserts the chosen card,
  * or takes back one still sticking out of the slot. */

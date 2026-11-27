@@ -92,6 +92,7 @@ add_library(nc_chihiro STATIC
   dev/chihiro/board_setup.c
   dev/chihiro/backup.c
   dev/chihiro/cards.c
+  dev/chihiro/storage.c
   dev/chihiro/cabinet_input.c
   dev/chihiro/file_util.c
   dev/chihiro/trace.c

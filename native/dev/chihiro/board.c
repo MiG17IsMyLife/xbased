@@ -28,10 +28,10 @@ static void jvs_outputs(void *opaque, const uint8_t outputs[4])
     }
 }
 
-void nc_chihiro_board_init(const char *dir, const char *save, const NcChihiroCoinSettings *coins,
+void nc_chihiro_board_init(const NcChihiroStorage *storage, const NcChihiroCoinSettings *coins,
                            unsigned cabinet, const char *game_id)
 {
-    chihiro_cards_init(dir);
+    chihiro_cards_init(storage);
     nc_chihiro_drive = nc_chihiro_drive_for(game_id);
     if (nc_chihiro_drive) {
         nc_chihiro_drive->init();
@@ -55,7 +55,7 @@ void nc_chihiro_board_init(const char *dir, const char *save, const NcChihiroCoi
         memcpy(g_qc.eeprom + 0x1f10, main_id, 16);
     }
 
-    chihiro_backup_load(&g_qc, save);
+    chihiro_backup_load(&g_qc, storage->save);
     chihiro_usb_apply_coins(&g_qc, coins);
     if (cabinet) {
         chihiro_backup_link(&g_qc, cabinet);

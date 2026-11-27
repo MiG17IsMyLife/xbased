@@ -1928,7 +1928,7 @@ static const char k_usage[] =
     "  lang=N               the console's language (1 English ... 9 Portuguese)\n"
     "  loadstate=FILE       start from a save state\n"
     "  chihirotest          start the cabinet test program named in boot.id\n"
-    "  chihiro.data=DIR     the cabinet's card data directory\n"
+    "  chihiro.data=DIR     the Chihiro folder: firmware, each game's cards and board memory\n"
     "  hdd=DIR              the hard disk folder\n"
     "  mod=ID, cheat=NAME   a mod or cheat of the game's on\n"
     "  net=off|nat|lan|kai  the network\n"

@@ -139,6 +139,41 @@ unsigned nc_chihiro_boot_tag(int boot_fd, const NcChihiroBoot *game)
     return n > 0 ? h : 0;
 }
 
+/* Finds subfolder name (any letter case) in dir and writes its path to
+ * out. False if there is none. */
+static bool find_folder(const char *dir, const char *name, char *out, size_t cap)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    for (struct dirent *entry; !found && (entry = readdir(d));) {
+        if (!strcasecmp(entry->d_name, name)) {
+            struct stat st;
+            const int n = snprintf(out, cap, "%s/%s", dir, entry->d_name);
+            found = n > 0 && (size_t)n < cap && !stat(out, &st) && S_ISDIR(st.st_mode);
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+const char *nc_chihiro_boot_region(int boot_fd)
+{
+    char dir[1024], data[1100], art[1200];
+    if (!nc_fold_fd_dir(boot_fd, dir, sizeof(dir)) || !find_folder(dir, "Data", data, sizeof(data))) {
+        return "";
+    }
+    if (find_folder(data, "2D_Japan", art, sizeof(art))) {
+        return "JPN";
+    }
+    if (find_folder(data, "2D_Usa", art, sizeof(art))) {
+        return "EXP";
+    }
+    return "";
+}
+
 bool nc_chihiro_boot_path(const char *path, char *out, size_t cap, bool *test)
 {
     if (test) {

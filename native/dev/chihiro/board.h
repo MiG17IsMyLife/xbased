@@ -22,6 +22,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "native/dev/chihiro/storage.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,15 +50,14 @@ typedef struct NcChihiroCoinSettings {
 
 /*
  * Starts the baseboard.
- *   dir      folder for the cabinet's files (card files go in dir/cards)
- *   save     file that keeps the settings EEPROM and backup SRAM between
- *            runs; NULL keeps them in memory only
+ *   storage  where the game's cards and board memory are (storage.h);
+ *            an empty save keeps the board memory in memory only
  *   coins    coin settings to apply (see NcChihiroCoinSettings)
  *   cabinet  link play cabinet number 1-4, or 0 for a single cabinet
  *   game_id  the game's 4-letter code from boot.id ("SBKD"); picks the
  *            drive board (drive.h)
  */
-void nc_chihiro_board_init(const char *dir, const char *save, const NcChihiroCoinSettings *coins,
+void nc_chihiro_board_init(const NcChihiroStorage *storage, const NcChihiroCoinSettings *coins,
                            unsigned cabinet, const char *game_id);
 
 /* True once nc_chihiro_board_init has run (a Chihiro game is loaded). */

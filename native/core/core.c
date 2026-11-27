@@ -88,18 +88,35 @@ static void chihiro_segaboot(const char *dir, NcChihiroBoot *game, const char me
     nc_log("xbased-native-chihiro", "SEGABOOT: the flash's bank %u booted first", bank ? 1u : 0u);
 }
 
-/* The board memory's file, a build's own (Ver.A and Ver.B share a game
- * code): the shared file of earlier versions is its start. */
-static void chihiro_board_memory(int disc_fd, const NcChihiroBoot *game, char *save, size_t cap)
+/*
+ * The game's save folders (storage.h): <data>/<game ID>-<region>, with its
+ * cards and this build's board memory.
+ *
+ * Board memory used to live in the hard disk folder, first one file per
+ * game (chihiro-SBKD.bin), then one per build (chihiro-SBKD-<build>.bin).
+ * A build with no board memory in its new place starts from a copy of the
+ * old file; the old one is left where it is.
+ */
+static void chihiro_storage(int disc_fd, const NcChihiroBoot *game, const char *data, NcChihiroStorage *s)
 {
-    char shared[600];
-    snprintf(shared, sizeof(shared), "%s/chihiro-%s.bin", nc_io_hdd_root(), game->game_id);
-    snprintf(save, cap, "%s/chihiro-%s-%08X.bin", nc_io_hdd_root(), game->game_id,
-             nc_chihiro_boot_tag(disc_fd, game));
-    if (access(save, 0) == 0 || access(shared, 0) != 0) {
+    const unsigned build = nc_chihiro_boot_tag(disc_fd, game);
+    const char *region = nc_chihiro_boot_region(disc_fd);
+    nc_chihiro_storage(data, game->game_id, region, build, s);
+    mkdir(data, 0775);
+    mkdir(s->folder, 0775);
+    nc_log("xbased-native-chihiro", "save data: %s (region %s)", s->folder, *region ? region : "unknown");
+    if (access(s->save, 0) == 0) {
         return;
     }
-    FILE *from = fopen(shared, "rb"), *to = fopen(save, "wb");
+    char old[600];
+    snprintf(old, sizeof(old), "%s/chihiro-%s-%08X.bin", nc_io_hdd_root(), game->game_id, build);
+    if (access(old, 0) != 0) {
+        snprintf(old, sizeof(old), "%s/chihiro-%s.bin", nc_io_hdd_root(), game->game_id);
+        if (access(old, 0) != 0) {
+            return;                 /* nothing to start from: a fresh board */
+        }
+    }
+    FILE *from = fopen(old, "rb"), *to = fopen(s->save, "wb");
     char buf[4096];
     for (size_t n; from && to && (n = fread(buf, 1, sizeof(buf), from)) > 0;) {
         fwrite(buf, 1, n, to);
@@ -110,7 +127,7 @@ static void chihiro_board_memory(int disc_fd, const NcChihiroBoot *game, char *s
     if (to) {
         fclose(to);
     }
-    nc_log("xbased-native-chihiro", "board memory: %s starts from %s", save, shared);
+    nc_log("xbased-native-chihiro", "board memory: %s starts from %s", s->save, old);
 }
 
 bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
@@ -185,8 +202,8 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
                 cabinet = 0;
             }
         }
-        char save[600];
-        chihiro_board_memory(disc_fd, &chihiro, save, sizeof(save));
+        NcChihiroStorage storage;
+        chihiro_storage(disc_fd, &chihiro, chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", &storage);
         /* with SEGABOOT its test menu sets the coins (and the game's test
          * menu its costs), kept in the board's memory: not ours over them */
         NcChihiroCoinSettings coins = boot->chihiro_coins;
@@ -194,8 +211,7 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
         if (nc_chihiro_flash_path(chihiro_dir, flash, sizeof(flash))) {
             memset(&coins, 0, sizeof(coins));
         }
-        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &coins, cabinet,
-                              chihiro.game_id);
+        nc_chihiro_board_init(&storage, &coins, cabinet, chihiro.game_id);
     }
     init_xbox_devices(&c->vm, !chihiro.title || cabinet != 0);
     if (chihiro.title && !boot->chihiro_test) {

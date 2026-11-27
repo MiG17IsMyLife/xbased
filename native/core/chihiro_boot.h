@@ -40,6 +40,11 @@ bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, si
  * memory. 0 if the XBE can't be read. */
 unsigned nc_chihiro_boot_tag(int boot_fd, const NcChihiroBoot *game);
 
+/* The build's region, from the game's 2D art folder: "JPN" with
+ * Data/2D_Japan, "EXP" with Data/2D_Usa, "" when neither is there.
+ * (boot.id and the XBE certificate are the same in both builds.) */
+const char *nc_chihiro_boot_region(int boot_fd);
+
 /* Reads boot.id from fd into game; test picks the test menu's XBE.
  * Returns an error message for a damaged or unsupported boot.id.
  * Returns NULL with game->title NULL when fd isn't a boot.id at all

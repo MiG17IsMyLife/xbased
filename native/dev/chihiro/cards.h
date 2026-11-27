@@ -2,11 +2,12 @@
  * Chihiro card files: which card the player puts into the card reader.
  *
  * Maximum Tune saves the player's progress on a magnetic card. Each card
- * is one 69-byte file in <cabinet folder>/cards (an empty file is a blank
- * card). New cards are named card001.bin, card002.bin, ...
+ * is one 69-byte file (an empty file is a blank card) in the game's card
+ * folder (storage.h). New cards are named card001.bin, card002.bin, ...
  *
  * The player picks a card by file name. An empty name means "the most
- * recently changed card in the folder".
+ * recently changed card". A name like "WMMT1:card001.bin" is a card of the
+ * previous game, to transfer (cards.c).
  */
 #ifndef NATIVE_DEV_CHIHIRO_CARDS_H
 #define NATIVE_DEV_CHIHIRO_CARDS_H

@@ -326,7 +326,7 @@ static void real_gpu_frame(void)
     if (!g_real_hw_speed || !g_pb.real_gpu.commands) {
         return;
     }
-    // perf-experimental's NV2A throughput model. The stages overlap.
+    /* perf-experimental's NV2A throughput model; the stages overlap */
     const uint64_t vertex_ns = g_pb.real_gpu.vertex_ops * 1000 / 466;
     const uint64_t pixel_ns = g_pb.real_gpu.pixel_cycles * 1000 / 932;
     const uint64_t memory_ns = g_pb.real_gpu.bytes * 100 / 497;
@@ -405,8 +405,8 @@ static int kelvin(uint32_t m, uint32_t v)
             }
             return HLE_PB_STALL;
         }
-        if (g_pb.pace_until) {
-            return HLE_PB_STALL;
+        if (g_real_hw_speed && g_pb.pace_until) {
+            return HLE_PB_STALL;    /* the frame's estimated GPU time (real_gpu_frame) */
         }
         break;
     case NV097_SET_ZSTENCIL_CLEAR_VALUE:

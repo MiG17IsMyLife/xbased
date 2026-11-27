@@ -123,6 +123,7 @@ void nc_net_deliver(const uint8_t *frame, size_t len);
 typedef struct NcNetConfig {
     uint32_t dns[2];                    /* network order, 0: none */
     uint16_t lan_port;
+    bool lan_tcp;
     uint32_t lan_bcast;                 /* network order, 0: 255.255.255.255 */
     uint32_t lan_mask;                  /* network order, 0: not known */
     char lan_subnet[32];                /* CIDR for multicast discovery */

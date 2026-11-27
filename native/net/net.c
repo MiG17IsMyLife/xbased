@@ -128,6 +128,8 @@ bool nc_net_option(const char *arg)
         if (p > 0 && p < 65536) {
             g_net.cfg.lan_port = (uint16_t)p;
         }
+    } else if (!strncmp(arg, "lantransport=", 13)) {
+        g_net.cfg.lan_tcp = !strcmp(arg + 13, "tcp");
     } else if (!strncmp(arg, "lanbcast=", 9)) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%s", arg + 9);

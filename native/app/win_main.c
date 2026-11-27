@@ -96,7 +96,12 @@ static NcCore g_core;
 static void pause_core(bool on);
 static void chihiro_wheel_open(void);
 static void chihiro_wheel_close(void);
+#ifdef _WIN32
+static void pads_close(void);
+static void pads_resync(void);
+#endif
 static bool chihiro_wheel_is(SDL_JoystickID id);
+static bool chihiro_cabinet_is(SDL_JoystickID id);
 static int g_disc_fd = -1;
 static SDL_AtomicInt g_core_state; /* 0 booting, 1 running, -1 failed or stopped */
 static struct ANativeWindow g_nw;
@@ -506,7 +511,14 @@ static void run_again(const char *extra, bool hold)
     if (g_nw.hwnd && !g_frame) {
         SetWindowPos((HWND)g_nw.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
-    const bool fresh_frame = g_frame && extra && !strcmp(extra, "relaunch") && nc_chihiro_board_active();
+    const bool cabinet_reboot = extra && !strcmp(extra, "relaunch") && nc_chihiro_board_active();
+    const bool fresh_frame = g_frame && cabinet_reboot;
+    if (cabinet_reboot) {
+        /* DirectInput's devices are held exclusively: the game's and the
+         * dashboard's handles let go before the next run opens them */
+        pads_close();
+        dash_close_gamepads();
+    }
     if (fresh_frame) {
         SetEnvironmentVariableA("XBASED_FRAME_HWND", NULL);
         SetEnvironmentVariableA("XBASED_FRAME_TOKEN", NULL);
@@ -516,9 +528,15 @@ static void run_again(const char *extra, bool hold)
         CloseHandle(pi.hThread);
         wait_next_run(ev, pi.hProcess);
         CloseHandle(pi.hProcess);
+        if (fresh_frame) {
+            nc_frame_retire(g_frame);   /* the next run has its own: this one goes, the dashboard left hidden */
+        }
         /* the dashboard waits for this process: the new one's id in the
          * exit code (bit 30 set) lets it follow the game on (dash.c) */
         exit_now(nc_frame_handoff_code(pi.dwProcessId));
+    }
+    if (cabinet_reboot) {
+        pads_resync();
     }
     if (fresh_frame) {
         SetEnvironmentVariableA("XBASED_FRAME_HWND", getenv("XBASED_FRAME_HWND"));
@@ -621,7 +639,7 @@ static void pads_changed(void)
 
 static void pad_added(SDL_JoystickID id)
 {
-    if (chihiro_wheel_is(id)) {
+    if (chihiro_cabinet_is(id)) {
         return;
     }
     for (unsigned i = 0; i < 4; i++) {
@@ -707,6 +725,19 @@ static void pads_resync(void)
         pad_added(ids[k]);      /* (ones already in keep their place) */
     }
     SDL_free(ids);
+    if (g_chihiro) {
+        SDL_JoystickID *joysticks = SDL_GetJoysticks(&n);
+        for (int i = 0; joysticks && i < n; i++) {
+            const SDL_JoystickID id = joysticks[i];
+            if (!chihiro_cabinet_is(id) && !SDL_IsGamepad(id)) {
+                joystick_added(id);
+                if (SDL_IsGamepad(id)) {
+                    pad_added(id);
+                }
+            }
+        }
+        SDL_free(joysticks);
+    }
     pads_changed();
 }
 
@@ -726,6 +757,20 @@ static bool pad_guide_held(SDL_Gamepad *pad)
  * Back let go first) */
 static SDL_Gamepad *g_back_pad;
 static int g_back_btn;
+
+#ifdef _WIN32
+static void pads_close(void)
+{
+    g_back_pad = NULL;
+    for (unsigned i = 0; i < SDL_arraysize(g_pads); i++) {
+        if (g_pads[i]) {
+            SDL_CloseGamepad(g_pads[i]);
+            g_pads[i] = NULL;
+        }
+    }
+    memset(g_rumble, 0, sizeof(g_rumble));
+}
+#endif
 
 static bool pad_in_shortcut(SDL_Gamepad *pad)
 {
@@ -767,11 +812,41 @@ static int opt_int(const char *name, int dflt)
     return v ? atoi(v) : dflt;
 }
 
+#ifdef _WIN32
+/* The run this one follows (run_again's XBASED_READY names its process): it
+ * ends only once this one has drawn, and a wheel acquired for force feedback
+ * while it goes (TerminateProcess) hung the acquire, inside DirectInput, for
+ * good. Its end awaited first (once, from the start, before XBASED_READY goes). */
+static bool previous_run_alive(void)
+{
+    static bool checked;
+    static HANDLE proc;
+    if (!checked) {
+        checked = true;
+        const char *rv = getenv("XBASED_READY");
+        unsigned long pid = 0;
+        if (rv && sscanf(rv, "Local\\xbased-ready-%lu-", &pid) == 1 && pid) {
+            proc = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+        }
+    }
+    if (proc && WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) {
+        CloseHandle(proc);
+        proc = NULL;
+    }
+    return proc != NULL;
+}
+#endif
+
 static void chihiro_wheel_open(void)
 {
     if (g_wheel.js) {
         return;
     }
+#ifdef _WIN32
+    if (previous_run_alive()) {
+        return;     /* again from chihiro_wheel_poll, once it's gone */
+    }
+#endif
     const bool first = !g_wheel.tried;
     g_wheel.tried = true;
     g_wheel.trace = getenv("NC_TRACE_WHEEL") != NULL;
@@ -821,6 +896,18 @@ static void chihiro_wheel_open(void)
 static bool chihiro_wheel_is(SDL_JoystickID id)
 {
     return g_wheel.js && SDL_GetJoystickID(g_wheel.js) == id;
+}
+
+/* The wheel, or the separate shifter (chihiro.shifter, open or not yet):
+ * the cabinet's, never a player's controller */
+static bool chihiro_cabinet_is(SDL_JoystickID id)
+{
+    if (chihiro_wheel_is(id) || (g_wheel.shifter && SDL_GetJoystickID(g_wheel.shifter) == id)) {
+        return true;
+    }
+    const char *shifter = g_chihiro ? opt_value("chihiro.shifter") : NULL;
+    const char *device = shifter && *shifter ? SDL_GetJoystickNameForID(id) : NULL;
+    return device && strstr(device, shifter);   /* as im_cabinet_open_wheel matches it */
 }
 
 static void chihiro_wheel_close(void)
@@ -912,6 +999,12 @@ static void chihiro_wheel_poll(bool focused)
         g_wheel.ffb_retry_at = now + 1000;
     }
     nc_wheel_ffb_poll(running);
+    if (!focused && opt_int("chihiro.focus_input", 0)) {
+        /* chihiro.focus_input=1: only the window in front reads the controls
+         * (two cabinets on one PC) */
+        nc_chihiro_board_wheel(true, &(NcChihiroInput){.steering = 0x8000});
+        return;
+    }
     if (g_wheel.trace) {
         static int16_t last[SDL_arraysize(g_wheel.rest)];
         static bool down[IM_CAB_WHEEL_MAX_BUTTONS];
@@ -987,6 +1080,9 @@ static void update_pads(bool focused)
         s.ry = m.ry;
         if (i == 0) {
             nc_auto_pad(&s);
+        }
+        if (g_chihiro && !focused && opt_int("chihiro.focus_input", 0)) {
+            memset(&s, 0, sizeof(s));       /* the other window's (chihiro_wheel_poll) */
         }
         nc_pad_set(i, &s);
         uint16_t l = 0, r = 0;
@@ -2365,7 +2461,7 @@ static void handle_game_event(SDL_Window *win, GameWindowState *state, const SDL
             chihiro_wheel_open();
         }
         /* SDL treats mapped joysticks as gamepads and excludes them from haptics. */
-        if (!chihiro_wheel_is(event->jdevice.which)) {
+        if (!chihiro_cabinet_is(event->jdevice.which)) {
             joystick_added(event->jdevice.which);
         }
         break;
@@ -2736,12 +2832,16 @@ int main(int argc, char *argv[])
             snprintf(dir, sizeof(dir), "%schihiro", g_data_dir);
         }
         setenv("NC_CHIHIRO_DIR", dir, 0);
-        const char *card = opt_value("chihiro.card");
-        nc_chihiro_card_select(card ? atoi(card) : 0);
+        nc_chihiro_card_load_setting(opt_value("chihiro.card"));
         const char *region = opt_value("chihiro.region");
         if (region) {
             setenv("NC_CHIHIRO_REGION", region, 1);
         }
+        /* the board IDs (chihiro.main_id, chihiro.media_id; empty: made) */
+        const char *main_id = opt_value("chihiro.main_id");
+        const char *media_id = opt_value("chihiro.media_id");
+        setenv("NC_CHIHIRO_MAIN_ID", main_id ? main_id : "", 1);
+        setenv("NC_CHIHIRO_MEDIA_ID", media_id ? media_id : "", 1);
         /* link play: the network board on xbased's LAN network, the other
          * cabinets reached by broadcast and at the addresses named (a VPN's) */
         const char *link = opt_value("chihiro.link");
@@ -2753,6 +2853,10 @@ int main(int argc, char *argv[])
             nc_chihiro_link_firmware(getenv("NC_CHIHIRO_DIR"), firmware, sizeof(firmware));
         if (g_chihiro_link_requested) {
             add_arg("net=lan");
+            const char *transport = opt_value("chihiro.link_transport");
+            if (transport && !strcmp(transport, "tcp")) {
+                add_arg("lantransport=tcp");
+            }
             const char *subnet = opt_value("chihiro.link_subnet");
             const char *ip = opt_value("chihiro.link_ip");
             char adapter[64];
@@ -2899,6 +3003,7 @@ int main(int argc, char *argv[])
         if (rv && rv[0]) {
             g_ready_ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, rv);
         }
+        previous_run_alive();   /* its process, before the name goes */
         SetEnvironmentVariableA("XBASED_READY", NULL);
         SetEnvironmentVariableA("XBASED_HOLD", NULL);
         SetEnvironmentVariableA("XBASED_RECT", NULL);
@@ -2919,7 +3024,11 @@ int main(int argc, char *argv[])
     }
 #endif
     nc_core_fault_install(&g_core);
-    pads_changed();
+    if (g_chihiro) {
+        pads_resync();
+    } else {
+        pads_changed();
+    }
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);

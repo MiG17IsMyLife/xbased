@@ -28,10 +28,9 @@ enum {
 
 static char g_serial[16];
 
-void nc_chihiro_media_init(const char serial[12])
+void nc_chihiro_media_init(const char serial[16])
 {
-    memcpy(g_serial, "XB-", 3);
-    memcpy(g_serial + 3, serial, 12);
+    memcpy(g_serial, serial, sizeof(g_serial));
 }
 
 static bool dimm_query(bool network, unsigned dimm_factor, uint16_t operation, uint32_t reply[8])
@@ -51,7 +50,9 @@ static bool dimm_query(bool network, unsigned dimm_factor, uint16_t operation, u
         if (network) {
             return false;
         }
-        reply[1] = 0x02u | DIMM_FIRMWARE << 8;
+        /* the media board's firmware answers 203h; bit 16 would be a
+         * development board (SEGABOOT's "Develop mode") */
+        reply[1] = 0x0203u;
         return true;
     case DIMM_SERIAL:
         memcpy(reply + 1, g_serial, sizeof(g_serial));

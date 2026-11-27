@@ -1315,7 +1315,9 @@ static LRESULT CALLBACK frame_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         set_fullscreen(!g_fs);
         return 0;
     case WM_FRAME_CLOSE:
-        hand_back();
+        if (!w) {
+            hand_back();                /* wParam 1: retired, the session goes on (nc_frame_retire) */
+        }
         ShowWindow(h, SW_HIDE);
         DestroyWindow(h);
         return 0;
@@ -1580,6 +1582,13 @@ void nc_frame_close(void *frame)
 {
     if (frame) {
         PostMessageA((HWND)frame, WM_FRAME_CLOSE, 0, 0);
+    }
+}
+
+void nc_frame_retire(void *frame)
+{
+    if (frame) {
+        PostMessageA((HWND)frame, WM_FRAME_CLOSE, 1, 0);
     }
 }
 
@@ -2023,6 +2032,11 @@ void nc_frame_close(void *frame)
     if (frame) {
         send_msg(frame, FRAME_MSG_CLOSE);
     }
+}
+
+void nc_frame_retire(void *frame)
+{
+    nc_frame_close(frame);  /* (a frame of its own each reboot is Windows' only) */
 }
 
 #endif

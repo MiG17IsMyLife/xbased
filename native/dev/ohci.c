@@ -342,6 +342,7 @@ static void td_copy(Ohci *o, uint32_t cbp, uint32_t be, uint8_t *buf, uint32_t l
 static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
 {
     const uint32_t td_pa = ed[2] & PTR_MASK;
+    const uint32_t head_was = ed[2];            /* the ED's HeadP as read */
     uint32_t td[4];
     if (!rd_words(o, td_pa, td, 4)) {
         ed[2] |= ED_H;
@@ -432,8 +433,23 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
     }
     td[0] = (td[0] & ~(TD_EC_MASK | (0xfu << TD_CC_SHIFT))) | (cc << TD_CC_SHIFT);
 
-    /* Retire: off the ED, onto the done queue. */
+    /* Retire: off the ED, onto the done queue, unless the driver paused the
+     * ED or moved its queue meanwhile (this thread ran late: a host under
+     * load). The driver cancelled the TD then and may have freed it; put
+     * back, its old address in HeadP sent XPP through freed memory. */
     ed[2] = (td[2] & PTR_MASK) | (ed[2] & (ED_H | ED_C));
+    uint32_t *head = (uint32_t *)phys(o, ed_pa + 8, 4);
+    const uint32_t *flags = (const uint32_t *)phys(o, ed_pa, 4);
+    uint32_t expected = head_was;
+    if (!head || !flags || (__atomic_load_n(flags, __ATOMIC_ACQUIRE) & ED_K) ||
+        !__atomic_compare_exchange_n(head, &expected, ed[2], false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        static unsigned s_logged;
+        if (s_logged++ < 8) {
+            nc_log("xbased-native-usb", "ohci: ED %08x changed by the driver while its TD %08x ran: not retired",
+                   ed_pa, td_pa);
+        }
+        return false;
+    }
     td[2] = o->done;
     o->done = td_pa;
     const int di = (int)TD_DI(td[0]);
@@ -444,7 +460,6 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
         o->done_count = 0; /* errors are reported at once */
     }
     wr_words(o, td_pa, td, 4);
-    wr_words(o, ed_pa + 8, &ed[2], 1);
     return !(ed[2] & ED_H);
 }
 

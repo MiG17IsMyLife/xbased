@@ -38,11 +38,16 @@ void nc_chihiro_board_init(const char *dir, const char *save, const NcChihiroCoi
 bool nc_chihiro_board_active(void);
 unsigned nc_chihiro_link_cabinet(void);
 bool nc_chihiro_link_firmware(const char *dir, char *path, size_t capacity);
+/* The media board's flash dump (SEGABOOT's builds) in dir: its path, false
+ * when there's none. With it SEGABOOT boots the game (core.c). */
+bool nc_chihiro_flash_path(const char *dir, char *path, size_t capacity);
 
-/* Card slot 0 selects the latest available card. */
-void nc_chihiro_card_select(int slot);
-int nc_chihiro_card_selected(void);
-int nc_chihiro_card_step(int slot, int direction);
+/* The empty filename selects the most recently updated card. */
+#define NC_CHIHIRO_CARD_NAME_CAP 456
+void nc_chihiro_card_select(const char *name);
+void nc_chihiro_card_load_setting(const char *value);
+void nc_chihiro_card_selected(char name[NC_CHIHIRO_CARD_NAME_CAP]);
+void nc_chihiro_card_step(char name[NC_CHIHIRO_CARD_NAME_CAP], int direction);
 struct NcUsbDev *nc_chihiro_board_qc(void);
 struct NcUsbDev *nc_chihiro_board_sc(void);
 
@@ -79,8 +84,13 @@ typedef struct NcChihiroForce {
 /* On the OHCI worker or under its lock. False with the motor off. */
 bool nc_chihiro_board_force(NcChihiroForce *force);
 
-/* The media board's serial is based on the emulated console's identity. */
-void nc_chihiro_media_init(const char serial[12]);
+/* The media board's serial (the game's MEDIA BD ID), 16 characters */
+void nc_chihiro_media_init(const char serial[16]);
+/* The board IDs a cabinet presents, the baseboard's (base: the game's MAIN BD
+ * ID) or the media board's (MEDIA BD ID): id (chihiro.main_id,
+ * chihiro.media_id) when it has SEGABOOT's form, as AAEE-01D44744715 (see
+ * id_form); else one made from the console's serial. */
+void nc_chihiro_board_id(const char *id, const char console_serial[12], bool base, char out[17]);
 bool nc_chihiro_media_exchange(unsigned dimm_factor, const uint32_t command[8], uint32_t reply[8]);
 bool nc_chihiro_net_exchange(unsigned dimm_factor, const uint32_t command[8], uint32_t reply[8],
                              uint32_t *delay_ms);

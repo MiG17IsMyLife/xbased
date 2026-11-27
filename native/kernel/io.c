@@ -400,6 +400,13 @@ static bool g_chihiro_media;
 #define IO_MBCOM_NET   (0x8000ull * 512u)   /* the network board's window */
 static const char k_mbcom_dev[] = "\\Device\\MediaBoard\\Partition1";
 
+/* SEGABOOT's mbrom0: and mbrom1:, the media board flash's two 1 MB banks,
+ * read raw (its builds and their assets); writes drop. */
+#define IO_MBROM_PART  10               /* and 11 */
+static const char k_mbrom_dev[2][32] = {"\\Device\\MediaBoard\\Rom0", "\\Device\\MediaBoard\\Rom1"};
+static const uint8_t *g_mbrom;
+static size_t g_mbrom_len;
+
 /* path past prefix when it names that device or a file in it, else NULL */
 static const char *under(const char *path, const char *prefix, size_t len)
 {
@@ -417,6 +424,11 @@ static IoDevicePath device_path(const char *path)
     const char *rel;
     if (g_chihiro_media && (rel = under(path, mbfs, sizeof(mbfs) - 1))) {
         return (IoDevicePath){.kind = IO_DEVICE_DISC, .relative = rel};
+    }
+    for (int b = 0; g_mbrom && b < 2; b++) {
+        if ((rel = under(path, k_mbrom_dev[b], strlen(k_mbrom_dev[b])))) {
+            return (IoDevicePath){.kind = IO_DEVICE_RAW_DISK, .partition = IO_MBROM_PART + b, .relative = rel};
+        }
     }
     if (g_chihiro_media && (rel = under(path, k_mbcom_dev, sizeof(k_mbcom_dev) - 1))) {
         return (IoDevicePath){.kind = IO_DEVICE_RAW_DISK, .partition = IO_MBCOM_PART, .relative = rel};
@@ -466,6 +478,19 @@ void nc_io_mount_chihiro_media(const char *executable, const char *test_executab
     link_set("\\??\\mbfs:", NC_CHIHIRO_MBFS);
     link_set("\\??\\mbcom:", k_mbcom_dev);
     link_set("\\??\\D:", NC_CHIHIRO_MBFS);
+}
+
+bool nc_io_chihiro_segaboot(void)
+{
+    return g_mbrom != NULL;
+}
+
+void nc_io_mount_chihiro_flash(const uint8_t *flash, size_t len)
+{
+    g_mbrom = flash;
+    g_mbrom_len = len;
+    link_set("\\??\\mbrom0:", k_mbrom_dev[0]);
+    link_set("\\??\\mbrom1:", k_mbrom_dev[1]);
 }
 
 const char *nc_io_chihiro_boot(bool test)
@@ -2005,6 +2030,18 @@ static uint64_t file_size(const NcFile *nf)
 
 static void raw_io(int part, uint64_t off, uint8_t *buf, uint32_t len, bool write)
 {
+    if (part == IO_MBROM_PART || part == IO_MBROM_PART + 1) {
+        const uint64_t bank = (uint64_t)(part - IO_MBROM_PART) << 20, end = bank + (1u << 20);
+        if (!write) {
+            memset(buf, 0xff, len);
+            const uint64_t at = bank + off;
+            if (at < end && at < g_mbrom_len) {
+                const uint64_t lim = end < g_mbrom_len ? end : g_mbrom_len;
+                memcpy(buf, g_mbrom + at, (size_t)(lim - at < len ? lim - at : len));
+            }
+        }
+        return;
+    }
     if (part == IO_MBCOM_PART && off >= IO_MBCOM_NET && off - IO_MBCOM_NET < 0x100000u &&
         nc_chihiro_net_window((uint32_t)(off - IO_MBCOM_NET), buf, len, write)) {
         return;
@@ -2244,7 +2281,7 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         return NC_STATUS_INVALID_HANDLE;
     }
     const uint32_t va0 = nrun ? run[0].va : 0;
-    const int raw = nf->kind == F_VOLUME && (nf->partition == 0 || nf->partition == IO_MBCOM_PART) ? nf->partition
+    const int raw = nf->kind == F_VOLUME && (nf->partition == 0 || nf->partition >= IO_MBCOM_PART) ? nf->partition
                   : nf->kind == F_HOST && nf->is_dir ? partition_root(nf) : -1;
     if (raw == 0 || raw >= 3) {
         /* The raw disk's config sectors, or a cache partition read raw. */
@@ -2474,7 +2511,7 @@ static uint64_t write_data(NcKernel *k, const uint32_t *a, const uint8_t *src, u
         return NC_STATUS_INVALID_HANDLE;
     }
     if (nf->kind == F_VOLUME) {
-        if (nf->partition == 0 || nf->partition == IO_MBCOM_PART) {
+        if (nf->partition == 0 || nf->partition >= IO_MBCOM_PART) {
             const uint64_t off = io_offset(k, nf, a[7]);
             raw_io(nf->partition, off, (uint8_t *)src, len, true);
             io_moved(k, nf, a[7], off + len);

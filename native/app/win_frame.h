@@ -72,5 +72,8 @@ void nc_frame_toggle_fullscreen(void *frame);
 bool nc_frame_minimized(void *frame);
 /* The session's over (back to the dashboard): the frame goes at once. */
 void nc_frame_close(void *frame);
+/* The session goes on in a frame of its own (a cabinet's reboot): this one
+ * goes at once, the dashboard left hidden. */
+void nc_frame_retire(void *frame);
 
 #endif

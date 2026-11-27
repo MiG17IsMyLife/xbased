@@ -48,9 +48,75 @@ static void init_xbox_devices(NcVm *vm, bool network_enabled)
     nc_dev_misc_init();
 }
 
+/* SEGABOOT, when the media board's flash is there (nc_chihiro_flash_path):
+ * its newer build (the flash's second bank, else the first) put on the hard
+ * disk and booted as the cabinet does at power on and on every reboot; it
+ * boots the game, or its test program. */
+static void chihiro_segaboot(const char *dir, NcChihiroBoot *game, const char media_id[17])
+{
+    char path[1100];
+    FILE *f = nc_chihiro_flash_path(dir, path, sizeof(path)) ? fopen(path, "rb") : NULL;
+    if (!f) {
+        return;
+    }
+    static uint8_t flash[2u << 20];
+    const size_t n = fread(flash, 1, sizeof(flash), f);
+    fclose(f);
+    const size_t bank = n >= (2u << 20) && !memcmp(flash + (1u << 20), "XBEH", 4) ? (1u << 20) : 0;
+    if (memcmp(flash + bank, "XBEH", 4)) {
+        nc_log("xbased-native-chihiro", "SEGABOOT: no XBE in the media board's flash");
+        return;
+    }
+    /* the board's serial where its flash keeps it (MBDT), the MEDIA BD ID
+     * SEGABOOT hands the game */
+    if (n >= 0x100000 && !memcmp(flash + 0xFFE00, "MBDT", 4)) {
+        memcpy(flash + 0xFFE10, media_id, 16);
+    }
+    char host[600];
+    snprintf(host, sizeof(host), "%s/Partition1/chihiro-segaboot.xbe", nc_io_hdd_root());
+    FILE *o = fopen(host, "wb");
+    const bool ok = o && fwrite(flash + bank, 1, 1u << 20, o) == (1u << 20);
+    if (o) {
+        fclose(o);
+    }
+    if (!ok) {
+        nc_log("xbased-native-chihiro", "SEGABOOT: can't write %s", host);
+        return;
+    }
+    snprintf(game->boot_path, sizeof(game->boot_path), "%s", NC_CHIHIRO_SEGABOOT_XBE);
+    nc_io_mount_chihiro_flash(flash, n);
+    nc_log("xbased-native-chihiro", "SEGABOOT: the flash's bank %u booted first", bank ? 1u : 0u);
+}
+
+/* The board memory's file, a build's own (Ver.A and Ver.B share a game
+ * code): the shared file of earlier versions is its start. */
+static void chihiro_board_memory(int disc_fd, const NcChihiroBoot *game, char *save, size_t cap)
+{
+    char shared[600];
+    snprintf(shared, sizeof(shared), "%s/chihiro-%s.bin", nc_io_hdd_root(), game->game_id);
+    snprintf(save, cap, "%s/chihiro-%s-%08X.bin", nc_io_hdd_root(), game->game_id,
+             nc_chihiro_boot_tag(disc_fd, game));
+    if (access(save, 0) == 0 || access(shared, 0) != 0) {
+        return;
+    }
+    FILE *from = fopen(shared, "rb"), *to = fopen(save, "wb");
+    char buf[4096];
+    for (size_t n; from && to && (n = fread(buf, 1, sizeof(buf), from)) > 0;) {
+        fwrite(buf, 1, n, to);
+    }
+    if (from) {
+        fclose(from);
+    }
+    if (to) {
+        fclose(to);
+    }
+    nc_log("xbased-native-chihiro", "board memory: %s starts from %s", save, shared);
+}
+
 bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
 {
     memset(c, 0, sizeof(*c));
+    char media_id[17] = "";
     c->disc.fd = -1;
     NcChihiroBoot chihiro;
     const char *probe_error = nc_chihiro_boot_probe(disc_fd, boot->chihiro_test, &chihiro);
@@ -104,21 +170,36 @@ bool nc_core_boot(NcCore *c, int disc_fd, const NcBootOptions *boot)
     }
     nc_ports_set_chihiro(chihiro.title != NULL);
     if (chihiro.title) {
-        char serial[12];
+        nc_kernel_set_av_chihiro();
+        /* the game's MAIN BD ID is the baseboard's serial, its MEDIA BD ID
+         * the media board's */
+        char serial[12], main_id[17];
         nc_ex_console_serial(&c->kernel, serial);
-        nc_chihiro_media_init(serial);
+        nc_chihiro_board_id(getenv("NC_CHIHIRO_MAIN_ID"), serial, true, main_id);
+        nc_chihiro_board_id(getenv("NC_CHIHIRO_MEDIA_ID"), serial, false, media_id);
+        setenv("NC_CHIHIRO_MAIN_ID", main_id, 1);   /* the baseboard's EEPROM (nc_chihiro_board_init) */
+        nc_log("xbased-native-chihiro", "MAIN BD ID %s, MEDIA BD ID %s", main_id, media_id);
+        nc_chihiro_media_init(media_id);
         if (cabinet) {
-            char media_serial[16] = "XB-";
-            memcpy(media_serial + 3, serial, sizeof(serial));
-            if (!nc_chihiro_lpc_load_network(firmware, media_serial, cabinet)) {
+            if (!nc_chihiro_lpc_load_network(firmware, media_id, cabinet)) {
                 cabinet = 0;
             }
         }
         char save[600];
-        snprintf(save, sizeof(save), "%s/chihiro-%s.bin", nc_io_hdd_root(), chihiro.game_id);
-        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &boot->chihiro_coins, cabinet);
+        chihiro_board_memory(disc_fd, &chihiro, save, sizeof(save));
+        /* with SEGABOOT its test menu sets the coins (and the game's test
+         * menu its costs), kept in the board's memory: not ours over them */
+        NcChihiroCoinSettings coins = boot->chihiro_coins;
+        char flash[1100];
+        if (nc_chihiro_flash_path(chihiro_dir, flash, sizeof(flash))) {
+            memset(&coins, 0, sizeof(coins));
+        }
+        nc_chihiro_board_init(chihiro_dir && *chihiro_dir ? chihiro_dir : "chihiro", save, &coins, cabinet);
     }
     init_xbox_devices(&c->vm, !chihiro.title || cabinet != 0);
+    if (chihiro.title && !boot->chihiro_test) {
+        chihiro_segaboot(chihiro_dir, &chihiro, media_id);
+    }
     if (chihiro.title) {
         nc_io_mount_chihiro_media(chihiro.game_executable, chihiro.test_executable);
         nc_log("xbased-native-chihiro", "direct boot: %s, %s, 128 MiB", chihiro.title, chihiro.executable);

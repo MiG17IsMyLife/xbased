@@ -17,6 +17,8 @@ extern "C" {
 /* Present a folder as a disc using its open default.xbe or Chihiro boot.id.
  * The descriptor identifies the folder in subsequent nc_fold_read calls. */
 bool nc_fold_attach(int fd);
+/* The folder holding the file open as fd. */
+bool nc_fold_fd_dir(int fd, char *out, size_t cap);
 void nc_fold_detach(int fd);
 /* fd registered as a folder */
 bool nc_fold_is(int fd);

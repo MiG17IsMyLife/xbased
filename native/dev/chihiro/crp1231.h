@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #define NC_CARD_BYTES 69
+#define NC_CARD_PATH_CAP 1024
 
 typedef struct NcCardReader {
     uint8_t in[260];            /* the host's frame being gathered */
@@ -23,7 +24,7 @@ typedef struct NcCardReader {
     uint8_t card[NC_CARD_BYTES];
     int where;                  /* where the card is (crp1231.c) */
     bool written;               /* the card has data on it */
-    char path[512];             /* its file, "" for a blank not yet written */
+    char path[NC_CARD_PATH_CAP]; /* its file, "" for a blank not yet written */
     bool waiting;               /* a take-in waits for a card */
     bool cleaning;
     uint64_t clean_start_ns;

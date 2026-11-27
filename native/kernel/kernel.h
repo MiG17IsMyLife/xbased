@@ -452,6 +452,7 @@ void nc_kernel_loaded_fixups(NcKernel *k);
 #define NC_VIDEO_PAL60      0x00400000u
 enum { NC_AV_PACK_HDTV, NC_AV_PACK_STANDARD, NC_AV_PACK_SVIDEO, NC_AV_PACK_SCART, NC_AV_PACK_VGA };
 void nc_kernel_set_video(int64_t flags, int av_pack);
+void nc_kernel_set_av_chihiro(void);
 
 /* ex.c: the console's language, the EEPROM's XC_LANGUAGE that XGetLanguage
  * returns: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian,
@@ -687,6 +688,13 @@ void nc_io_mount_chihiro_media(const char *executable, const char *test_executab
 /* Chihiro: the full path of the game's XBE or, for test, the test XBE
  * (the game's if boot.id names none); NULL on an Xbox */
 const char *nc_io_chihiro_boot(bool test);
+/* Chihiro: the media board's flash (2 MB), read raw as mbrom0: and mbrom1:
+ * (SEGABOOT's); kept by the caller. */
+void nc_io_mount_chihiro_flash(const uint8_t *flash, size_t len);
+/* Chihiro: SEGABOOT is there (nc_io_mount_chihiro_flash) */
+bool nc_io_chihiro_segaboot(void);
+/* SEGABOOT's XBE on the hard disk's first partition (nc_core_boot puts it there) */
+#define NC_CHIHIRO_SEGABOOT_XBE "\\Device\\Harddisk0\\Partition1\\chihiro-segaboot.xbe"
 /* The path within the currently mounted media device, if this names one. */
 const char *nc_io_disc_relative(const char *path);
 /* Whether the disc has language folders, English's among them, and none for

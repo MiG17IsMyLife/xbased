@@ -20,6 +20,9 @@
 #include <errno.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
+#ifndef _WIN32
+#include <netinet/tcp.h>
+#endif
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +39,8 @@ typedef struct Station {
     uint8_t mac[6];
     struct sockaddr_in at;
     time_t seen;
+    bool tcp;
+    time_t tcp_retry;
     bool remote;                        /* outside the local network: flooded to */
 } Station;
 
@@ -46,6 +51,7 @@ static struct {
     uint8_t own[6];                     /* the console's MAC (its frames' source) */
     bool own_known;
     bool multicast;
+    struct in_addr local;
     Station st[MACS];
     time_t hello;                       /* the last hello sent */
     uint64_t flooded, unicast, dropped_own;
@@ -120,6 +126,7 @@ static bool lan_join_discovery(const NcNetConfig *c)
     g_lan.discovery_bcast = g_lan.bcast;
     g_lan.discovery_bcast.sin_addr.s_addr = broadcast;
     g_lan.multicast = true;
+    g_lan.local = membership.imr_interface;
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &membership.imr_interface, ip, sizeof(ip));
     nc_log("xbased-native-net", "lan: multicast 225.0.0.1:%u via %s", c->lan_port, ip);
@@ -212,6 +219,8 @@ static void flood(const uint8_t *frame, size_t len)
     g_lan.flooded++;
 }
 
+static const char tcp_tag[] = "TCP1";
+
 static void hello(void)
 {
     uint8_t f[60] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -219,7 +228,10 @@ static void hello(void)
     f[12] = HELLO_TYPE >> 8;
     f[13] = HELLO_TYPE & 0xff;
     memcpy(f + 14, "xbased hello", 12);
-    if (g_lan.multicast) {
+    if (nc_net_config()->lan_tcp) {
+        memcpy(f + 26, tcp_tag, sizeof(tcp_tag));
+    }
+    if (g_lan.multicast || (nc_net_config()->lan_tcp && !nc_net_config()->npeers)) {
         send_to(&g_lan.bcast, f, sizeof(f));
         if (g_lan.discovery_bcast.sin_addr.s_addr) {
             send_to(&g_lan.discovery_bcast, f, sizeof(f));
@@ -265,13 +277,31 @@ static bool own(const uint8_t *frame)
     return true;
 }
 
+static void tcp_send_frame(Station *peer, const uint8_t *frame, size_t len);
+
 static void lan_input(const uint8_t *frame, size_t len)
 {
     if (len < 14) {
         return;
     }
     own(frame);
-    const Station *s = (frame[0] & 1) ? NULL : station(frame);
+    Station *s = (frame[0] & 1) ? NULL : station(frame);
+    if (nc_net_config()->lan_tcp) {
+        if (s) {
+            if (s->tcp) {
+                tcp_send_frame(s, frame, len);
+            }
+        } else {
+            const time_t now = time(NULL);
+            for (unsigned i = 0; i < MACS; i++) {
+                Station *peer = &g_lan.st[i];
+                if (peer->tcp && peer->seen && now - peer->seen < MAC_TTL_S) {
+                    tcp_send_frame(peer, frame, len);
+                }
+            }
+        }
+        return;
+    }
     if (s) {
         send_to(&s->at, frame, len);
         g_lan.unicast++;
@@ -280,7 +310,7 @@ static void lan_input(const uint8_t *frame, size_t len)
     }
 }
 
-static void learn(const uint8_t *mac, const struct sockaddr_in *from)
+static void learn(const uint8_t *mac, const struct sockaddr_in *from, bool tcp)
 {
     if (mac[0] & 1) {
         return;                         /* not a station's address */
@@ -299,6 +329,7 @@ static void learn(const uint8_t *mac, const struct sockaddr_in *from)
                        mac[3], mac[4], mac[5], a, ntohs(from->sin_port));
             }
             s->at = *from;
+            s->tcp |= tcp;
             s->seen = now;
             s->remote = remote;
             return;
@@ -313,6 +344,8 @@ static void learn(const uint8_t *mac, const struct sockaddr_in *from)
     Station *s = free_slot ? free_slot : oldest;
     memcpy(s->mac, mac, 6);
     s->at = *from;
+    s->tcp = tcp;
+    s->tcp_retry = 0;
     s->seen = now;
     s->remote = remote;
     char a[INET_ADDRSTRLEN];
@@ -321,10 +354,312 @@ static void learn(const uint8_t *mac, const struct sockaddr_in *from)
            mac[4], mac[5], a, ntohs(from->sin_port), remote ? " (outside the local network)" : "");
 }
 
+#define TCP_LINKS 16
+#define TCP_QUEUE_BYTES (32u * 1024u)
+
+/* Each direction has its own stream so simultaneous starts need no tie-break. */
+typedef struct TcpLink {
+    bool used, outgoing, connecting;
+    int fd;
+    unsigned generation;
+    struct sockaddr_in at;
+    uint8_t mac[6];
+    time_t deadline;
+    size_t begin, end, received;
+    uint8_t tx[TCP_QUEUE_BYTES];
+    uint8_t rx[2 + NC_NET_FRAME_MAX];
+} TcpLink;
+
+static TcpLink tcp_links[TCP_LINKS];
+static int tcp_listener = -1;
+static time_t tcp_listen_retry;
+static unsigned tcp_polled_generation[TCP_LINKS];
+
+static void tcp_close(TcpLink *link)
+{
+    nc_net_close(link->fd);
+    link->used = false;
+}
+
+static TcpLink *tcp_slot(void)
+{
+    for (unsigned i = 0; i < TCP_LINKS; i++) {
+        if (!tcp_links[i].used) {
+            return &tcp_links[i];
+        }
+    }
+    return NULL;
+}
+
+static int tcp_socket(void)
+{
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        nc_net_nonblock(fd);
+    }
+    return fd;
+}
+
+static void tcp_listen(void)
+{
+    const time_t now = time(NULL);
+    if (tcp_listener >= 0 || now < tcp_listen_retry) {
+        return;
+    }
+    const NcNetConfig *c = nc_net_config();
+    const struct sockaddr_in addr = {
+        .sin_family = AF_INET, .sin_port = htons(c->lan_port), .sin_addr = g_lan.local
+    };
+    const int fd = tcp_socket();
+    if (fd >= 0) {
+        const int one = 1;
+#ifdef _WIN32
+        setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const void *)&one, sizeof(one));
+#else
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&one, sizeof(one));
+#endif
+        if (bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0 && listen(fd, TCP_LINKS) == 0) {
+            tcp_listener = fd;
+            nc_log("xbased-native-net", "lan: TCP frame transport listening on port %u", c->lan_port);
+            return;
+        }
+        nc_net_close(fd);
+    }
+    if (!tcp_listen_retry) {
+        nc_log("xbased-native-net", "lan: TCP listen failed on port %u; retrying", c->lan_port);
+    }
+    tcp_listen_retry = now + 1;
+}
+
+static TcpLink *tcp_connect_peer(Station *peer)
+{
+    for (unsigned i = 0; i < TCP_LINKS; i++) {
+        TcpLink *link = &tcp_links[i];
+        if (link->used && link->outgoing && !memcmp(link->mac, peer->mac, 6)) {
+            if (link->at.sin_addr.s_addr == peer->at.sin_addr.s_addr && link->at.sin_port == peer->at.sin_port) {
+                return link;
+            }
+            tcp_close(link);
+            break;
+        }
+    }
+    TcpLink *link = tcp_slot();
+    const time_t now = time(NULL);
+    if (!link || now < peer->tcp_retry) {
+        return NULL;
+    }
+    peer->tcp_retry = now + 1;
+    const int fd = tcp_socket();
+    if (fd < 0) {
+        return NULL;
+    }
+    if (g_lan.local.s_addr) {
+        const struct sockaddr_in local = {.sin_family = AF_INET, .sin_addr = g_lan.local};
+        if (bind(fd, (const struct sockaddr *)&local, sizeof(local)) != 0) {
+            nc_net_close(fd);
+            return NULL;
+        }
+    }
+    const int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)&one, sizeof(one));
+    const int rc = connect(fd, (const struct sockaddr *)&peer->at, sizeof(peer->at));
+    const int err = rc != 0 ? nc_net_errno() : 0;
+    if (rc != 0 && err != EINPROGRESS && err != EAGAIN && err != EINTR) {
+        nc_net_close(fd);
+        return NULL;
+    }
+    link->used = link->outgoing = true;
+    link->connecting = rc != 0;
+    link->fd = fd;
+    link->generation++;
+    link->at = peer->at;
+    memcpy(link->mac, peer->mac, 6);
+    link->deadline = rc != 0 ? now + 4 : 0;
+    link->begin = link->end = 0;
+    return link;
+}
+
+static void tcp_send_frame(Station *peer, const uint8_t *frame, size_t len)
+{
+    TcpLink *link = tcp_connect_peer(peer);
+    if (!link) {
+        return;
+    }
+    if (sizeof(link->tx) - link->end < len + 2) {
+        link->end -= link->begin;
+        memmove(link->tx, link->tx + link->begin, link->end);
+        link->begin = 0;
+        if (sizeof(link->tx) - link->end < len + 2) {
+            nc_log("xbased-native-net", "lan: TCP send backlog full; closing stalled connection");
+            tcp_close(link);
+            return;
+        }
+    }
+    link->tx[link->end++] = (uint8_t)(len >> 8);
+    link->tx[link->end++] = (uint8_t)len;
+    memcpy(link->tx + link->end, frame, len);
+    link->end += len;
+}
+
+static void tcp_accept(void)
+{
+    for (unsigned i = 0; i < TCP_LINKS; i++) {
+        struct sockaddr_in from;
+        socklen_t len = sizeof(from);
+#ifdef _WIN32
+        const int fd = accept(tcp_listener, (struct sockaddr *)&from, &len);
+#else
+        const int fd = accept4(tcp_listener, (struct sockaddr *)&from, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#endif
+        if (fd < 0) {
+            break;
+        }
+        TcpLink *link = tcp_slot();
+        bool discovered = false;
+        for (unsigned k = 0; k < MACS; k++) {
+            const Station *s = &g_lan.st[k];
+            if (s->tcp && s->seen && time(NULL) - s->seen < MAC_TTL_S &&
+                s->at.sin_addr.s_addr == from.sin_addr.s_addr) {
+                discovered = true;
+                break;
+            }
+        }
+        if (!link || !discovered) {
+            nc_net_close(fd);
+            continue;
+        }
+        nc_net_nonblock(fd);
+        link->used = true;
+        link->outgoing = link->connecting = false;
+        link->fd = fd;
+        link->generation++;
+        link->at = from;
+        link->deadline = time(NULL) + 4;
+        link->received = 0;
+    }
+}
+
+static bool tcp_read_frames(TcpLink *link)
+{
+    for (unsigned i = 0; i < 128; i++) {
+        size_t want = 2;
+        if (link->received >= 2) {
+            const size_t len = (size_t)link->rx[0] * 256 + link->rx[1];
+            if (len < 14 || len > NC_NET_FRAME_MAX) {
+                return false;
+            }
+            want += len;
+        }
+        if (link->received < want) {
+            const ssize_t n = recv(link->fd, (void *)(link->rx + link->received), want - link->received, 0);
+            if (n <= 0) {
+                return n < 0 && (nc_net_errno() == EAGAIN || nc_net_errno() == EINTR);
+            }
+            link->received += (size_t)n;
+            continue;
+        }
+        const uint8_t *frame = link->rx + 2;
+        if (link->deadline) {
+            const Station *peer = station(frame + 6);
+            if (!peer || !peer->tcp || peer->at.sin_addr.s_addr != link->at.sin_addr.s_addr) {
+                return false;
+            }
+            memcpy(link->mac, frame + 6, 6);
+            link->deadline = 0;
+            nc_log("xbased-native-net", "lan: TCP stream from %02x:%02x:%02x:%02x:%02x:%02x",
+                   frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]);
+        }
+        if (memcmp(link->mac, frame + 6, 6)) {
+            return false;
+        }
+        nc_net_deliver(frame, want - 2);
+        link->received = 0;
+    }
+    return true;
+}
+
+static bool tcp_write_frames(TcpLink *link, short events)
+{
+    if (link->connecting) {
+        if (!(events & POLLOUT)) {
+            return true;
+        }
+        int status = 0;
+        socklen_t len = sizeof(status);
+        if (getsockopt(link->fd, SOL_SOCKET, SO_ERROR, (void *)&status, &len) != 0 || status) {
+            return false;
+        }
+        link->connecting = false;
+        link->deadline = 0;
+    }
+    if (events & POLLIN) {
+        uint8_t byte;
+        const ssize_t n = recv(link->fd, (void *)&byte, 1, 0);
+        if (n >= 0 || nc_net_errno() != EAGAIN) {
+            return false;
+        }
+    }
+    if ((events & POLLOUT) && link->begin != link->end) {
+        const ssize_t n = send(link->fd, (const void *)(link->tx + link->begin), link->end - link->begin,
+                               MSG_NOSIGNAL);
+        if (n <= 0) {
+            return n < 0 && (nc_net_errno() == EAGAIN || nc_net_errno() == EINTR);
+        }
+        link->begin += (size_t)n;
+        if (link->begin == link->end) {
+            link->begin = link->end = 0;
+        }
+    }
+    return true;
+}
+
 static int lan_fill(struct pollfd *fds, int max, int *timeout_ms)
 {
-    fds[0] = (struct pollfd){ .fd = g_lan.fd, .events = POLLIN };
-    return 1;
+    int n = 0;
+    fds[n++] = (struct pollfd){ .fd = g_lan.fd, .events = POLLIN };
+    if (!nc_net_config()->lan_tcp) {
+        return n;
+    }
+    tcp_listen();
+    if (tcp_listener >= 0 && n < max) {
+        fds[n++] = (struct pollfd){ .fd = tcp_listener, .events = POLLIN };
+    }
+    for (unsigned i = 0; i < TCP_LINKS && n < max; i++) {
+        const TcpLink *link = &tcp_links[i];
+        if (link->used) {
+            const short events = POLLIN | (link->outgoing && (link->connecting || link->begin != link->end) ? POLLOUT : 0);
+            tcp_polled_generation[i] = link->generation;
+            fds[n++] = (struct pollfd){ .fd = link->fd, .events = events };
+        }
+    }
+    return n;
+}
+
+static void tcp_poll(struct pollfd *fds, int n)
+{
+    const time_t now = time(NULL);
+    bool accept_ready = false;
+    for (int i = 1; i < n; i++) {
+        const short events = fds[i].revents;
+        if (fds[i].fd == tcp_listener) {
+            accept_ready = events & POLLIN;
+            continue;
+        }
+        for (unsigned k = 0; k < TCP_LINKS; k++) {
+            TcpLink *link = &tcp_links[k];
+            if (!link->used || link->fd != fds[i].fd || link->generation != tcp_polled_generation[k]) {
+                continue;
+            }
+            if ((events & (POLLERR | POLLHUP | POLLNVAL)) || (link->deadline && now >= link->deadline) ||
+                (link->outgoing ? !tcp_write_frames(link, events) : ((events & POLLIN) && !tcp_read_frames(link)))) {
+                tcp_close(link);
+            }
+            break;
+        }
+    }
+    if (accept_ready) {
+        tcp_accept();
+    }
 }
 
 /* Whether a is one of this device's addresses. */
@@ -363,10 +698,10 @@ static void twin(const struct sockaddr_in *from)
     nc_net_twin(from->sin_addr.s_addr);     /* the app says so */
 }
 
-static void lan_poll(struct pollfd *fds, int n)
+static void poll_discovery(struct pollfd *fds, bool tcp)
 {
-    const time_t interval = g_lan.multicast ? 1 : HELLO_S;
-    if ((g_lan.multicast || nc_net_config()->npeers) && time(NULL) - g_lan.hello >= interval && own(NULL)) {
+    const time_t interval = g_lan.multicast || tcp ? 1 : HELLO_S;
+    if ((tcp || g_lan.multicast || nc_net_config()->npeers) && time(NULL) - g_lan.hello >= interval && own(NULL)) {
         hello();
     }
     if (!(fds[0].revents & POLLIN)) {
@@ -388,10 +723,24 @@ static void lan_poll(struct pollfd *fds, int n)
             twin(&from);
             continue;
         }
-        learn(buf + 6, &from);
-        if (!is_hello(buf, (size_t)r)) {
+        const bool discovery = is_hello(buf, (size_t)r);
+        const bool tcp_peer = discovery && r >= 26 + (ssize_t)sizeof(tcp_tag) &&
+                              !memcmp(buf + 26, tcp_tag, sizeof(tcp_tag));
+        if (!tcp || tcp_peer) {
+            learn(buf + 6, &from, tcp_peer);
+        }
+        if (!tcp && !discovery) {
             nc_net_deliver(buf, (size_t)r);
         }
+    }
+}
+
+static void lan_poll(struct pollfd *fds, int n)
+{
+    const bool tcp = nc_net_config()->lan_tcp;
+    poll_discovery(fds, tcp);
+    if (tcp) {
+        tcp_poll(fds, n);
     }
 }
 

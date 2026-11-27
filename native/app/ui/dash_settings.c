@@ -293,6 +293,12 @@ static void link_rows(List *l)
     if (!link || !strcmp(link, "off")) {
         return;
     }
+    static const char *const transports[] = {"udp", "tcp"};
+    static const char *const transport_labels[] = {"UDP", "TCP"};
+    opt_choice(l, S_CH_LINK_TRANSPORT, "chihiro.link_transport", transports, transport_labels, 2, "udp");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_LINK_TRANSPORT), HELP_NEXT_START);
+    }
     text_field(l, S_CH_LINK_SUBNET, "chihiro.link_subnet", "");
     if (list_selected(l)) {
         dash_help(T(S_H_CH_LINK_SUBNET), HELP_NEXT_START);
@@ -315,9 +321,31 @@ static void region_row(List *l)
     opt_choice(l, S_CH_REGION, "chihiro.region", rv, rn, 3, "1");
 }
 
+/* SEGABOOT is there (the media board's flash in the cabinet's folder): it
+ * boots the game, and the coins are its test menu's (COIN ASSIGNMENTS), the
+ * costs the game's test menu's; the core leaves them (core.c). Looked for
+ * once a second. */
+static bool segaboot_present(void)
+{
+    static uint64_t at;
+    static bool present;
+    const uint64_t now = SDL_GetTicks();
+    if (!at || now - at >= 1000) {
+        at = now;
+        char dir[1100], flash[1200];
+        dash_chihiro_firmware(dir, sizeof(dir));
+        present = nc_chihiro_flash_path(dir, flash, sizeof(flash));
+    }
+    return present;
+}
+
 static void segaboot_choice(List *l, enum UiStr label, const char *key,
                             const char *const *values, const char *const *names, int count)
 {
+    if (segaboot_present()) {
+        list_row_fixed(l, T(label), T(S_CH_IN_TEST_MENU), T(S_H_CH_COIN_SEGABOOT));
+        return;
+    }
     opt_choice(l, label, key, values, names, count, "0");
     if (list_selected(l)) {
         dash_help(T(S_H_CH_COIN_SETTING), HELP_NEXT_START);
@@ -328,6 +356,14 @@ static void segaboot_rows(List *l)
 {
     list_heading(l, T(S_CH_SEGABOOT));
     region_row(l);
+    text_field(l, S_CH_MAIN_ID, "chihiro.main_id", "");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_BOARD_ID), HELP_NEXT_START);
+    }
+    text_field(l, S_CH_MEDIA_ID, "chihiro.media_id", "");
+    if (list_selected(l)) {
+        dash_help(T(S_H_CH_BOARD_ID), HELP_NEXT_START);
+    }
     static const char *const values[] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
     const char *const rates[] = {
         T(S_CH_BOARD_VALUE), "1 : 1", "2 : 1", "3 : 1", "4 : 1", "5 : 1",
@@ -354,22 +390,21 @@ static void segaboot_rows(List *l)
 
 static void card_row(List *l)
 {
-    int slot = nc_chihiro_card_selected();
-    char filename[24];
-    snprintf(filename, sizeof(filename), "card%03d.bin", slot);
+    char filename[NC_CHIHIRO_CARD_NAME_CAP];
+    nc_chihiro_card_selected(filename);
     int delta = 0;
-    if (list_row(l, T(S_CH_CARD_SELECT), slot ? filename : T(S_CH_CARD_LATEST), &delta)) {
+    if (list_row(l, T(S_CH_CARD_SELECT), filename[0] ? filename : T(S_CH_CARD_LATEST), &delta)) {
         delta = 1;
     }
     if (list_selected(l)) {
         dash_help(T(S_H_CH_CARD), HELP_NOW);
     }
     if (delta) {
-        slot = nc_chihiro_card_step(slot, delta);
-        char value[8];
-        snprintf(value, sizeof(value), "%d", slot);
+        nc_chihiro_card_step(filename, delta);
+        char value[sizeof(filename) + sizeof("file:")];
+        snprintf(value, sizeof(value), "file:%s", filename);
         cfg_set(&D.game, "chihiro.card", value);
-        nc_chihiro_card_select(slot);
+        nc_chihiro_card_select(filename);
     }
 }
 

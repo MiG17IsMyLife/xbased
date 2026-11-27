@@ -343,6 +343,11 @@ static bool fd_dir(int fd, char *out, size_t cap)
     return true;
 }
 
+bool nc_fold_fd_dir(int fd, char *out, size_t cap)
+{
+    return fd_dir(fd, out, cap);
+}
+
 bool nc_fold_attach(int fd)
 {
     char magic[4];

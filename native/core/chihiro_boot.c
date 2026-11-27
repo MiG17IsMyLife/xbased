@@ -5,6 +5,9 @@
  * and chihiro_game_name_of in hw/xbox/chihiro/chihiro.c (98fbd75).
  */
 #include "native/core/chihiro_boot.h"
+#include "native/core/fold_image.h"
+
+#include <stdint.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -105,6 +108,30 @@ static bool boot_of_xbe(const char *xbe, char *out, size_t cap, bool *test)
         return false;
     }
     return false;
+}
+
+unsigned nc_chihiro_boot_tag(int boot_fd, const NcChihiroBoot *game)
+{
+    char dir[1024], xbe[1100];
+    if (!nc_fold_fd_dir(boot_fd, dir, sizeof(dir))) {
+        return 0;
+    }
+    snprintf(xbe, sizeof(xbe), "%s/%s", dir, game->game_executable);
+    for (char *c = xbe + strlen(dir); *c; c++) {
+        *c = *c == '\\' ? '/' : *c;
+    }
+    const int fd = open(xbe, O_RDONLY | O_CLOEXEC | O_BINARY);
+    if (fd < 0) {
+        return 0;
+    }
+    uint8_t head[4096];
+    const ssize_t n = pread(fd, head, sizeof(head), 0);
+    close(fd);
+    unsigned h = 2166136261u;
+    for (ssize_t i = 0; i < n; i++) {
+        h = (h ^ head[i]) * 16777619u;
+    }
+    return n > 0 ? h : 0;
 }
 
 bool nc_chihiro_boot_path(const char *path, char *out, size_t cap, bool *test)

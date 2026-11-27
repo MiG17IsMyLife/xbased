@@ -141,7 +141,11 @@ bool nc_xbox_boot_xbe(NcCore *c, int disc_fd, const NcBootOptions *boot, const N
     bool have_page = false;
     char default_xbe[NC_LAUNCH_PAGE];
     if (chihiro) {
-        snprintf(default_xbe, sizeof(default_xbe), NC_CHIHIRO_MBFS "\\%s", chihiro->executable);
+        if (chihiro->boot_path[0]) {
+            snprintf(default_xbe, sizeof(default_xbe), "%s", chihiro->boot_path);
+        } else {
+            snprintf(default_xbe, sizeof(default_xbe), NC_CHIHIRO_MBFS "\\%s", chihiro->executable);
+        }
     } else {
         snprintf(default_xbe, sizeof(default_xbe), "%s", boot->dashboard ? NC_DASHBOARD_PATH : "\\default.xbe");
     }

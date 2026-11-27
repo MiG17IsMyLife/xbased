@@ -151,6 +151,16 @@ void nc_kernel_set_video(int64_t flags, int av_pack)
     g_av_pack = av_pack;
 }
 
+/* Chihiro: VGA out, and no AV pack on the system controller's pins (0, which
+ * SEGABOOT's monitor check takes as the cabinet's) */
+static bool g_av_chihiro;
+
+void nc_kernel_set_av_chihiro(void)
+{
+    g_av_pack = NC_AV_PACK_VGA;
+    g_av_chihiro = true;
+}
+
 /* The app's language (nc_kernel_set_language); 0 keeps the stored one.
  * Fixed: the game's own setting, kept even on a disc that seems to lack it. */
 static int g_language;
@@ -866,6 +876,9 @@ static uint32_t av_pack_caps(void)
 
 static uint32_t av_pack_smc(void)
 {
+    if (g_av_chihiro) {
+        return 0x00;
+    }
     switch (g_av_pack) {
     case NC_AV_PACK_STANDARD: return 0x06;
     case NC_AV_PACK_SCART: return 0x00;
@@ -987,11 +1000,13 @@ static uint64_t AvSetDisplayMode(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     nc_log("xbased-native", "av: display mode %08x format %08x pitch %u fb %08x", a[2], a[3], a[4], a[5]);
     if (a[2]) {
-        /* AV mode bit 30: the 50 Hz modes (PAL 576-line timings, as
-         * 0x58030314 is); the 480-line, 480p and HD modes are 60 Hz. */
-        nc_dev_nv2a_refresh(a[2] & 0x40000000u ? 50 : 60);
+        /* AV mode bit 30 alone: the 50 Hz modes (PAL 576-line timings, as
+         * 0x58030314 is); the 480-line, 480p, HD and VGA (bits 31 and 30)
+         * modes are 60 Hz. */
+        const unsigned hz = (a[2] & 0xC0000000u) == 0x40000000u ? 50 : 60;
+        nc_dev_nv2a_refresh(hz);
         nc_dev_nv2a_av_mode_set(a[2]);
-        nc_dev_nv2a_display_mode(a[4], a[3], a[2] & 0x40000000u ? 50 : 60, a[5]);
+        nc_dev_nv2a_display_mode(a[4], a[3], hz, a[5]);
         nc_kernel_av_title_scan(k, f);
     }
     return 0;
@@ -1111,8 +1126,12 @@ void nc_kernel_launch_page_restore(NcKernel *k, const uint8_t page[NC_LAUNCH_PAG
     nc_vm_wr32(k->vm, slot, va);
 }
 
-/* Chihiro: a return to the firmware reboots the game, or its test program
- * when TEST was just pressed. Leaving the test program goes back to the game. */
+/* Chihiro: a return to the firmware reboots the cabinet. With SEGABOOT it
+ * boots, given the launch data the title left: a first word of 1 is its
+ * system test mode at once (the game's TEST, the game's test program's
+ * EXIT), and from there its ENTER GAME TEST launches the test program with
+ * 1 again. Without SEGABOOT the game boots, or its test program when TEST
+ * was just pressed. */
 static bool chihiro_reboot(NcKernel *k, NcFrame *f, uint32_t routine, uint32_t page, const char *launch)
 {
     const char *game = nc_io_chihiro_boot(false);
@@ -1120,13 +1139,19 @@ static bool chihiro_reboot(NcKernel *k, NcFrame *f, uint32_t routine, uint32_t p
     if (!game || (routine != 1 && routine != 2)) {
         return false;
     }
+    const bool segaboot = nc_io_chihiro_segaboot();
     const bool in_test = !strcasecmp(k->image_path, test_xbe) && strcasecmp(test_xbe, game);
-    const bool test = !in_test && nc_chihiro_board_test_pressed();
-    const char *xbe = test ? test_xbe : game;
-    uint8_t pg[NC_LAUNCH_PAGE] = {0};
-    snprintf((char *)pg + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s", xbe);
+    const bool pressed = !segaboot && !in_test && nc_chihiro_board_test_pressed();
+    const bool sys_test = segaboot && page && nc_vm_rd32(k->vm, page + LAUNCH_DATA_OFF) == 1;
+    const char *xbe = segaboot ? NC_CHIHIRO_SEGABOOT_XBE : pressed ? test_xbe : game;
     char path[512];
     nc_kernel_relaunch_file(path, sizeof(path));
+    uint8_t pg[NC_LAUNCH_PAGE] = {0};
+    if (segaboot && page) {
+        memcpy(pg, nc_vm_host(k->vm, page), NC_LAUNCH_PAGE);    /* its launch data */
+        memset(pg + LAUNCH_PATH_OFF, 0, LAUNCH_PATH_LEN);
+    }
+    snprintf((char *)pg + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s", xbe);
     FILE *fp = fopen(path, "wb");
     const bool ok = fp && fwrite(pg, 1, sizeof(pg), fp) == sizeof(pg);
     if (fp) {
@@ -1141,8 +1166,9 @@ static bool chihiro_reboot(NcKernel *k, NcFrame *f, uint32_t routine, uint32_t p
         nc_mm_keep_drop(page);
     }
     nc_mm_keep_save(k, g_av_saved);
-    nc_kernel_request_stop(k, f, "Chihiro reboot: %s%s (routine %u%s%s)", xbe, test ? ", TEST pressed" : "",
-                           routine, *launch ? ", asked for " : "", launch);
+    nc_kernel_request_stop(k, f, "Chihiro reboot: %s%s (routine %u%s%s)", xbe,
+                           sys_test ? ", its system test" : pressed ? ", TEST pressed" : "", routine,
+                           *launch ? ", asked for " : "", launch);
     return true;
 }
 

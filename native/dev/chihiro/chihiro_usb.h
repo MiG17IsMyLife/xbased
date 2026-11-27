@@ -36,6 +36,7 @@ typedef struct ChihiroUsbBoard {
     bool qc;
     bool cpu_held;
     bool backup_dirty;
+    void (*backup_written)(void);   /* the game finished a write to the backup SRAM */
     uint8_t eeprom[CHIHIRO_EEPROM_SIZE];
     uint8_t settings[CHIHIRO_SETTINGS_SIZE];
     uint8_t sram[CHIHIRO_SRAM_SIZE];

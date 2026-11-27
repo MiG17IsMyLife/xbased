@@ -57,6 +57,17 @@ static int g_trans_dir = 1;
 static SDL_Gamepad *g_pads[8];
 static SDL_JoystickID g_last_pad;
 
+void dash_close_gamepads(void)
+{
+    for (int i = 0; i < (int)SDL_arraysize(g_pads); i++) {
+        if (g_pads[i]) {
+            SDL_CloseGamepad(g_pads[i]);
+            g_pads[i] = NULL;
+        }
+    }
+    g_last_pad = 0;
+}
+
 SDL_Gamepad *dash_active_pad(void)
 {
     for (int i = 0; i < 8; i++) {

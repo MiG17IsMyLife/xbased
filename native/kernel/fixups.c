@@ -76,75 +76,148 @@ static bool section_mapped(const NcVm *vm, uint32_t va, uint32_t len)
     return true;
 }
 
-static void wmmt2_keep_confirmed_course(NcKernel *k)
+/* The first match of pattern in the game's code (0x2E: any byte), from 0x11000
+ * to 0x200000, page by page; 0 when none or more than one. */
+static uint32_t find_code(const NcVm *vm, const uint8_t *pattern, size_t len)
 {
-    const uint32_t address = 0x0013d764;
-    static const uint8_t original[] = {
-        0x8b, 0x88, 0xb4, 0x47, 0x31, 0x00, 0x42, 0x51, 0x89, 0x15, 0x54, 0xa8,
-        0x31, 0x00, 0xe8, 0x09, 0x54, 0xff, 0xff,
-    };
-    /* The remote menu slot clears as it closes. A zero there would select
-     * course 1 again. Keep the current course if the peer has confirmed it. */
-    static const uint8_t confirm_course[] = {
-        0x83, 0x7c, 0x24, 0x04, 0x00, 0x75, 0x1d, 0xf6, 0x80, 0x84, 0x44, 0x31,
-        0x00, 0x80, 0x74, 0x14, 0x8b, 0x0d, 0x4c, 0xa8, 0x31, 0x00, 0x83, 0xf9,
-        0x01, 0x7e, 0x09, 0x3b, 0x88, 0xb8, 0x44, 0x31, 0x00, 0x75, 0x01, 0xc3,
-        0x68, 0x80, 0x2b, 0x13, 0x00, 0xc3,
-    };
-    if (!section_mapped(k->vm, address, sizeof(original))) {
-        return;
+    uint32_t found = 0;
+    for (uint32_t va = 0x11000; va + len < 0x200000; va++) {
+        if ((va & (NC_PAGE - 1)) == 0 && !section_mapped(vm, va, NC_PAGE)) {
+            va += NC_PAGE - 1;
+            continue;
+        }
+        const uint8_t *code = nc_vm_host(vm, va);
+        if (code[0] != pattern[0]) {
+            continue;
+        }
+        size_t i = 1;
+        while (i < len && (pattern[i] == 0x2E || code[i] == pattern[i]) &&
+               ((va + i) & (NC_PAGE - 1) || section_mapped(vm, va + i, 1))) {
+            i++;
+        }
+        if (i == len) {
+            if (found) {
+                return 0;
+            }
+            found = va;
+        }
     }
-    uint8_t *site = nc_vm_host(k->vm, address);
-    if (memcmp(site, original, sizeof(original))) {
-        return;
-    }
-    const uint32_t stub = nc_kernel_code_alloc(k, sizeof(confirm_course));
-    if (!stub) {
-        return;
-    }
-    memcpy(nc_vm_host(k->vm, stub), confirm_course, sizeof(confirm_course));
-    const uint32_t relative = stub - (address + sizeof(original));
-    memcpy(site + sizeof(original) - 4, &relative, sizeof(relative));
-    nc_log("xbased-chihiro", "WMMT2: preserve the confirmed link course");
+    return found;
 }
+
+static uint32_t rd32(const NcVm *vm, uint32_t va)
+{
+    uint32_t v;
+    memcpy(&v, nc_vm_host(vm, va), 4);
+    return v;
+}
+
+static void wr32(uint8_t *at, uint32_t v)
+{
+    memcpy(at, &v, 4);
+}
+
+/* Maximum Tune 2 (Ver.A and Ver.B): the remote menu slot clears as it closes,
+ * and a zero there selects course 1 again; the course the peer confirmed is
+ * kept. The call to the course setter becomes a stub that skips it then.
+ * slot0: the first link slot (0x400 each), count: the linked cabinets. */
+static void wmmt2_keep_confirmed_course(NcKernel *k, uint32_t slot0)
+{
+    /* mov ecx,[eax+course]; inc edx; push ecx; mov [count+8],edx; call setter */
+    static const uint8_t pattern[] = {0x8b, 0x88, 0x2E, 0x2E, 0x2E, 0x2E, 0x42, 0x51, 0x89, 0x15,
+                                      0x2E, 0x2E, 0x2E, 0x2E, 0xe8, 0x2E, 0x2E, 0x2E, 0x2E};
+    const uint32_t site = find_code(k->vm, pattern, sizeof(pattern));
+    if (!site || rd32(k->vm, site + 2) != slot0 + 0x358) {
+        return;
+    }
+    const uint32_t count = rd32(k->vm, site + 10) - 8;
+    const uint32_t setter = site + 19 + rd32(k->vm, site + 15);
+    uint8_t stub[] = {
+        0x83, 0x7c, 0x24, 0x04, 0x00,               /* cmp dword [esp+4], 0 */
+        0x75, 0x1d,                                 /* jne call */
+        0xf6, 0x80, 0, 0, 0, 0, 0x80,               /* test byte [eax+slot0+0x28], 0x80 */
+        0x74, 0x14,                                 /* je call */
+        0x8b, 0x0d, 0, 0, 0, 0,                     /* mov ecx, [count] */
+        0x83, 0xf9, 0x01,                           /* cmp ecx, 1 */
+        0x7e, 0x09,                                 /* jle call */
+        0x3b, 0x88, 0, 0, 0, 0,                     /* cmp ecx, [eax+slot0+0x5c] */
+        0x75, 0x01,                                 /* jne call */
+        0xc3,                                       /* ret: keep the course */
+        0x68, 0, 0, 0, 0, 0xc3,                     /* call: push setter; ret */
+    };
+    wr32(stub + 9, slot0 + 0x28);
+    wr32(stub + 18, count);
+    wr32(stub + 29, slot0 + 0x5c);
+    wr32(stub + 37, setter);
+    const uint32_t at = nc_kernel_code_alloc(k, sizeof(stub));
+    if (!at) {
+        return;
+    }
+    memcpy(nc_vm_host(k->vm, at), stub, sizeof(stub));
+    wr32(nc_vm_host(k->vm, site + 15), at - (site + 19));
+    nc_log("xbased-chihiro", "WMMT2: preserve the confirmed link course (%08x)", site);
+}
+
+/* Maximum Tune 2 (Ver.A and Ver.B): a cabinet picks its link group as the
+ * lowest number from 3 not in use by a peer, so two cabinets choosing at once
+ * take the same one. Each starts at 3 + its zero-based PCB ID instead and
+ * wraps from 6 to 3 on a collision, returning 0 if all four are in use. */
 void nc_kernel_wmmt2_link_fixup(NcKernel *k)
 {
-    const uint32_t address = 0x0006d6d0;
-    static const uint8_t original[] = {
-        0x56, 0x8b, 0x35, 0x38, 0x44, 0x31, 0x00, 0xb8, 0x03, 0x00, 0x00, 0x00,
-        0x8d, 0x64, 0x24, 0x00, 0x33, 0xd2, 0xb9, 0x5c, 0x44, 0x31, 0x00, 0x3b,
-        0xd6, 0x74, 0x04, 0x39, 0x01, 0x74, 0x0f, 0x81, 0xc1, 0x00, 0x04, 0x00,
-        0x00, 0x42, 0x81, 0xf9, 0x5c, 0x54, 0x31, 0x00, 0x7c, 0xe9, 0x83, 0xfa,
-        0x04, 0x74, 0x08, 0x40, 0x83, 0xf8, 0x07, 0x7c, 0xd7, 0x33, 0xc0, 0x5e, 0xc3,
+    static const uint8_t pattern[] = {
+        0x56, 0x8b, 0x35, 0x2E, 0x2E, 0x2E, 0x2E, 0xb8, 0x03, 0x00, 0x00, 0x00, 0x8d, 0x64, 0x24, 0x00, 0x33,
+        0xd2, 0xb9, 0x2E, 0x2E, 0x2E, 0x2E, 0x3b, 0xd6, 0x74, 0x04, 0x39, 0x01, 0x74, 0x0f, 0x81, 0xc1, 0x00,
+        0x04, 0x00, 0x00, 0x42, 0x81, 0xf9, 0x2E, 0x2E, 0x2E, 0x2E, 0x7c, 0xe9, 0x83, 0xfa, 0x04, 0x74, 0x08,
+        0x40, 0x83, 0xf8, 0x07, 0x7c, 0xd7, 0x33, 0xc0, 0x5e, 0xc3,
     };
-    /* Start at 3 + the zero-based PCB ID. Scan each peer and wrap from 6
-     * to 3 on a collision, returning 0 if all four numbers are in use. */
-    static const uint8_t select_group[] = {
-        0x53, 0x56, 0x8b, 0x35, 0x38, 0x44, 0x31, 0x00, 0x83, 0xe6, 0x03, 0x8d,
-        0x46, 0x03, 0xc1, 0xe6, 0x0a, 0x81, 0xc6, 0x5c, 0x44, 0x31, 0x00, 0xb3,
-        0x04, 0xba, 0x5c, 0x44, 0x31, 0x00, 0x39, 0xf2, 0x74, 0x04, 0x39, 0x02,
-        0x74, 0x10, 0x81, 0xc2, 0x00, 0x04, 0x00, 0x00, 0x81, 0xfa, 0x5c, 0x54,
-        0x31, 0x00, 0x72, 0xea, 0xeb, 0x11, 0x40, 0x83, 0xf8, 0x07, 0x72, 0x05,
-        0xb8, 0x03, 0x00, 0x00, 0x00, 0xfe, 0xcb, 0x75, 0xd4, 0x31, 0xc0, 0x5e,
-        0x5b, 0xc3,
+    const uint32_t site = find_code(k->vm, pattern, sizeof(pattern));
+    if (!site) {
+        return;
+    }
+    const uint32_t self = rd32(k->vm, site + 3), slot0 = rd32(k->vm, site + 19), end = rd32(k->vm, site + 40);
+    if (end != slot0 + 0x1000) {
+        return;
+    }
+    uint8_t stub[] = {
+        0x53, 0x56,                                 /* push ebx; push esi */
+        0x8b, 0x35, 0, 0, 0, 0,                     /* mov esi, [self] */
+        0x83, 0xe6, 0x03,                           /* and esi, 3 */
+        0x8d, 0x46, 0x03,                           /* lea eax, [esi+3] */
+        0xc1, 0xe6, 0x0a,                           /* shl esi, 10 */
+        0x81, 0xc6, 0, 0, 0, 0,                     /* add esi, slot0: its own slot */
+        0xb3, 0x04,                                 /* mov bl, 4 */
+        0xba, 0, 0, 0, 0,                           /* next: mov edx, slot0 */
+        0x39, 0xf2,                                 /* scan: cmp edx, esi */
+        0x74, 0x04,                                 /* je skip */
+        0x39, 0x02,                                 /* cmp [edx], eax */
+        0x74, 0x10,                                 /* je taken */
+        0x81, 0xc2, 0x00, 0x04, 0x00, 0x00,         /* skip: add edx, 0x400 */
+        0x81, 0xfa, 0, 0, 0, 0,                     /* cmp edx, end */
+        0x72, 0xea,                                 /* jb scan */
+        0xeb, 0x11,                                 /* jmp done */
+        0x40,                                       /* taken: inc eax */
+        0x83, 0xf8, 0x07,                           /* cmp eax, 7 */
+        0x72, 0x05,                                 /* jb again */
+        0xb8, 0x03, 0x00, 0x00, 0x00,               /* mov eax, 3 */
+        0xfe, 0xcb,                                 /* again: dec bl */
+        0x75, 0xd4,                                 /* jne next */
+        0x31, 0xc0,                                 /* xor eax, eax */
+        0x5e, 0x5b, 0xc3,                           /* done: pop esi; pop ebx; ret */
     };
-    if (!section_mapped(k->vm, address, sizeof(original))) {
+    wr32(stub + 4, self);
+    wr32(stub + 19, slot0);
+    wr32(stub + 26, slot0);
+    wr32(stub + 46, end);
+    const uint32_t at = nc_kernel_code_alloc(k, sizeof(stub));
+    if (!at) {
         return;
     }
-    uint8_t *site = nc_vm_host(k->vm, address);
-    if (memcmp(site, original, sizeof(original))) {
-        return;
-    }
-    const uint32_t stub = nc_kernel_code_alloc(k, sizeof(select_group));
-    if (!stub) {
-        return;
-    }
-    memcpy(nc_vm_host(k->vm, stub), select_group, sizeof(select_group));
-    const uint32_t relative = stub - (address + 5);
-    site[0] = 0xe9;
-    memcpy(site + 1, &relative, sizeof(relative));
-    nc_log("xbased-chihiro", "WMMT2: choose link groups in PCB order");
-    wmmt2_keep_confirmed_course(k);
+    memcpy(nc_vm_host(k->vm, at), stub, sizeof(stub));
+    uint8_t *code = nc_vm_host(k->vm, site);
+    code[0] = 0xe9;
+    wr32(code + 1, at - (site + 5));
+    nc_log("xbased-chihiro", "WMMT2: choose link groups in PCB order (%08x)", site);
+    wmmt2_keep_confirmed_course(k, slot0);
 }
 
 void nc_kernel_title_fixups(NcKernel *k, const HleXbeInfo *xbe)

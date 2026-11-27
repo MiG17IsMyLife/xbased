@@ -295,7 +295,9 @@ static int board_control(NcUsbDev *dev, const uint8_t setup[8], uint8_t *data, i
     }
     uint8_t reply[8] = {0};
     if (b->qc) {
-        /* status prefix: JVS board unaddressed (53) or addressed (52) */
+        /* the baseboard's DIP switches (low: on): a 31 kHz landscape
+         * monitor, as SEGABOOT matches them to boot.id; then the status:
+         * JVS board unaddressed (53) or addressed (52) */
         reply[1] = 0xcb;
         reply[2] = b->jvs.sense ? 0x53 : 0x52;
         reply[3] = b->jvs.sense ? 0 : 0x10;
@@ -379,6 +381,8 @@ static int board_data(NcUsbDev *dev, bool in, int ep, uint8_t *bytes, int len)
             jvs_send(b, b->jvs_tx_len - JVS_HEADER_BYTES);
         } else if (ep == EP_RTC) {
             rtc_write(b);
+        } else if (ep == EP_BACKUP_OR_DRIVE && b->backup_written) {
+            b->backup_written();
         }
     }
     return (int)n;

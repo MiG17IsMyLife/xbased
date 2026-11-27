@@ -8,6 +8,7 @@
 #include "chihiro_usb.h"
 #include "net/chihiro-netboard.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -52,56 +53,135 @@ bool nc_chihiro_link_firmware(const char *dir, char *path, size_t capacity)
            st.st_size >= CHIHIRO_NETBOARD_MIN_FIRMWARE_BYTES && access(path, R_OK) == 0;
 }
 
+bool nc_chihiro_flash_path(const char *dir, char *path, size_t capacity)
+{
+    static const char *const names[] = {"fpr21042.bin", "fpr21042_m29w160et.bin"};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); i++) {
+        const int n = snprintf(path, capacity, "%s/%s", dir && *dir ? dir : "chihiro", names[i]);
+        if (n >= 0 && (size_t)n < capacity && access(path, R_OK) == 0) {
+            return true;
+        }
+    }
+    path[0] = 0;
+    return false;
+}
+
 /* ------------------------------------------------------------ files */
 
 enum { CARD_SLOT_MAX = 999 };
 static char g_cards[512];       /* <dir>/cards */
 static char g_save[600];        /* the battery-backed memory's file */
-static atomic_int g_card_slot;
+static pthread_mutex_t g_card_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_card_name[NC_CHIHIRO_CARD_NAME_CAP];
 
-static int card_path(char *path, size_t size, int slot)
+static bool valid_card_name(const char *name)
 {
-    return snprintf(path, size, "%s/card%03d.bin", g_cards, slot);
-}
-
-static bool card_exists(int slot, char path[600])
-{
-    card_path(path, 600, slot);
-    struct stat st;
-    return g_cards[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) &&
-           (st.st_size == 0 || st.st_size == NC_CARD_BYTES);
-}
-
-void nc_chihiro_card_select(int slot)
-{
-    g_card_slot = slot >= 1 && slot <= CARD_SLOT_MAX ? slot : 0;
-}
-
-int nc_chihiro_card_selected(void)
-{
-    return g_card_slot;
-}
-
-static int find_card(int slot, int direction, char path[600])
-{
-    if (slot < 0 || slot > CARD_SLOT_MAX) {
-        slot = 0;
+    const size_t n = strlen(name);
+    if (n > 4 && !strcasecmp(name + n - 4, ".tmp")) {
+        return false;               /* one being written (file_replace) */
     }
-    const int step = direction < 0 ? -1 : 1;
-    slot = slot == 0 && step < 0 ? CARD_SLOT_MAX : slot + step;
-    for (; slot >= 1 && slot <= CARD_SLOT_MAX; slot += step) {
-        if (card_exists(slot, path)) {
-            return slot;
+    return *name && strlen(name) < NC_CHIHIRO_CARD_NAME_CAP &&
+           strcmp(name, ".") && strcmp(name, "..") && !strpbrk(name, "/\\:\r\n") &&
+           name[strlen(name) - 1] != ' ' && name[strlen(name) - 1] != '\t';
+}
+
+static bool card_file(const char *name, char path[NC_CARD_PATH_CAP], struct stat *st)
+{
+    if (!g_cards[0] || !valid_card_name(name)) {
+        return false;
+    }
+    const int n = snprintf(path, NC_CARD_PATH_CAP, "%s/%s", g_cards, name);
+    return n >= 0 && n < NC_CARD_PATH_CAP && stat(path, st) == 0 && S_ISREG(st->st_mode) &&
+           (st->st_size == 0 || st->st_size == NC_CARD_BYTES);
+}
+
+void nc_chihiro_card_select(const char *name)
+{
+    pthread_mutex_lock(&g_card_lock);
+    snprintf(g_card_name, sizeof(g_card_name), "%s", name && valid_card_name(name) ? name : "");
+    pthread_mutex_unlock(&g_card_lock);
+}
+
+void nc_chihiro_card_selected(char name[NC_CHIHIRO_CARD_NAME_CAP])
+{
+    pthread_mutex_lock(&g_card_lock);
+    memcpy(name, g_card_name, sizeof(g_card_name));
+    pthread_mutex_unlock(&g_card_lock);
+}
+
+void nc_chihiro_card_load_setting(const char *value)
+{
+    if (!value || !*value) {
+        nc_chihiro_card_select(NULL);
+    } else if (!strncmp(value, "file:", 5)) {
+        nc_chihiro_card_select(value + 5);
+    } else {
+        char *end;
+        const long slot = strtol(value, &end, 10);
+        char name[24] = "";
+        if (!*end && slot >= 1 && slot <= CARD_SLOT_MAX) {
+            snprintf(name, sizeof(name), "card%03ld.bin", slot);
+        }
+        nc_chihiro_card_select(name);
+    }
+}
+
+static void find_card(char result[NC_CHIHIRO_CARD_NAME_CAP], const char *current, int direction)
+{
+    result[0] = 0;
+    if (!g_cards[0]) {
+        return;
+    }
+#ifdef _WIN32
+    wchar_t directory[512];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, g_cards, -1,
+                             directory, sizeof(directory) / sizeof(*directory))) {
+        return;
+    }
+    _WDIR *dir = _wopendir(directory);
+#else
+    DIR *dir = opendir(g_cards);
+#endif
+    if (!dir) {
+        return;
+    }
+    time_t latest = 0;
+#ifdef _WIN32
+    for (struct _wdirent *entry; (entry = _wreaddir(dir));) {
+        char name[NC_CHIHIRO_CARD_NAME_CAP];
+        if (!WideCharToMultiByte(CP_UTF8, 0, entry->d_name, -1, name, sizeof(name), NULL, NULL)) {
+            continue;
+        }
+#else
+    for (struct dirent *entry; (entry = readdir(dir));) {
+        const char *name = entry->d_name;
+#endif
+        const int relative = strcmp(name, current);
+        const int order = strcmp(name, result);
+        if ((direction > 0 && (relative <= 0 || (*result && order >= 0))) ||
+            (direction < 0 && ((*current && relative >= 0) || (*result && order <= 0)))) {
+            continue;
+        }
+        char path[NC_CARD_PATH_CAP];
+        struct stat st;
+        if (card_file(name, path, &st) &&
+            (direction || !*result || st.st_mtime > latest || (st.st_mtime == latest && order > 0))) {
+            strcpy(result, name);
+            latest = st.st_mtime;
         }
     }
-    path[0] = '\0';
-    return 0;
+#ifdef _WIN32
+    _wclosedir(dir);
+#else
+    closedir(dir);
+#endif
 }
 
-int nc_chihiro_card_step(int slot, int direction)
+void nc_chihiro_card_step(char name[NC_CHIHIRO_CARD_NAME_CAP], int direction)
 {
-    char path[600];
-    return find_card(slot, direction, path);
+    char next[NC_CHIHIRO_CARD_NAME_CAP];
+    find_card(next, name, direction);
+    strcpy(name, next);
 }
 
 typedef struct FilePart {
@@ -112,7 +192,7 @@ typedef struct FilePart {
 /* Publish a complete file with a same-directory rename. */
 static bool file_replace(const char *path, const FilePart *parts, int count)
 {
-    char tmp[640];
+    char tmp[NC_CARD_PATH_CAP + 32];
     const int n = snprintf(tmp, sizeof(tmp), "%s.%ld.tmp", path, (long)getpid());
     if (n < 0 || (size_t)n >= sizeof(tmp)) {
         return false;
@@ -153,8 +233,8 @@ static bool save_card(char *path, size_t cap, const uint8_t *data)
     }
     nc_mkdir(g_cards);
     for (int slot = 1; slot <= CARD_SLOT_MAX; slot++) {
-        char candidate[600];
-        const int len = card_path(candidate, sizeof(candidate), slot);
+        char candidate[NC_CARD_PATH_CAP];
+        const int len = snprintf(candidate, sizeof(candidate), "%s/card%03d.bin", g_cards, slot);
         if (len < 0 || (size_t)len >= sizeof(candidate) || (size_t)len >= cap) {
             return false;
         }
@@ -193,12 +273,15 @@ static void card_key(void)
         card_note("insert ignored while reader holds a card");
         return;
     }
-    char path[600];
-    const int selected = nc_chihiro_card_selected();
-    if (!selected) {
-        find_card(0, -1, path);
-    } else if (!card_exists(selected, path)) {
-        nc_log("xbased-chihiro", "card: unavailable %s", path);
+    char name[NC_CHIHIRO_CARD_NAME_CAP];
+    nc_chihiro_card_selected(name);
+    if (!name[0]) {
+        find_card(name, "", 0);
+    }
+    char path[NC_CARD_PATH_CAP] = "";
+    struct stat st;
+    if (name[0] && !card_file(name, path, &st)) {
+        nc_log("xbased-chihiro", "card: unavailable %s", name);
         return;
     }
     if (nc_card_reader_offer(r, path)) {
@@ -275,6 +358,15 @@ static void link_pcb_id(unsigned cabinet)
     }
 }
 
+static unsigned g_link_cabinet;
+
+/* A record the game writes for the first time (no backup yet) gets the
+ * cabinet's PCB ID too; the game reads it from its next start. */
+static void backup_written(void)
+{
+    link_pcb_id(g_link_cabinet);
+}
+
 void nc_chihiro_board_flush(void)
 {
     if (!g_active || !g_save[0] || !g_qc.backup_dirty) {
@@ -306,14 +398,68 @@ void nc_chihiro_board_init(const char *dir, const char *save, const NcChihiroCoi
     const int r = region ? atoi(region) : 1;
     g_qc.eeprom[0x1f00] = (uint8_t)(r >= 1 && r <= 3 ? r : 1);
     g_qc.eeprom[0x1f01] = (uint8_t)~g_qc.eeprom[0x1f00];
+    /* the baseboard's serial (the game's MAIN BD ID), where Sega's QC EEPROM has it */
+    const char *main_id = getenv("NC_CHIHIRO_MAIN_ID");
+    if (main_id && strlen(main_id) == 16) {
+        memcpy(g_qc.eeprom + 0x1f10, main_id, 16);
+    }
     save_load();
     chihiro_usb_apply_coins(&g_qc, coins);
     if (cabinet) {
+        g_link_cabinet = cabinet;
         link_pcb_id(cabinet);
+        g_qc.backup_written = backup_written;
     }
     g_frames = 0;
     g_active = true;
     nc_log("xbased-chihiro", "baseboard: QC and SC USB protocol emulation");
+}
+
+/* SEGABOOT's form for both boards' serials, "%%%@-##@########": % a digit
+ * or a letter, @ a letter (I and O never), # a digit. */
+static bool id_form(const char *id)
+{
+    static const char form[] = "%%%@-##@########";
+    if (!id || strlen(id) != sizeof(form) - 1) {
+        return false;
+    }
+    for (int i = 0; form[i]; i++) {
+        const char c = id[i];
+        const bool digit = c >= '0' && c <= '9', letter = c >= 'A' && c <= 'Z' && c != 'I' && c != 'O';
+        const bool ok = form[i] == '#'   ? digit
+                        : form[i] == '%' ? digit || letter
+                        : form[i] == '@' ? letter
+                                         : c == form[i];
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void nc_chihiro_board_id(const char *id, const char console_serial[12], bool base, char out[17])
+{
+    if (id_form(id)) {
+        memcpy(out, id, 17);
+        return;
+    }
+    if (id && *id) {
+        nc_log("xbased-chihiro", "%s BD ID \"%s\" isn't in SEGABOOT's form: the default", base ? "MAIN" : "MEDIA", id);
+    }
+    /* A, two hex digits and a letter from A to F of the console's serial's
+     * hash, -01D, eight of its digits (the main board's from the start, the
+     * media board's from the end) */
+    uint32_t h = base ? 0x811C9DC5u : 0x01000193u;
+    for (int i = 0; i < 12; i++) {
+        h = (h ^ (uint8_t)console_serial[i]) * 16777619u;
+    }
+    char digits[9];
+    for (int i = 0; i < 8; i++) {
+        const char c = console_serial[base ? i : 4 + i];
+        digits[i] = c >= '0' && c <= '9' ? c : '0';
+    }
+    digits[8] = 0;
+    snprintf(out, 17, "A%02X%c-01D%s", (unsigned)(h & 0xFF), 'A' + (int)((h >> 8) % 6), digits);
 }
 
 bool nc_chihiro_board_active(void)

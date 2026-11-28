@@ -67,6 +67,17 @@
 ChihiroLpc chihiro_lpc;
 pthread_mutex_t chihiro_lpc_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* A Type-1 board has no SADDR mailbox: the game finds the DIMM base at
+ * ports 0x401E/0x4020 and writes its command to a sector of mbcom:, the
+ * reply coming in the sector before it (ctx_ac[r].xbe 0x000fa350 and
+ * 0x000fa700; xemu's chihiro_mbcom_process answers the same way). */
+#define TYPE1_DIMM_BASE 0x01000000u     /* ports 0x4020:0x401E */
+#define TYPE1_MAILBOX   0x900000u       /* mbcom: offset of the reply sector */
+#define TYPE1_SECTOR    512u            /* the command sector follows it */
+
+static bool g_type1;                /* a Type-1 (FPGA) board, not a Type-3 */
+static uint8_t g_type1_box[2 * TYPE1_SECTOR];   /* the reply sector, then the command's */
+
 static unsigned g_unknown;          /* accesses logged as not modelled */
 static bool g_asic;                 /* the real media board firmware runs */
 static uint8_t g_fw_upload[FW_UPLOAD_SIZE];
@@ -140,7 +151,11 @@ void nc_chihiro_lpc_frame(void)
     if (chihiro_lpc.raise_at_ns && now >= chihiro_lpc.raise_at_ns) {
         chihiro_lpc.raise_at_ns = 0;
         chihiro_lpc.e0 |= 0x01;
-        chihiro_lpc_trace("IRQ 10 raised: message %08x %08x (#%u)", chihiro_lpc.resp[0], chihiro_lpc.resp[1]);
+        uint32_t reply[2] = {chihiro_lpc.resp[0], chihiro_lpc.resp[1]};
+        if (g_type1) {
+            memcpy(reply, g_type1_box, sizeof(reply));
+        }
+        chihiro_lpc_trace("IRQ 10 raised: reply %08x %08x (#%u)", reply[0], reply[1]);
         chihiro_lpc_irq_pulse();
     }
     chihiro_lpc_net_frame(now);
@@ -252,6 +267,62 @@ static void saddr_write(uint32_t a, uint32_t v)
     }
 }
 
+/* ---------------------------------------------------------- Type-1 mailbox */
+
+void nc_chihiro_lpc_set_type1(bool type1)
+{
+    pthread_mutex_lock(&chihiro_lpc_lock);
+    g_type1 = type1;
+    memset(g_type1_box, 0, sizeof(g_type1_box));
+    pthread_mutex_unlock(&chihiro_lpc_lock);
+    if (type1) {
+        nc_log("xbased-chihiro", "media board: Type-1");
+    }
+}
+
+/* The command sector answered into the reply sector: the same 8 words as
+ * a Type-3's mailbox, so media.c answers both. */
+static void type1_command(void)
+{
+    uint32_t command[8], reply[8];
+    memcpy(command, g_type1_box + TYPE1_SECTOR, sizeof(command));
+    memset(g_type1_box + TYPE1_SECTOR, 0, TYPE1_SECTOR);
+    if (!command[0] || (command[0] & 0x80000000u)) {
+        return;                     /* the game clearing the sector */
+    }
+    chihiro_lpc_trace("Type-1 command %08x %08x (#%u)", command[0], command[1]);
+    if (!nc_chihiro_media_exchange(chihiro_lpc.dimm_factor, command, reply)) {
+        /* What the board does with the others (0x0009 at start) isn't
+         * known: done, nothing to report, as xemu answers. */
+        chihiro_lpc_unknown("Type-1 command", command[0], command[1]);
+        memset(reply, 0, sizeof(reply));
+        reply[0] = command[0] | 0x80000000u;
+    }
+    memset(g_type1_box, 0, TYPE1_SECTOR);
+    memcpy(g_type1_box, reply, sizeof(reply));
+    raise_message();
+}
+
+bool nc_chihiro_lpc_type1_mailbox(uint64_t off, void *buf, uint32_t len, bool write)
+{
+    if (!g_type1 || off < TYPE1_MAILBOX || off >= TYPE1_MAILBOX + sizeof(g_type1_box)) {
+        return false;
+    }
+    const uint32_t at = (uint32_t)(off - TYPE1_MAILBOX);
+    const uint32_t n = len < sizeof(g_type1_box) - at ? len : (uint32_t)sizeof(g_type1_box) - at;
+    pthread_mutex_lock(&chihiro_lpc_lock);
+    if (!write) {
+        memcpy(buf, g_type1_box + at, n);
+    } else {
+        memcpy(g_type1_box + at, buf, n);
+        if (at + n > TYPE1_SECTOR) {
+            type1_command();
+        }
+    }
+    pthread_mutex_unlock(&chihiro_lpc_lock);
+    return true;
+}
+
 /* ---------------------------------------------------------- registers */
 
 static uint32_t reg_read(uint32_t a)
@@ -319,10 +390,15 @@ bool nc_chihiro_lpc_in(uint16_t port, unsigned bytes, uint32_t *value)
         *value = chihiro_lpc.reg_addr;
         break;
     case DIMM_BASE_LO:
+        /* A Type-1 gives the DIMM base here and "XBAM" at 0x4022 only. */
+        *value = g_type1 ? (uint16_t)TYPE1_DIMM_BASE : 0x4258;
+        break;
+    case XBAM_0:
+        *value = g_type1 ? (uint16_t)(TYPE1_DIMM_BASE >> 16) : 0x4D41;
+        break;
     case XBAM_1:
         *value = 0x4258;            /* "XB": the ports spell "XBAM" after SEGABOOT */
         break;
-    case XBAM_0:
     case XBAM_2:
         *value = 0x4D41;            /* "AM" */
         break;
@@ -336,11 +412,12 @@ bool nc_chihiro_lpc_in(uint16_t port, unsigned bytes, uint32_t *value)
         *value = chihiro_lpc.e0;
         break;
     case CHIP_REVISION:
-        *value = 0x0100;            /* a Type-3 board (with the ASIC) */
+        /* High byte: 1 the ASIC (Type-3), 0 the FPGA (Type-1, revision 1). */
+        *value = g_type1 ? 0x0001 : 0x0100;
         break;
     case DIMM_SIZE:
         /* The DIMM size jumpers, plus 0x40 for the Type-3's DIP register. */
-        *value = chihiro_lpc.dimm_factor | 0x40;
+        *value = chihiro_lpc.dimm_factor | (g_type1 ? 0 : 0x40);
         break;
     default:
         chihiro_lpc_unknown("port read", port, 0);
@@ -368,6 +445,11 @@ bool nc_chihiro_lpc_out(uint16_t port, unsigned bytes, uint32_t value)
         break;
     case SCRATCH:
         chihiro_lpc.scratch = (uint16_t)value;
+        if (g_type1) {
+            /* A Type-1 game's IRQ 10 handler writes 0x102 here: taken. */
+            chihiro_lpc.e0 &= (uint8_t)~0x01;
+            irq_drop_if_idle();
+        }
         break;
     case IRQ10_STATUS:
         /* The game acknowledges replies by writing their bits. */

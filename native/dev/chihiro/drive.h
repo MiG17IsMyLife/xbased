@@ -3,12 +3,12 @@
  * (force feedback).
  *
  * Each racing game uses its own board, with its own protocol on the SC's
- * second serial port and/or the JVS outputs. The game ID picks one
+ * second serial port and/or the JVS outputs. The game's cabinet picks one
  * (nc_chihiro_drive_for); the rest of the cabinet only calls the
  * functions in NcChihiroDrive, so it doesn't care which board it is.
  *
  * To support a new game's board: write an NcChihiroDrive for it (v257.c
- * is Maximum Tune's) and add the game ID to the table in drive.c.
+ * is Maximum Tune's) and pick it for its cabinet in drive.c.
  * Any function may be NULL if the board doesn't need it.
  */
 #ifndef NATIVE_DEV_CHIHIRO_DRIVE_H

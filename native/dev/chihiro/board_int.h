@@ -31,7 +31,7 @@ void chihiro_backup_link(ChihiroUsbBoard *qc, unsigned cabinet);
 void chihiro_backup_flush(ChihiroUsbBoard *qc);
 
 /* cabinet_input.c: picks how the cabinet wires its controls for a game
- * ID from boot.id ("SGBZ"); Maximum Tune's when it doesn't know it. */
+ * ID from boot.id ("SGBZ"): its cabinet's (nc_chihiro_cabinet). */
 void chihiro_input_init(const char *game_id);
 
 /* cabinet_input.c: puts the latest controls onto the JVS board. Returns

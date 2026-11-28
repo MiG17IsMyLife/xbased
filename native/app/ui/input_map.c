@@ -253,20 +253,34 @@ ImCabinet im_cabinet_of(const char *key)
     if (key && !strncmp(key, "CH-", 3)) {
         key += 3;
     }
-    return key && !strncmp(key, "SGBZ", 4) ? IM_CAB_OUTRUN : IM_CAB_MAXIMUM_TUNE;
+    return (ImCabinet)nc_chihiro_cabinet(key);
 }
 
 /* OutRun 2's cabinet: steering, pedals, a two-way shift lever, START,
- * VIEW CHANGE, coin, TEST and SERVICE. */
+ * VIEW CHANGE, coin, TEST and SERVICE. Crazy Taxi's: the same with a D/R
+ * lever and a JUMP button on it. */
 bool im_cabinet_has(ImCabinet cabinet, int input)
 {
-    return cabinet != IM_CAB_OUTRUN || (input != IM_CAB_INTRUDE && input != IM_CAB_CARD);
+    return cabinet == IM_CAB_MAXIMUM_TUNE || (input != IM_CAB_INTRUDE && input != IM_CAB_CARD);
+}
+
+enum UiStr im_cabinet_label(ImCabinet cabinet, int input)
+{
+    if (cabinet == IM_CAB_CRAZY_TAXI) {
+        switch (input) {
+        case IM_CAB_SHIFT_UP: return S_CH_DRIVE_GEAR;
+        case IM_CAB_SHIFT_DOWN: return S_CH_REVERSE_GEAR;
+        case IM_CAB_VIEW: return S_CH_JUMP;
+        default: break;
+        }
+    }
+    return im_cabinet_controls[input].label;
 }
 
 int im_cabinet_wheel_default(ImCabinet cabinet, int input)
 {
-    /* OutRun 2 has no intrude button; its START goes on that button. */
-    if (cabinet == IM_CAB_OUTRUN && input == IM_CAB_START) {
+    /* OutRun 2 and Crazy Taxi have no intrude button; START goes on it. */
+    if (cabinet != IM_CAB_MAXIMUM_TUNE && input == IM_CAB_START) {
         return im_cabinet_controls[IM_CAB_INTRUDE].wheel_default;
     }
     return im_cabinet_has(cabinet, input) ? im_cabinet_controls[input].wheel_default : 0;
@@ -274,7 +288,7 @@ int im_cabinet_wheel_default(ImCabinet cabinet, int input)
 
 bool im_cabinet_has_gears(ImCabinet cabinet)
 {
-    return cabinet != IM_CAB_OUTRUN;
+    return cabinet == IM_CAB_MAXIMUM_TUNE;
 }
 
 const ImCabinetAxis im_cabinet_axes[IM_CAB_WHEEL_AXES] = {

@@ -1549,7 +1549,7 @@ static void cabinet_controls(void)
         }
         char value[96];
         im_cabinet_binding_name(&D.global, &D.game, input, value, sizeof(value));
-        if (list_row(&l, T(im_cabinet_controls[input].label), value, NULL)) {
+        if (list_row(&l, T(im_cabinet_label(cabinet, input)), value, NULL)) {
             D.remap_target = input;
             D.remap_since = ui_time();
             dash_push(SCR_REMAP);
@@ -1720,7 +1720,8 @@ void scr_cabinet_wheel(void)
     wheel_device_row(&l, false);
     opt_bool(&l, S_CH_FFB, "chihiro.ffb", false, false);
     if (list_selected(&l)) {
-        dash_help(T(S_H_CH_FFB), HELP_NEXT_START);
+        const bool sprung = im_cabinet_of(D.cur->g.key) == IM_CAB_CRAZY_TAXI;
+        dash_help(T(sprung ? S_H_CH_FFB_SPRING : S_H_CH_FFB), HELP_NEXT_START);
     }
     opt_int(&l, S_CH_FFB_STRENGTH, "chihiro.ffb.strength", 0, 100, 5, NC_WHEEL_FFB_STRENGTH_DEFAULT, "%");
     bool slider = list_selected(&l);
@@ -1747,8 +1748,8 @@ void scr_cabinet_wheel(void)
     for (int i = 0; i < IM_CAB_INPUTS; i++) {
         const ImCabinetControl *control = &im_cabinet_controls[i];
         if (control->wheel_button && im_cabinet_has(cabinet, i)) {
-            wheel_binding_row(&l, T(control->label), control->wheel_button, im_cabinet_wheel_default(cabinet, i),
-                              false);
+            wheel_binding_row(&l, T(im_cabinet_label(cabinet, i)), control->wheel_button,
+                              im_cabinet_wheel_default(cabinet, i), false);
             binding |= list_selected(&l);
         }
     }
@@ -2198,8 +2199,10 @@ void scr_remap(void)
     const bool wheel = g_wheel_capture.option[0] != 0;
     const bool hotkey = D.remap_target >= 1000;
     const bool cabinet = D.editing_game && cur_chihiro() && !hotkey;
-    const char *what = wheel ? g_wheel_capture.label : hotkey ? T(im_hotkey_label(D.remap_target - 1000))
-                             : cabinet ? T(im_cabinet_controls[D.remap_target].label) : im_input_label(D.remap_target);
+    const char *what = wheel     ? g_wheel_capture.label
+                       : hotkey  ? T(im_hotkey_label(D.remap_target - 1000))
+                       : cabinet ? T(im_cabinet_label(im_cabinet_of(D.cur->g.key), D.remap_target))
+                                 : im_input_label(D.remap_target);
     const char *prompt = T(S_PRESS_INPUT);
     if (wheel) {
         prompt = T(!g_wheel_capture.wheel || !SDL_JoystickConnected(g_wheel_capture.wheel) ? S_CH_NO_WHEEL

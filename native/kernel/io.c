@@ -477,6 +477,10 @@ void nc_io_mount_chihiro_media(const char *executable, const char *test_executab
     }
     link_set("\\??\\mbfs:", NC_CHIHIRO_MBFS);
     link_set("\\??\\mbcom:", k_mbcom_dev);
+    /* mbsys: is the same 0x8000 sectors (xemu, Tovarichtch chihiro.c "the
+     * DIMM's system area"): OutRun 2 SP keeps its ranking at +3 MB there and
+     * falls back to its mbcom: handle, same offset, when mbsys: won't open. */
+    link_set("\\??\\mbsys:", k_mbcom_dev);
     link_set("\\??\\D:", NC_CHIHIRO_MBFS);
 }
 
@@ -2040,6 +2044,9 @@ static void raw_io(int part, uint64_t off, uint8_t *buf, uint32_t len, bool writ
                 memcpy(buf, g_mbrom + at, (size_t)(lim - at < len ? lim - at : len));
             }
         }
+        return;
+    }
+    if (part == IO_MBCOM_PART && nc_chihiro_lpc_type1_mailbox(off, buf, len, write)) {
         return;
     }
     if (part == IO_MBCOM_PART && off >= IO_MBCOM_NET && off - IO_MBCOM_NET < 0x100000u &&

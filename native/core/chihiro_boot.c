@@ -115,24 +115,63 @@ static bool boot_of_xbe(const char *xbe, char *out, size_t cap, bool *test)
     return false;
 }
 
-/* The games xbased runs, by game ID. */
+/* The games xbased runs, by the game ID in their boot.id. A build whose
+ * boot.id has another ID runs as the game named by game_id. */
 static const struct {
+    char boot_id[4];        /* as in boot.id, not zero-terminated */
     char game_id[5];
     const char *title;
+    NcChihiroCabinet cabinet;
+    bool type1;             /* a Type-1 media board (nc_chihiro_type1_media) */
 } k_games[] = {
-    {"SBHQ", "Wangan Midnight Maximum Tune"},
-    {"SBKD", "Wangan Midnight Maximum Tune 2"},
-    {"SGBZ", "OutRun 2"},
+    {"SBHQ", "SBHQ", "Wangan Midnight Maximum Tune", NC_CHIHIRO_MAXIMUM_TUNE},
+    {"SBKD", "SBKD", "Wangan Midnight Maximum Tune 2", NC_CHIHIRO_MAXIMUM_TUNE},
+    {"SGBZ", "SGBZ", "OutRun 2", NC_CHIHIRO_OUTRUN},
+    /* OutRun 2's internal beta (XBE of 2003-09-10, boot.id dated
+     * 2003-09-09) has "GBZ\0"; the game never checks it. */
+    {{'G', 'B', 'Z', 0}, "SGBZ", "OutRun 2 (Beta)", NC_CHIHIRO_OUTRUN},
+    {"SBJE", "SBJE", "OutRun 2 Special Tours", NC_CHIHIRO_OUTRUN},
+    {"SBFY", "SBFY", "Crazy Taxi High Roller", NC_CHIHIRO_CRAZY_TAXI, true},
 };
 
-const char *nc_chihiro_game_title(const char *game_id)
+/* k_games' first entry for a game ID, -1 for a game xbased doesn't run. */
+static int game_of_id(const char *game_id)
 {
     for (unsigned i = 0; game_id && i < sizeof(k_games) / sizeof(*k_games); i++) {
         if (!strncmp(game_id, k_games[i].game_id, 4)) {
-            return k_games[i].title;
+            return (int)i;
         }
     }
-    return NULL;
+    return -1;
+}
+
+const char *nc_chihiro_game_title(const char *game_id)
+{
+    const int i = game_of_id(game_id);
+    return i < 0 ? NULL : k_games[i].title;
+}
+
+NcChihiroCabinet nc_chihiro_cabinet(const char *game_id)
+{
+    const int i = game_of_id(game_id);
+    return i < 0 ? NC_CHIHIRO_MAXIMUM_TUNE : k_games[i].cabinet;
+}
+
+bool nc_chihiro_type1_media(const char *game_id)
+{
+    const int i = game_of_id(game_id);
+    return i >= 0 && k_games[i].type1;
+}
+
+/* k_games' entry for boot.id's 4 ID bytes, -1 for a game xbased doesn't run. */
+static int game_of_boot_id(const char raw[4])
+{
+    for (unsigned i = 0; i < sizeof(k_games) / sizeof(*k_games); i++) {
+        if (!memcmp(raw, k_games[i].boot_id, 4)) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 /* path's boot.id opened for reading, -1 if it has none. */
@@ -273,7 +312,8 @@ bool nc_chihiro_boot_path(const char *path, char *out, size_t cap, bool *test)
     return found;
 }
 
-bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, size_t root_cap, char game_id[5])
+bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, size_t root_cap, char game_id[5],
+                         const char **title)
 {
     char boot[1024];
     if (!nc_chihiro_boot_path(path, boot, sizeof(boot), NULL)) {
@@ -303,6 +343,9 @@ bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, si
         *c = *c == '\\' ? '/' : *c;
     }
     memcpy(game_id, game.game_id, sizeof(game.game_id));
+    if (title) {
+        *title = game.title;
+    }
     return true;
 }
 
@@ -371,10 +414,11 @@ const char *nc_chihiro_boot_probe(int fd, bool test, NcChihiroBoot *game)
         game->test_executable[0] = 0;
     }
     memcpy(game->executable, test ? game->test_executable : game->game_executable, sizeof(game->executable));
-    memcpy(game->game_id, data + GAME_ID, 4);
-    game->title = nc_chihiro_game_title(game->game_id);
-    if (!game->title) {
+    const int known = game_of_boot_id(data + GAME_ID);
+    if (known < 0) {
         return "This game is not supported yet.";
     }
+    memcpy(game->game_id, k_games[known].game_id, sizeof(game->game_id));
+    game->title = k_games[known].title;
     return NULL;
 }

@@ -32,12 +32,31 @@ typedef struct NcChihiroBoot {
 bool nc_chihiro_boot_path(const char *path, char *out, size_t cap, bool *test);
 
 /* For path (as above): the game XBE's path, the game folder (root) and the
- * game ID. Opening the test XBE uses the game's settings, found this way. */
-bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, size_t root_cap, char game_id[5]);
+ * game ID; title (may be NULL) gets the name xbased shows for this build
+ * ("OutRun 2 (Beta)"). Opening the test XBE uses the game's settings, found
+ * this way. */
+bool nc_chihiro_xbe_path(const char *path, char *out, size_t cap, char *root, size_t root_cap, char game_id[5],
+                         const char **title);
 
 /* The name xbased shows for a game ID from boot.id ("SGBZ": "OutRun 2"),
  * NULL for a game it doesn't run. */
 const char *nc_chihiro_game_title(const char *game_id);
+
+/* The cabinet a game runs in, which decides its controls, its drive board
+ * and its media board. */
+typedef enum {
+    NC_CHIHIRO_MAXIMUM_TUNE,    /* H-pattern gears, card reader, Namco V257 */
+    NC_CHIHIRO_OUTRUN,          /* up/down shift lever, Sega servo drive board */
+    NC_CHIHIRO_CRAZY_TAXI,      /* D/R lever and JUMP, a sprung wheel (no motor) */
+} NcChihiroCabinet;
+
+/* The cabinet for a game ID ("SBFY"), Maximum Tune's for one xbased
+ * doesn't know. */
+NcChihiroCabinet nc_chihiro_cabinet(const char *game_id);
+
+/* True if the game shipped on a Type-1 media board (the FPGA one) and
+ * won't talk to the Type-3 (ASIC) the others use. */
+bool nc_chihiro_type1_media(const char *game_id);
 
 /* How boot.id names the game (32 bytes at 0x80, as "MAXIMUM TUNE 2 Ver.B";
  * builds with the same game ID and region differ here) and the build's

@@ -279,14 +279,27 @@ static SDL_EnumerationResult SDLCALL chihiro_data(void *userdata, const char *di
     return SDL_ENUM_SUCCESS;
 }
 
-static void chihiro_title(const char *root, const char *game_id, char *out, size_t size)
+/* " Ver.B" for a later version boot.id names ("MAXIMUM TUNE 2 Ver.B"),
+ * "" for Ver.A or none. */
+static void chihiro_version(const char *root, char *out, size_t size)
+{
+    char name[33], region[4];
+    out[0] = 0;
+    const char *ver = nc_chihiro_boot_label(root, name, region) ? SDL_strcasestr(name, "Ver.") : NULL;
+    if (ver && ver[4] && ver[4] != ' ' && SDL_toupper((unsigned char)ver[4]) != 'A') {
+        snprintf(out, size, " %.*s", (int)strcspn(ver, " "), ver);
+    }
+}
+
+static void chihiro_title(const char *root, const char *title, char *out, size_t size)
 {
     /* The language assets distinguish releases whose boot.id and XBE
      * certificate region mask are identical. */
     unsigned regions = 0;
     SDL_EnumerateDirectory(root, chihiro_data, &regions);
-    const char *title = nc_chihiro_game_title(game_id);
-    snprintf(out, size, "%s%s", title ? title : game_id,
+    char version[33];
+    chihiro_version(root, version, sizeof(version));
+    snprintf(out, size, "%s%s%s", title, version,
              regions == CHIHIRO_JPN ? " (JPN)" : regions == CHIHIRO_EXP ? " (EXP)" : "");
 }
 
@@ -298,11 +311,13 @@ bool xd_read_game(const char *path, XdGame *g)
     /* an extracted game (its folder, or its default.xbe): the XBE read as
      * it is, the folder's name its title until the certificate's */
     char xbe[1024], chihiro_root[1024], game_id[5];
-    const bool chihiro = nc_chihiro_xbe_path(path, xbe, sizeof(xbe), chihiro_root, sizeof(chihiro_root), game_id);
+    const char *chihiro_name = NULL;
+    const bool chihiro = nc_chihiro_xbe_path(path, xbe, sizeof(xbe), chihiro_root, sizeof(chihiro_root), game_id,
+                                             &chihiro_name);
     g->chihiro = chihiro;
     const bool folder = chihiro || nc_fold_xbe_path(path, xbe, sizeof(xbe));
     if (chihiro) {
-        chihiro_title(chihiro_root, game_id, g->title, sizeof(g->title));
+        chihiro_title(chihiro_root, chihiro_name, g->title, sizeof(g->title));
     } else if (folder) {
         char dir[1024];
         snprintf(dir, sizeof(dir), "%s", xbe);

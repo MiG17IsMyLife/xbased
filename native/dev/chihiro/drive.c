@@ -1,25 +1,35 @@
 /*
- * Chihiro drive board: which game uses which board (drive.h).
+ * Chihiro drive board: which cabinet uses which board (drive.h).
  */
 #include "drive.h"
+#include "board.h"
+#include "native/core/chihiro_boot.h"
 
-#include <string.h>
+/* Crazy Taxi's wheel has no motor, only a centring spring: the host wheel
+ * gets that spring. */
+static bool sprung_force(NcChihiroForce *force)
+{
+    *force = (NcChihiroForce){.target = 0x200, .spring = 0x60, .damping = 0x10};
+    return true;
+}
 
-static const struct {
-    char game_id[5];
-    const NcChihiroDrive *drive;
-} k_games[] = {
-    {"SBHQ", &nc_chihiro_drive_v257},         /* Wangan Midnight Maximum Tune */
-    {"SBKD", &nc_chihiro_drive_v257},         /* Wangan Midnight Maximum Tune 2 */
-    {"SGBZ", &nc_chihiro_drive_sega_servo},   /* OutRun 2 */
+static const NcChihiroDrive k_sprung = {
+    .name = "none (a sprung wheel)",
+    .force = sprung_force,
 };
 
 const NcChihiroDrive *nc_chihiro_drive_for(const char *game_id)
 {
-    for (unsigned i = 0; game_id && i < sizeof(k_games) / sizeof(*k_games); i++) {
-        if (!strncmp(game_id, k_games[i].game_id, 4)) {
-            return k_games[i].drive;
-        }
+    if (!nc_chihiro_game_title(game_id)) {
+        return NULL;
+    }
+    switch (nc_chihiro_cabinet(game_id)) {
+    case NC_CHIHIRO_MAXIMUM_TUNE:
+        return &nc_chihiro_drive_v257;
+    case NC_CHIHIRO_OUTRUN:
+        return &nc_chihiro_drive_sega_servo;
+    case NC_CHIHIRO_CRAZY_TAXI:
+        return &k_sprung;
     }
     return NULL;
 }

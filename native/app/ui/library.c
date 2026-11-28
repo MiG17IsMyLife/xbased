@@ -540,8 +540,8 @@ static void cache_load(const ScanArgs *a, const bool *there)
         if (board_len >= 4 && nc_chihiro_game_title(board)) {
             g->chihiro = true;
             snprintf(g->key, sizeof(g->key), "CH-%.4s-%08X", board, g->disc_sig);
-            if (board_len != 6 || memcmp(board + 4, ":1", 2)) {
-                e->mtime = -1;    /* refresh names inherited from the folder */
+            if (board_len != 6 || memcmp(board + 4, ":3", 2)) {
+                e->mtime = -1;    /* titles from an older format: read again (:3 names builds, "Ver.B") */
             }
         } else {
             snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
@@ -583,7 +583,7 @@ static void cache_save(const ScanArgs *a)
         }
         fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%d\t%08X\t%s\t%.4s%s\n", g->g.path, (long long)g->g.size,
                 (long long)g->mtime, g->g.title_id, g->g.version, g->g.regions, g->g.year, g->g.disc_sig,
-                g->orig[0] ? g->orig : g->g.title, g->g.chihiro ? g->g.key + 3 : "-", g->g.chihiro ? ":1" : "");
+                g->orig[0] ? g->orig : g->g.title, g->g.chihiro ? g->g.key + 3 : "-", g->g.chihiro ? ":3" : "");
     }
     SDL_UnlockMutex(L.mu);
     const bool ok = fclose(f) == 0;

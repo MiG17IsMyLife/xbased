@@ -2755,11 +2755,16 @@ int main(int argc, char *argv[])
     nc_present_set_widescreen(opt.video >= 0 && (opt.video & NC_VIDEO_WIDESCREEN));
     nc_log("xbased-app", "native core: disc %s, hdd %s%s", g_disc, hdd, opt.uncap ? ", frame rate uncapped" : "");
 
-    const char *title = strrchr(g_disc, '\\');
-    const char *title2 = strrchr(g_disc, '/');
-    title = title2 > title ? title2 : title;
+    /* The window's name: a Chihiro game's title, else the image's file name. */
+    const char *base = strrchr(g_disc, '\\');
+    const char *base2 = strrchr(g_disc, '/');
+    base = base2 > base ? base2 : base;
+    const char *name = xbox_dash                    ? "Xbox Dashboard"
+                       : g_chihiro && g_game_title[0] ? g_game_title
+                       : base                       ? base + 1
+                                                    : g_disc;
     char wtitle[512];
-    snprintf(wtitle, sizeof(wtitle), "xbased - %s", xbox_dash ? "Xbox Dashboard" : title ? title + 1 : g_disc);
+    snprintf(wtitle, sizeof(wtitle), "xbased - %s", name);
 #ifdef _WIN32
     const SDL_WindowFlags vk_flag = 0;            /* the presenter makes its own Win32 surface */
 #else

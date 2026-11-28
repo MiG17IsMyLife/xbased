@@ -4,6 +4,7 @@
  * board_int.h for which does what.
  */
 #include "native/dev/chihiro_board.h"
+#include "native/core/chihiro_boot.h"
 
 #include "board_int.h"
 
@@ -33,8 +34,9 @@ void nc_chihiro_board_init(const NcChihiroStorage *storage, const NcChihiroCoinS
 {
     chihiro_cards_init(storage);
     chihiro_input_init(game_id);
+    nc_chihiro_lpc_set_type1(nc_chihiro_type1_media(game_id));
     nc_chihiro_drive = nc_chihiro_drive_for(game_id);
-    if (nc_chihiro_drive) {
+    if (nc_chihiro_drive && nc_chihiro_drive->init) {
         nc_chihiro_drive->init();
     }
     nc_log("xbased-chihiro", "drive board: %s", nc_chihiro_drive ? nc_chihiro_drive->name : "none");

@@ -9,6 +9,7 @@
 
 #include "native/app/ui/config.h"
 #include "native/app/ui/i18n.h"
+#include "native/core/chihiro_boot.h"
 
 #include <SDL3/SDL.h>
 #include <stdint.h>
@@ -111,14 +112,19 @@ typedef struct ImCabinetControl {
 } ImCabinetControl;
 extern const ImCabinetControl im_cabinet_controls[IM_CAB_INPUTS];
 
-/* Which cabinet a Chihiro game runs in: its controls differ. Found from
- * the game's settings key ("CH-SGBZ-...") or its boot.id game ID ("SGBZ");
- * anything else is Maximum Tune's. */
-typedef enum { IM_CAB_MAXIMUM_TUNE, IM_CAB_OUTRUN } ImCabinet;
+/* Which cabinet a Chihiro game runs in (nc_chihiro_cabinet), from its
+ * settings key ("CH-SGBZ-...") or its boot.id game ID ("SGBZ"). */
+typedef enum {
+    IM_CAB_MAXIMUM_TUNE = NC_CHIHIRO_MAXIMUM_TUNE,
+    IM_CAB_OUTRUN = NC_CHIHIRO_OUTRUN,
+    IM_CAB_CRAZY_TAXI = NC_CHIHIRO_CRAZY_TAXI,
+} ImCabinet;
 ImCabinet im_cabinet_of(const char *key_or_game_id);
-/* False for a control the cabinet doesn't have (OutRun 2: no card reader,
- * no intrude button). */
+/* False for a control the cabinet doesn't have (OutRun 2 and Crazy Taxi:
+ * no card reader, no intrude button). */
 bool im_cabinet_has(ImCabinet cabinet, int input);
+/* The control's name on that cabinet (Crazy Taxi: D, R and JUMP). */
+enum UiStr im_cabinet_label(ImCabinet cabinet, int input);
 /* The control's default wheel button, 1-based, 0 none. */
 int im_cabinet_wheel_default(ImCabinet cabinet, int input);
 /* True if the cabinet has an H-pattern gear lever (Maximum Tune). */
